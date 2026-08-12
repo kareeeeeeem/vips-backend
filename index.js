@@ -128,10 +128,16 @@ app.put('/api/admin/employees/:id', async (req, res) => {
 
 // ─── Health Check ─────────────────────────────────────────
 app.get('/api/health', (req, res) => {
+  const dbStates = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  const dbReadyState = mongoose.connection.readyState;
   res.json({
     status:    'ok',
-    message:   'VIPs Backend is running 🚀',
+    message:   'VIPs Backend is running',
     timestamp: new Date().toISOString(),
+    db: {
+      readyState: dbReadyState,
+      status:     dbStates[dbReadyState] || 'unknown',
+    },
   });
 });
 

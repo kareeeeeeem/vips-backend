@@ -192,8 +192,13 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
 router.post('/send-gift', authMiddleware, async (req, res) => {
   try {
     const { recipientPhone, amount, message } = req.body;
-    
+
+    if (!recipientPhone || !amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'recipientPhone and a valid amount are required' });
+    }
+
     const sender = await User.findById(req.user.id);
+    if (!sender) return res.status(404).json({ success: false, message: 'User not found' });
     if (sender.walletBalance < amount) {
       return res.status(400).json({ success: false, message: 'Insufficient balance' });
     }
@@ -258,6 +263,30 @@ router.post('/spin-wheel', authMiddleware, async (req, res) => {
 
     const updatedUser = await User.findById(req.user.id).select('walletPoints');
     res.json({ success: true, message: 'Wheel spun', data: { ...randomReward, newBalance: updatedUser?.walletPoints || 0 } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/rewards/save-promotion ────────────────────
+router.post('/save-promotion', authMiddleware, async (req, res) => {
+  try {
+    const { promotionId } = req.body;
+    if (!promotionId) {
+      return res.status(400).json({ success: false, message: 'promotionId is required' });
+    }
+
+    const Promotion = require('../models/Promotion');
+    const promotion = await Promotion.findById(promotionId).catch(() => null);
+    if (!promotion) {
+      return res.status(404).json({ success: false, message: 'Promotion not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Promotion saved successfully',
+      data: { promotionId, title: promotion.title, code: promotion.code },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

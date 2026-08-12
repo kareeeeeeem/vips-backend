@@ -31,11 +31,15 @@ const upload = multer({
 });
 
 router.post('/', authMiddleware, upload.single('image'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'No image provided' });
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No image provided' });
+    }
+    const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+    res.json({ success: true, data: { url } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
-  const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-  res.json({ success: true, data: { url } });
 });
 
 module.exports = router;

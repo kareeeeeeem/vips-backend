@@ -13,7 +13,11 @@ const couponSchema = new mongoose.Schema(
     merchantId:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     usageCount:         { type: Number, default: 0 },
     maxUsage:           { type: Number, default: null },
+    // Aliases kept for seeder / legacy compatibility
+    usedCount:          { type: Number, default: 0 },
+    maxUses:            { type: Number, default: null },
     minOrderAmount:     { type: Number, default: 0 },
+    description:        { type: String, default: '' },
     tags:               [{ type: String }],
   },
   { timestamps: true }

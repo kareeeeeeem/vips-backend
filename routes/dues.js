@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const due = await Due.create({ ...req.body, merchantId: req.user.id });
-    res.json({ success: true, data: due });
+    res.status(201).json({ success: true, data: due });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -28,6 +28,21 @@ router.put('/:id', async (req, res) => {
     const due = await Due.findOneAndUpdate(
       { _id: req.params.id, merchantId: req.user.id },
       { ...req.body, lastTransaction: new Date() },
+      { new: true }
+    );
+    if (!due) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: due });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.put('/:id/collect', async (req, res) => {
+  try {
+    const { paidAmount } = req.body;
+    const due = await Due.findOneAndUpdate(
+      { _id: req.params.id, merchantId: req.user.id },
+      { paidAmount: parseFloat(paidAmount || 0), lastTransaction: new Date() },
       { new: true }
     );
     if (!due) return res.status(404).json({ success: false, message: 'Not found' });

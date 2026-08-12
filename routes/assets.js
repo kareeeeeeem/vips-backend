@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const item = await Asset.create({ ...req.body, merchantId: req.user.id });
-    res.json({ success: true, data: item });
+    res.status(201).json({ success: true, data: item });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }

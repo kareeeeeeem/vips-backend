@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const member = await Staff.create({ ...req.body, merchantId: req.user.id });
-    res.json({ success: true, data: member });
+    res.status(201).json({ success: true, data: member });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }

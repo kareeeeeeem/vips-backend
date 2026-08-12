@@ -229,6 +229,25 @@ async function seedDemoNotificationsForUser(userId) {
   ]);
 }
 
+// ─── 12. SEED NOTIFICATIONS for existing users with none ────────────────────
+async function seedUserNotifications() {
+  try {
+    const totalNotifs = await UserNotification.countDocuments();
+    if (totalNotifs >= 1) return; // notifications already exist globally
+
+    // Find up to 10 customer users and seed welcome notifications for each
+    const customers = await User.find({ role: 'customer' }).select('_id').limit(10);
+    for (const customer of customers) {
+      await seedDemoNotificationsForUser(customer._id);
+    }
+    if (customers.length > 0) {
+      console.log(`🌱 Seeded notifications for ${customers.length} users`);
+    }
+  } catch (e) {
+    console.log('UserNotification seed error:', e.message);
+  }
+}
+
 // ─── Master runner ───────────────────────────────────────────────────────────
 async function runAutoSeeder() {
   console.log('🌱 Running auto-seeder...');
@@ -243,6 +262,7 @@ async function runAutoSeeder() {
       seedGiftVoucherBrands(),
       seedCoupons(),
       seedTrendingMerchants(),
+      seedUserNotifications(),
     ]);
     console.log('✅ Auto-seeder complete');
   } catch (e) {

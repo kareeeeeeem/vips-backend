@@ -29,9 +29,48 @@ const Staff       = require('../models/Staff');
 const Due         = require('../models/Due');
 const Employee    = require('../models/Employee');
 const Coupon      = require('../models/Coupon');
+const BusinessRegistration = require('../models/BusinessRegistration');
+const Product = require('../models/Product');
 
 const router = express.Router();
 router.use(authMiddleware);
+
+// ─── POST /api/merchant/register ──────────────────────────
+// Alias for merchant_partnership/register — called by business registration flow
+router.post('/register', async (req, res) => {
+  try {
+    const {
+      ownerName, ownerNameAr, storeName, storeNameAr, businessType,
+      category, jobTitle, phone, email, address, description,
+      schedule, loyaltyType, documents
+    } = req.body;
+    const merchantId = req.user.id;
+    const existing = await BusinessRegistration.findOne({ merchantId });
+    let registration;
+    if (existing) {
+      registration = await BusinessRegistration.findOneAndUpdate(
+        { merchantId },
+        { ownerName, businessName: storeName, businessType: businessType || 'retail',
+          phone, email, address, description, status: 'pending' },
+        { new: true }
+      );
+    } else {
+      registration = await BusinessRegistration.create({
+        merchantId, ownerName: ownerName || '', businessName: storeName || '',
+        businessType: businessType || 'retail', phone: phone || '',
+        email: email || '', address: address || '', description: description || '',
+        status: 'pending',
+      });
+    }
+    // Update user profile with registration info
+    await User.findByIdAndUpdate(merchantId, {
+      $set: { storeName, storeCategory: category, phone, address, description }
+    });
+    res.json({ success: true, message: 'Registration submitted successfully', data: registration });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // DASHBOARD & STATS
@@ -822,6 +861,65 @@ router.use('/assets',    crudRouter(Asset));
 router.use('/tax-rates', crudRouter(TaxRate));
 router.use('/staff',     crudRouter(Staff));
 router.use('/dues',      crudRouter(Due, 'lastTransaction'));
+
+// ═══════════════════════════════════════════════════════════
+// PRODUCTS  (merchant's own catalog)
+// ═══════════════════════════════════════════════════════════
+
+// ─── GET /api/merchant/products ───────────────────────────
+router.get('/products', async (req, res) => {
+  try {
+    const { category, isActive } = req.query;
+    const filter = { merchantId: req.user.id };
+    if (category && category !== 'All') filter.category = category;
+    if (isActive !== undefined) filter.isActive = isActive === 'true';
+    const products = await Product.find(filter).sort({ createdAt: -1 });
+    res.json({ success: true, data: products });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── POST /api/merchant/products ──────────────────────────
+router.post('/products', async (req, res) => {
+  try {
+    const { name, category, price, image, description, isFeature, hasVariants, isActive, vat, code, taxMethod } = req.body;
+    if (!name || !price || !category) {
+      return res.status(400).json({ success: false, message: 'name, price, and category are required' });
+    }
+    const product = await Product.create({
+      merchantId: req.user.id,
+      name, category, price, image, description,
+      isFeature: isFeature ?? false,
+      hasVariants: hasVariants ?? false,
+      isActive: isActive !== false,
+      vat: parseFloat(vat || 0),
+      code: code || '',
+      taxMethod: taxMethod || 'Exclusive',
+    });
+    res.status(201).json({ success: true, message: 'Product created successfully', data: product });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── PUT /api/merchant/products/:id ───────────────────────
+router.put('/products/:id', async (req, res) => {
+  try {
+    const product = await Product.findOneAndUpdate(
+      { _id: req.params.id, merchantId: req.user.id },
+      req.body,
+      { new: true, runValidators: true }
+    );
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    res.json({ success: true, message: 'Product updated successfully', data: product });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── DELETE /api/merchant/products/:id ────────────────────
+router.delete('/products/:id', async (req, res) => {
+  try {
+    const product = await Product.findOneAndDelete({ _id: req.params.id, merchantId: req.user.id });
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    res.json({ success: true, message: 'Product deleted successfully' });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
 
 // ─── GET  /api/merchant/coupons ───────────────────────────
 router.get('/coupons', async (req, res) => {

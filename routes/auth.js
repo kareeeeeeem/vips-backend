@@ -146,6 +146,10 @@ router.put('/update-profile', authMiddleware, async (req, res) => {
       { new: true, runValidators: true }
     );
 
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
     res.json({
       success: true,
       message: 'Profile updated successfully!',
@@ -361,6 +365,87 @@ router.post('/merchant-verify-otp', async (req, res) => {
       message: 'Verification successful!',
       data: { user: user.toJSON(), token },
     });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/auth/social ────────────────────────────────
+// Find-or-create a user from a social provider (Google / Facebook / Apple / Phone).
+// Client sends: { email, name, providerUid, provider, phone? }
+// `phone` is the real, Firebase-verified number and is only honored when
+// provider === 'phone' — for other providers it is ignored so an OAuth
+// account can never impersonate an existing phone-registered account.
+router.post('/social', async (req, res) => {
+  try {
+    const { email, name, providerUid, provider, phone } = req.body;
+
+    if (!providerUid) {
+      return res.status(400).json({ success: false, message: 'providerUid is required' });
+    }
+
+    const socialEmail = (email || '').toLowerCase().trim() || `${providerUid}@social.vips.app`;
+    const socialPhone =
+      provider === 'phone' && phone
+        ? phone.trim()
+        : `social_${providerUid}`;
+
+    let user = await User.findOne({ $or: [{ email: socialEmail }, { phone: socialPhone }] });
+
+    if (!user) {
+      user = await User.create({
+        fullName : name || 'VIPs User',
+        email    : socialEmail,
+        phone    : socialPhone,
+        password : crypto.randomBytes(32).toString('hex'),
+        role     : 'customer',
+      });
+    }
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+
+    user.lastLogin = new Date();
+    await user.save({ validateBeforeSave: false });
+
+    res.json({ success: true, message: 'Social login successful!', data: { user: user.toJSON(), token } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/auth/merchant-social ───────────────────────
+// Sign in an EXISTING merchant via Google / Facebook / Apple, matched by
+// email. Unlike /social this never creates a new account — merchants must
+// already exist via business registration, matching the same "must already
+// exist" rule /merchant-login enforces for phone+OTP sign-in.
+// Client sends: { email, providerUid, provider }
+router.post('/merchant-social', async (req, res) => {
+  try {
+    const { email, providerUid, provider } = req.body;
+
+    if (!providerUid || !email) {
+      return res.status(400).json({ success: false, message: 'email and providerUid are required' });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user || user.role !== 'merchant') {
+      return res.status(401).json({ success: false, message: 'No merchant account found with this email.' });
+    }
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+
+    user.lastLogin = new Date();
+    await user.save({ validateBeforeSave: false });
+
+    res.json({ success: true, message: 'Social login successful!', data: { user: user.toJSON(), token } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

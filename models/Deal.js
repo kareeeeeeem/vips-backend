@@ -11,6 +11,7 @@ const dealSchema = new mongoose.Schema(
     rating: { type: Number, default: 0 },
     category: { type: String, required: true },
     endTime: { type: Date, default: null }, // Used for "Ending Soon" deals
+    isActive: { type: Boolean, default: true },
     merchantId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   },
   {
