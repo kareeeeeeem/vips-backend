@@ -49,11 +49,12 @@ router.get('/coupons', authMiddleware, async (req, res) => {
 // ─── PUT /api/rewards/coupons/:id ─────────────────────
 router.put('/coupons/:id', authMiddleware, async (req, res) => {
   try {
-    const { discount, minOrderAmount, expiryDate } = req.body;
+    const { discount, minOrderAmount, expiryDate, isActive } = req.body;
     const updates = {};
     if (discount !== undefined) updates.discount = discount;
     if (minOrderAmount !== undefined) updates.minOrderAmount = minOrderAmount;
     if (expiryDate !== undefined) updates.expiryDate = new Date(expiryDate);
+    if (isActive !== undefined) updates.isActive = isActive;
 
     const coupon = await Coupon.findByIdAndUpdate(
       req.params.id,

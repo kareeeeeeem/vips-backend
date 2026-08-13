@@ -69,6 +69,30 @@ const userSchema = new mongoose.Schema(
     isVerified: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },
 
+    // Payment methods — display data only (last4/expiry), never raw card
+    // numbers or CVV. No route currently writes to this (card entry is
+    // deliberately not implemented client-side for PCI reasons), so this
+    // just makes the existing GET /user/payment-methods read a real,
+    // declared field instead of an undefined one.
+    paymentMethods: [
+      {
+        id: { type: String, required: true },
+        type: { type: String, enum: ['card', 'paypal', 'wallet'], required: true },
+        last4: { type: String },
+        expiryDate: { type: String },
+        isDefault: { type: Boolean, default: false },
+        createdAt: { type: Date, default: Date.now },
+      },
+    ],
+
+    // Extended profile (collected by the Edit Profile screen)
+    city:             { type: String, default: null },
+    civilStatus:      { type: String, default: null },
+    postalCode:       { type: String, default: null },
+    profession:       { type: String, default: null },
+    gender:           { type: String, default: null },
+    numberOfChildren: { type: Number, default: null },
+
     // Password Reset (OTP)
     resetPasswordToken: { type: String, default: null },
     resetPasswordExpires: { type: Date, default: null },

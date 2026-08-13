@@ -138,11 +138,14 @@ router.get('/me', authMiddleware, async (req, res) => {
 // ─── PUT /api/auth/update-profile ─────────────────────────
 router.put('/update-profile', authMiddleware, async (req, res) => {
   try {
-    const { fullName, phone, profileImage } = req.body;
+    const {
+      fullName, phone, profileImage,
+      city, civilStatus, postalCode, profession, gender, numberOfChildren,
+    } = req.body;
 
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { fullName, phone, profileImage },
+      { fullName, phone, profileImage, city, civilStatus, postalCode, profession, gender, numberOfChildren },
       { new: true, runValidators: true }
     );
 

@@ -18,6 +18,17 @@ const productSchema = new mongoose.Schema(
     vat:           { type: Number, default: 0 },
     taxMethod:     { type: String, enum: ['Exclusive', 'Inclusive', 'None'], default: 'Exclusive' },
     productType:   { type: String, default: 'Product' },
+
+    // Matches exactly what POST /products/:id/comment pushes — was
+    // previously undeclared, so pushes may not have persisted under
+    // Mongoose's default strict mode.
+    comments: [
+      {
+        userId:    { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        text:      { type: String, required: true },
+        createdAt: { type: Date, default: Date.now },
+      },
+    ],
   },
   {
     timestamps: true,

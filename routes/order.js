@@ -87,7 +87,7 @@ router.get('/my-orders', authMiddleware, async (req, res) => {
 router.get('/trips', authMiddleware, async (req, res) => {
   try {
     const { from, to } = req.query;
-    const filter = { userId: req.user.id, status: 'delivered' };
+    const filter = { userId: req.user.id, status: 'delivered', hiddenFromTrips: { $ne: true } };
     if (from && to) {
       filter.createdAt = { $gte: new Date(from), $lte: new Date(to) };
     }
@@ -107,10 +107,45 @@ router.get('/trips', authMiddleware, async (req, res) => {
         time: `${date.getHours().toString().padStart(2,'0')}:${date.getMinutes().toString().padStart(2,'0')}`,
         date: `${months[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`,
         amount: o.totalAmount,
+        isMarked: o.tripMarked || false,
       };
     });
 
     res.json({ success: true, data: trips });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── DELETE /api/order/trips/:id ──────────────────────────
+// Soft-delete: hides the underlying order from the Trips list without
+// touching the order itself. Must be defined BEFORE /:id to avoid conflict.
+router.delete('/trips/:id', authMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
+      { hiddenFromTrips: true },
+      { new: true }
+    );
+    if (!order) return res.status(404).json({ success: false, message: 'Trip not found' });
+    res.json({ success: true, message: 'Trip deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── PATCH /api/order/trips/:id/mark ──────────────────────
+// Toggles (or explicitly sets via { isMarked }) the bookmark flag on a trip.
+// Must be defined BEFORE /:id to avoid conflict.
+router.patch('/trips/:id/mark', authMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!order) return res.status(404).json({ success: false, message: 'Trip not found' });
+
+    order.tripMarked = typeof req.body.isMarked === 'boolean' ? req.body.isMarked : !order.tripMarked;
+    await order.save();
+
+    res.json({ success: true, message: 'Trip updated', data: { id: order._id, isMarked: order.tripMarked } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -72,6 +72,11 @@ const orderSchema = new mongoose.Schema(
     rating:  { type: Number, default: 0 },
     review:  { type: String, default: '' },
 
+    // Shipping "Trips" screen (derived from delivered orders): user-side
+    // soft-delete / bookmark flags, scoped by userId via the /order/trips routes.
+    hiddenFromTrips: { type: Boolean, default: false },
+    tripMarked:      { type: Boolean, default: false },
+
     // Status timestamp tracking
     pendingAt:          { type: Date, default: null },
     confirmedAt:        { type: Date, default: null },
