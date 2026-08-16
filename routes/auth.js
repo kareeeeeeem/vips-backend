@@ -393,6 +393,7 @@ router.post('/social', async (req, res) => {
     try {
       decoded = await verifyFirebaseIdToken(idToken);
     } catch (err) {
+      console.error('[auth/social] verifyFirebaseIdToken failed:', err.code || err.name, '-', err.message);
       return res.status(401).json({ success: false, message: 'Invalid or expired sign-in token.' });
     }
 
@@ -426,6 +427,7 @@ router.post('/social', async (req, res) => {
 
     res.json({ success: true, message: 'Social login successful!', data: { user: user.toJSON(), token } });
   } catch (error) {
+    console.error('[auth/social] unexpected error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -450,6 +452,7 @@ router.post('/merchant-social', async (req, res) => {
     try {
       decoded = await verifyFirebaseIdToken(idToken);
     } catch (err) {
+      console.error('[auth/merchant-social] verifyFirebaseIdToken failed:', err.code || err.name, '-', err.message);
       return res.status(401).json({ success: false, message: 'Invalid or expired sign-in token.' });
     }
 
@@ -474,6 +477,7 @@ router.post('/merchant-social', async (req, res) => {
 
     res.json({ success: true, message: 'Social login successful!', data: { user: user.toJSON(), token } });
   } catch (error) {
+    console.error('[auth/merchant-social] unexpected error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
