@@ -139,6 +139,10 @@ app.get('/api/health', (req, res) => {
       readyState: dbReadyState,
       status:     dbStates[dbReadyState] || 'unknown',
     },
+    // Boolean + error message only — never the raw FIREBASE_SERVICE_ACCOUNT
+    // value — so social-login misconfiguration can be diagnosed without
+    // dashboard/log access.
+    firebaseAdmin: require('./utils/firebaseAdmin').getInitStatus(),
   });
 });
 
