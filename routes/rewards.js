@@ -56,8 +56,8 @@ router.put('/coupons/:id', authMiddleware, async (req, res) => {
     if (expiryDate !== undefined) updates.expiryDate = new Date(expiryDate);
     if (isActive !== undefined) updates.isActive = isActive;
 
-    const coupon = await Coupon.findByIdAndUpdate(
-      req.params.id,
+    const coupon = await Coupon.findOneAndUpdate(
+      { _id: req.params.id, merchantId: req.user.id },
       { $set: updates },
       { new: true, runValidators: true }
     );
@@ -71,7 +71,7 @@ router.put('/coupons/:id', authMiddleware, async (req, res) => {
 // ─── DELETE /api/rewards/coupons/:id ──────────────────
 router.delete('/coupons/:id', authMiddleware, async (req, res) => {
   try {
-    const coupon = await Coupon.findByIdAndDelete(req.params.id);
+    const coupon = await Coupon.findOneAndDelete({ _id: req.params.id, merchantId: req.user.id });
     if (!coupon) return res.status(404).json({ success: false, message: 'Coupon not found' });
     res.json({ success: true, message: 'Coupon deleted' });
   } catch (error) {
@@ -80,16 +80,41 @@ router.delete('/coupons/:id', authMiddleware, async (req, res) => {
 });
 
 // ─── POST /api/rewards/expense-to-reward ───────────────────────
+// NOTE: `amount` is a self-reported expense with no receipt/gateway
+// verification behind it, so this endpoint is inherently farmable by a
+// user repeatedly claiming expenses that never happened. The caps below
+// are a stopgap to bound the damage until expenses are tied to a
+// verified purchase (e.g. a real Order/Transaction record); they are not
+// a real fix and should be replaced once that verification exists.
+const MAX_EXPENSE_AMOUNT = 5000;
+const MAX_DAILY_EXPENSE_REWARD_POINTS = 500;
+
 router.post('/expense-to-reward', authMiddleware, async (req, res) => {
   try {
     const { amount, merchantId } = req.body;
-    
-    if (!amount || amount <= 0) {
+
+    if (!amount || amount <= 0 || amount > MAX_EXPENSE_AMOUNT) {
       return res.status(400).json({ success: false, message: 'Invalid amount' });
     }
 
     // Give 10% of expense as reward points
     const pointsEarned = Math.floor(amount * 0.1);
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const todaysRewards = await Transaction.find({
+      userId: req.user.id,
+      type: 'reward',
+      reference: { $regex: '^EXP-REW-' },
+      createdAt: { $gte: startOfDay },
+    }).select('amount');
+    const totalToday = todaysRewards.reduce((sum, t) => sum + t.amount, 0);
+    if (totalToday + pointsEarned > MAX_DAILY_EXPENSE_REWARD_POINTS) {
+      return res.status(429).json({
+        success: false,
+        message: 'Daily expense-to-reward limit reached. Try again tomorrow.',
+      });
+    }
 
     const user = await User.findById(req.user.id);
     user.walletPoints += pointsEarned;

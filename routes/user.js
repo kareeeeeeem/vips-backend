@@ -166,12 +166,26 @@ router.post('/transfer', async (req, res) => {
   try {
     const { recipientPhone, amount, description } = req.body;
 
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Amount must be a positive number.',
+      });
+    }
+
     // Find recipient
     const recipient = await User.findOne({ phone: recipientPhone });
     if (!recipient) {
       return res.status(404).json({
         success: false,
         message: 'Recipient not found.',
+      });
+    }
+
+    if (recipient._id.equals(req.user.id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot transfer to yourself.',
       });
     }
 
@@ -672,11 +686,19 @@ router.post('/referral/use', async (req, res) => {
 });
 
 // ─── POST /api/user/wallet/topup ─────────────────────────────
+// NOTE: there is no live payment gateway behind this yet (see
+// GET /payment-methods, which returns an empty card list as a placeholder),
+// so this endpoint currently mints wallet balance from a client-supplied
+// number with nothing actually charged. The cap below is a stopgap to
+// bound the exposure until a real payment gateway is wired in — it is
+// not a substitute for verifying an actual charge.
+const MAX_TOPUP_AMOUNT = 50000;
+
 router.post('/wallet/topup', async (req, res) => {
   try {
     const { vipsAmount, cardId } = req.body;
-    if (!vipsAmount || vipsAmount < 100) {
-      return res.status(400).json({ success: false, message: 'Minimum purchase is 100 VIPS' });
+    if (!vipsAmount || vipsAmount < 100 || vipsAmount > MAX_TOPUP_AMOUNT) {
+      return res.status(400).json({ success: false, message: 'Invalid top-up amount' });
     }
 
     const user = await User.findById(req.user.id);
