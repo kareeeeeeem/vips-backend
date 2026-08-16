@@ -1,10 +1,16 @@
-const admin = require('firebase-admin');
+// firebase-admin@14's default `require('firebase-admin')` export only has
+// app-management functions (initializeApp, cert, getApp, ...) — no
+// `.auth()`, `.credential`, etc. Those moved to modular subpath imports.
+// Verified locally: typeof require('firebase-admin').auth === 'undefined',
+// while require('firebase-admin/auth').getAuth is a function.
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
 
-let initialized = false;
+let app = null;
 let initError = null;
 
 function ensureInitialized() {
-  if (initialized) return;
+  if (app) return;
   if (initError) throw initError;
   try {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -14,12 +20,7 @@ function ensureInitialized() {
       );
     }
     const serviceAccount = JSON.parse(raw);
-    // firebase-admin@14's default CJS export flattens `credential.cert` to
-    // just `cert` at the top level — `admin.credential` doesn't exist on
-    // this version (confirmed: Object.keys(require('firebase-admin')) has
-    // no `credential` key, but does have `cert`).
-    admin.initializeApp({ credential: admin.cert(serviceAccount) });
-    initialized = true;
+    app = initializeApp({ credential: cert(serviceAccount) });
   } catch (err) {
     // Cache the failure so every request doesn't re-attempt (and
     // re-log) a doomed initialization, and so /api/health can report
@@ -34,13 +35,13 @@ function ensureInitialized() {
 // forged — callers must not fall back to trusting client-supplied fields.
 async function verifyFirebaseIdToken(idToken) {
   ensureInitialized();
-  return admin.auth().verifyIdToken(idToken);
+  return getAuth(app).verifyIdToken(idToken);
 }
 
 // For /api/health — reports whether the service account loaded, and if
 // not, why (message only, never the raw env var value).
 function getInitStatus() {
-  if (initialized) return { configured: true };
+  if (app) return { configured: true };
   try {
     ensureInitialized();
     return { configured: true };
