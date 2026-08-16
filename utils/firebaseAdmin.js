@@ -14,7 +14,11 @@ function ensureInitialized() {
       );
     }
     const serviceAccount = JSON.parse(raw);
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    // firebase-admin@14's default CJS export flattens `credential.cert` to
+    // just `cert` at the top level — `admin.credential` doesn't exist on
+    // this version (confirmed: Object.keys(require('firebase-admin')) has
+    // no `credential` key, but does have `cert`).
+    admin.initializeApp({ credential: admin.cert(serviceAccount) });
     initialized = true;
   } catch (err) {
     // Cache the failure so every request doesn't re-attempt (and
