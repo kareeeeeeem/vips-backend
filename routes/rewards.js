@@ -99,10 +99,23 @@ const MAX_MONTHLY_GIFT_AMOUNT = 10000;
 
 router.post('/expense-to-reward', authMiddleware, async (req, res) => {
   try {
-    const { amount, merchantId } = req.body;
+    const { amount, merchantId: rawMerchantId } = req.body;
 
     if (!amount || amount <= 0 || amount > MAX_EXPENSE_AMOUNT) {
       return res.status(400).json({ success: false, message: 'Invalid amount' });
+    }
+
+    // The "Merchant phone / ID" field (reward_page.dart /
+    // expense_to_reward_controller.dart) accepts either a scanned QR's
+    // real ObjectId or a typed phone number — resolve whichever was sent
+    // instead of passing it straight through, which would throw a
+    // CastError (and 500 the whole request) for any typed phone number.
+    let merchantId = null;
+    if (rawMerchantId && /^[a-fA-F0-9]{24}$/.test(rawMerchantId)) {
+      merchantId = rawMerchantId;
+    } else if (rawMerchantId) {
+      const merchantUser = await User.findOne({ phone: String(rawMerchantId).trim() }).select('_id');
+      merchantId = merchantUser?._id || null;
     }
 
     // Give 10% of expense as reward points
@@ -444,6 +457,22 @@ router.post('/validate-qr', authMiddleware, async (req, res) => {
         success: true,
         message: `Gift of ${gift.amount} added to wallet!`,
         data: { type: 'gift', amount: gift.amount, newBalance: claimedUser?.walletBalance || 0 },
+      });
+    }
+
+    // A VIPs ID card QR (see vips_id_view.dart: 'VIPS_USER_<mongoId>') —
+    // used by Gift's "scan recipient" flow to resolve a real user to send
+    // a gift to, without the sender needing to know their phone number.
+    const userQrMatch = code.match(/^VIPS_USER_([a-fA-F0-9]{24})$/);
+    if (userQrMatch) {
+      const scannedUser = await User.findById(userQrMatch[1]).select('fullName phone storeName role');
+      if (!scannedUser) {
+        return res.status(404).json({ success: false, message: 'No account found for this QR code' });
+      }
+      return res.json({
+        success: true,
+        message: `User: ${scannedUser.fullName || scannedUser.phone}`,
+        data: { type: 'user', user: { id: scannedUser._id, fullName: scannedUser.fullName, phone: scannedUser.phone } },
       });
     }
 
