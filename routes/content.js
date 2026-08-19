@@ -4,10 +4,46 @@ const Outing = require('../models/Outing');
 const User = require('../models/User');
 const Product = require('../models/Product');
 const Promotion = require('../models/Promotion');
+const Order = require('../models/Order');
 const { authMiddleware, optionalAuthMiddleware } = require('../middleware/auth');
 const { runAutoSeeder } = require('../utils/autoSeeder');
 
 const router = express.Router();
+
+// Real per-product stats derived from actual Orders, so product cards and
+// the detail page stop showing a hardcoded 5.0 rating / 0 sell count for
+// everything. `items.productId` is a Mixed field set by the client to the
+// product's _id.toString() (see order.js's normalizeItems) — matched as a
+// string here for the same reason. Order-level rating (POST /order/:id/review)
+// isn't per-line-item, so an order containing several products has its one
+// rating counted toward each of them — an approximation, not exact, but the
+// data model has no finer-grained rating to draw from.
+async function computeProductStats(productIds) {
+  if (!productIds.length) return {};
+  const [salesAgg, ratingAgg] = await Promise.all([
+    Order.aggregate([
+      { $unwind: '$items' },
+      { $match: { 'items.productId': { $in: productIds }, status: { $ne: 'cancelled' } } },
+      { $group: { _id: '$items.productId', salesCount: { $sum: '$items.quantity' } } },
+    ]),
+    Order.aggregate([
+      { $match: { rating: { $gt: 0 } } },
+      { $unwind: '$items' },
+      { $match: { 'items.productId': { $in: productIds } } },
+      { $group: { _id: '$items.productId', avgRating: { $avg: '$rating' }, reviewCount: { $sum: 1 } } },
+    ]),
+  ]);
+  const stats = {};
+  salesAgg.forEach((s) => { stats[s._id] = { ...(stats[s._id] || {}), salesCount: s.salesCount }; });
+  ratingAgg.forEach((r) => {
+    stats[r._id] = {
+      ...(stats[r._id] || {}),
+      avgRating: Math.round(r.avgRating * 10) / 10,
+      reviewCount: r.reviewCount,
+    };
+  });
+  return stats;
+}
 
 // ─── INIT SEED DATA ─────────────────────────────────────────
 async function seedContent() {
@@ -240,7 +276,49 @@ router.get('/products', optionalAuthMiddleware, async (req, res) => {
       await runAutoSeeder();
       products = await Product.find(filter).sort({ createdAt: -1 });
     }
-    res.json({ success: true, data: products });
+
+    const stats = await computeProductStats(products.map((p) => p._id.toString()));
+    const data = products.map((p) => {
+      const s = stats[p._id.toString()] || {};
+      const obj = p.toObject();
+      obj.salesCount = s.salesCount || 0;
+      obj.avgRating = s.avgRating || 0;
+      obj.reviewCount = s.reviewCount || 0;
+      return obj;
+    });
+
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/content/products/:id ─────────────────────────
+// Single product with real comments (commenter names populated), real
+// merchant name, and the same real sales/rating stats as the list
+// endpoint — previously didn't exist at all, so the product detail
+// screen showed hardcoded fake description/comments/reviews/tags/
+// related-products regardless of which real product was opened.
+router.get('/products/:id', optionalAuthMiddleware, async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id)
+      .populate('merchantId', 'storeName fullName')
+      .populate('comments.userId', 'fullName');
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+
+    const stats = await computeProductStats([product._id.toString()]);
+    const s = stats[product._id.toString()] || {};
+
+    const obj = product.toObject();
+    obj.salesCount = s.salesCount || 0;
+    obj.avgRating = s.avgRating || 0;
+    obj.reviewCount = s.reviewCount || 0;
+    obj.merchantName = product.merchantId?.storeName || product.merchantId?.fullName || null;
+    obj.comments = (obj.comments || [])
+      .map((c) => ({ ...c, userName: c.userId?.fullName || 'VIPs User' }))
+      .reverse();
+
+    res.json({ success: true, data: obj });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
