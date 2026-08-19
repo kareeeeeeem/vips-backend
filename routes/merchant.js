@@ -29,6 +29,7 @@ const Staff       = require('../models/Staff');
 const Due         = require('../models/Due');
 const Employee    = require('../models/Employee');
 const Coupon      = require('../models/Coupon');
+const Payout      = require('../models/Payout');
 const BusinessRegistration = require('../models/BusinessRegistration');
 const Product = require('../models/Product');
 
@@ -248,6 +249,58 @@ router.get('/wallet', async (req, res) => {
         netBalance:   totalIn - totalOut,
       },
     });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/merchant/wallet/payout ─────────────────────
+// Funds are held (deducted from walletBalance) the moment the request is
+// made — see models/Payout.js for why this stays 'pending' rather than
+// actually disbursing (no bank rail is wired up).
+router.post('/wallet/payout', async (req, res) => {
+  try {
+    const { amount, bankName, accountName, accountNumber } = req.body;
+    const amt = Number(amount);
+    if (!amt || amt <= 0) {
+      return res.status(400).json({ success: false, message: 'A valid amount is required' });
+    }
+    if (!accountName || !accountNumber) {
+      return res.status(400).json({ success: false, message: 'Account name and number are required' });
+    }
+
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+    if ((merchant.walletBalance || 0) < amt) {
+      return res.status(400).json({ success: false, message: 'Insufficient wallet balance' });
+    }
+
+    merchant.walletBalance -= amt;
+
+    const [payout] = await Promise.all([
+      Payout.create({
+        merchantId: req.user.id, amount: amt,
+        bankName: bankName || '', accountName, accountNumber,
+      }),
+      merchant.save(),
+      Transaction.create({
+        userId: req.user.id, merchantId: req.user.id, type: 'debit', amount: amt,
+        currency: 'TND', description: 'Payout requested', status: 'pending',
+        reference: `PAYOUT-${Date.now()}`,
+      }),
+    ]);
+
+    res.status(201).json({ success: true, message: 'Payout requested', data: payout });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/merchant/wallet/payouts ─────────────────────
+router.get('/wallet/payouts', async (req, res) => {
+  try {
+    const payouts = await Payout.find({ merchantId: req.user.id }).sort({ createdAt: -1 }).limit(50);
+    res.json({ success: true, data: payouts });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
