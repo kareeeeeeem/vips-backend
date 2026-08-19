@@ -97,6 +97,11 @@ const MAX_GIFT_AMOUNT_PER_TX = 1000;
 const MAX_DAILY_GIFT_AMOUNT = 1000;
 const MAX_MONTHLY_GIFT_AMOUNT = 10000;
 
+// Spin Wheel — matches the "3 spins/day" the frontend has always
+// displayed, but never actually enforced server-side (remainingSpins
+// reset to 3 on every screen visit; POST /spin-wheel had no cap at all).
+const MAX_DAILY_SPINS = 3;
+
 router.post('/expense-to-reward', authMiddleware, async (req, res) => {
   try {
     const { amount, merchantId: rawMerchantId } = req.body;
@@ -319,10 +324,11 @@ router.get('/limits', authMiddleware, async (req, res) => {
     startOfMonth.setDate(1);
     startOfMonth.setHours(0, 0, 0, 0);
 
-    const [todaysRewards, todaysGifts, monthsGifts] = await Promise.all([
+    const [todaysRewards, todaysGifts, monthsGifts, todaysSpins] = await Promise.all([
       Transaction.find({ userId: req.user.id, type: 'reward', reference: { $regex: '^EXP-REW-' }, createdAt: { $gte: startOfDay } }).select('amount'),
       Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfDay } }).select('amount'),
       Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfMonth } }).select('amount'),
+      Transaction.countDocuments({ userId: req.user.id, reference: { $regex: '^SPIN-' }, createdAt: { $gte: startOfDay } }),
     ]);
 
     const rewardPointsToday = todaysRewards.reduce((sum, t) => sum + t.amount, 0);
@@ -348,6 +354,11 @@ router.get('/limits', authMiddleware, async (req, res) => {
           usedThisMonthAmount: giftAmountThisMonth,
           remainingThisMonthAmount: Math.max(0, MAX_MONTHLY_GIFT_AMOUNT - giftAmountThisMonth),
         },
+        spinWheel: {
+          dailyLimit: MAX_DAILY_SPINS,
+          usedToday: todaysSpins,
+          remainingSpins: Math.max(0, MAX_DAILY_SPINS - todaysSpins),
+        },
       },
     });
   } catch (error) {
@@ -358,6 +369,15 @@ router.get('/limits', authMiddleware, async (req, res) => {
 // ─── POST /api/rewards/spin-wheel ─────────────────────────
 router.post('/spin-wheel', authMiddleware, async (req, res) => {
   try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const spinsToday = await Transaction.countDocuments({
+      userId: req.user.id, reference: { $regex: '^SPIN-' }, createdAt: { $gte: startOfDay },
+    });
+    if (spinsToday >= MAX_DAILY_SPINS) {
+      return res.status(429).json({ success: false, message: 'No spins left today. Come back tomorrow!' });
+    }
+
     // Match flutter spin wheel values
     const rewards = [
       { type: 'points', amount: 100 },
@@ -389,7 +409,11 @@ router.post('/spin-wheel', authMiddleware, async (req, res) => {
     }
 
     const updatedUser = await User.findById(req.user.id).select('walletPoints');
-    res.json({ success: true, message: 'Wheel spun', data: { ...randomReward, newBalance: updatedUser?.walletPoints || 0 } });
+    res.json({
+      success: true,
+      message: 'Wheel spun',
+      data: { ...randomReward, newBalance: updatedUser?.walletPoints || 0, remainingSpins: Math.max(0, MAX_DAILY_SPINS - spinsToday - 1) },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
