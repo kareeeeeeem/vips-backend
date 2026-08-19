@@ -41,28 +41,46 @@ router.post('/register', async (req, res) => {
   try {
     const {
       ownerName, ownerNameAr, storeName, storeNameAr, businessType,
-      category, jobTitle, phone, email, address, description,
-      schedule, loyaltyType, documents
+      category, jobTitle, phone, email, address, apartment, locationName,
+      description, schedule, loyaltyType, documents, tin, facebook, instagram, website,
     } = req.body;
     const merchantId = req.user.id;
-    const existing = await BusinessRegistration.findOne({ merchantId });
-    let registration;
-    if (existing) {
-      registration = await BusinessRegistration.findOneAndUpdate(
-        { merchantId },
-        { ownerName, businessName: storeName, businessType: businessType || 'retail',
-          phone, email, address, description, status: 'pending' },
-        { new: true }
-      );
-    } else {
-      registration = await BusinessRegistration.create({
-        merchantId, ownerName: ownerName || '', businessName: storeName || '',
-        businessType: businessType || 'retail', phone: phone || '',
-        email: email || '', address: address || '', description: description || '',
-        status: 'pending',
-      });
+
+    const fields = {
+      ownerName:      ownerName || '',
+      ownerNameAr:    ownerNameAr || '',
+      businessName:   storeName || '',
+      businessNameAr: storeNameAr || '',
+      businessType:   businessType || 'retail',
+      jobTitle:       jobTitle || '',
+      phone:          phone || '',
+      email:          email || '',
+      address:        address || '',
+      apartment:      apartment || '',
+      locationName:   locationName || '',
+      description:    description || '',
+      schedule:       schedule || {},
+      loyaltyType:    loyaltyType === 'private' ? 'private' : 'everywhere',
+      taxId:          tin || '',
+      website:        website || '',
+      'socialMedia.facebook':  facebook || '',
+      'socialMedia.instagram': instagram || '',
+      status: 'pending',
+    };
+    // Frontend uploads documents to /api/upload first and passes back plain
+    // URL strings — the schema stores them as {type,url,uploadedAt}.
+    if (Array.isArray(documents) && documents.length) {
+      fields.documents = documents.map((url) => ({ type: 'document', url }));
     }
-    // Update user profile with registration info
+
+    const registration = await BusinessRegistration.findOneAndUpdate(
+      { merchantId },
+      { $set: fields, $setOnInsert: { merchantId } },
+      { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
+    );
+
+    // Update user profile with the subset of registration info User itself
+    // tracks (used for display elsewhere in the merchant app).
     await User.findByIdAndUpdate(merchantId, {
       $set: { storeName, storeCategory: category, phone, address, description }
     });
@@ -80,10 +98,11 @@ router.post('/register', async (req, res) => {
 router.get('/dashboard', async (req, res) => {
   try {
     const merchantId = req.user.id;
+    const merchantObjectId = new (require('mongoose').Types.ObjectId)(merchantId);
 
-    const [agg, pending, total] = await Promise.all([
+    const [agg, pending, total, dueAgg, stockAgg] = await Promise.all([
       Transaction.aggregate([
-        { $match: { merchantId: new (require('mongoose').Types.ObjectId)(merchantId), status: 'completed' } },
+        { $match: { merchantId: merchantObjectId, status: 'completed' } },
         { $group: {
             _id: '$type',
             total: { $sum: '$amount' },
@@ -92,6 +111,23 @@ router.get('/dashboard', async (req, res) => {
       ]),
       Transaction.countDocuments({ merchantId, status: 'pending' }),
       Transaction.countDocuments({ merchantId }),
+      // Sale Due / Due Collect cards: real outstanding-vs-collected totals
+      // from the Due ledger (routes/dues.js), not transaction-derived.
+      Due.aggregate([
+        { $match: { merchantId: merchantObjectId } },
+        { $group: {
+            _id: null,
+            totalDue:       { $sum: { $subtract: ['$totalAmount', '$paidAmount'] } },
+            totalCollected: { $sum: '$paidAmount' },
+        }},
+      ]),
+      // Purchase card: current inventory value (stock on hand × unit
+      // price) — there's no supplier purchase-order log in the schema, so
+      // this is the closest real number rather than a fabricated one.
+      Stock.aggregate([
+        { $match: { merchantId: merchantObjectId } },
+        { $group: { _id: null, value: { $sum: { $multiply: ['$currentStock', '$unitPrice'] } } } },
+      ]),
     ]);
 
     const byType = {};
@@ -109,6 +145,9 @@ router.get('/dashboard', async (req, res) => {
         totalExpenses,
         totalGiftBack,
         totalRewards,
+        totalPurchases:      stockAgg[0]?.value || 0,
+        totalSaleDue:        Math.max(0, dueAgg[0]?.totalDue || 0),
+        totalDueCollect:     dueAgg[0]?.totalCollected || 0,
         pendingTransactions: pending,
         netProfit:           totalSales - totalExpenses,
         transactionCount:    total,
@@ -232,10 +271,10 @@ router.get('/profile', async (req, res) => {
 // ─── PUT /api/merchant/profile ────────────────────────────
 router.put('/profile', async (req, res) => {
   try {
-    const { storeName, storeCategory, phone, address, description, logo, brandColor, profileImage } = req.body;
+    const { storeName, storeCategory, phone, address, description, logo, coverImage, brandColor, profileImage } = req.body;
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { storeName, storeCategory, phone, address, description, logo, brandColor, profileImage },
+      { storeName, storeCategory, phone, address, description, logo, coverImage, brandColor, profileImage },
       { new: true, runValidators: true }
     ).select('-password');
     res.json({ success: true, message: 'Profile updated', data: user });
@@ -468,6 +507,43 @@ router.get('/orders', async (req, res) => {
   }
 });
 
+// ─── GET /api/merchant/orders/stats ───────────────────────
+// Registered before GET /orders/:id so 'stats' doesn't get swallowed as an
+// :id. True lifetime totals — the repository used to derive these purely
+// from the ?status=pending list (AppConstants.currentOrdersUri), so
+// "Total Orders"/"Total Revenue" only ever counted pending orders.
+router.get('/orders/stats', async (req, res) => {
+  try {
+    const merchantId = req.user.id;
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const [totalOrders, pendingOrders, completedOrders, todayOrders, revenueAgg] = await Promise.all([
+      Order.countDocuments({ merchantId }),
+      Order.countDocuments({ merchantId, status: 'pending' }),
+      Order.countDocuments({ merchantId, status: 'delivered' }),
+      Order.countDocuments({ merchantId, createdAt: { $gte: startOfDay } }),
+      Order.aggregate([
+        { $match: { merchantId: new (require('mongoose').Types.ObjectId)(merchantId), paymentStatus: 'paid' } },
+        { $group: { _id: null, total: { $sum: '$totalAmount' } } },
+      ]),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        totalOrders,
+        pendingOrders,
+        completedOrders,
+        todayOrders,
+        totalRevenue: revenueAgg[0]?.total || 0,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── POST /api/merchant/orders ────────────────────────────
 // Flutter sends status updates as POST with _method=put in body
 // Body: { order_id, status, _method: 'put', reason, otp, processing_time }
@@ -566,7 +642,40 @@ router.put('/orders/:id/status', async (req, res) => {
     if (status === 'delivered' && order.paymentMethod === 'cash' && order.paymentStatus === 'pending') {
       order.paymentStatus = 'paid';
     }
+
+    // Merchant approving a refund_requested order (see POST
+    // /order/:id/request-refund for how it gets into that state): reverse
+    // whatever was actually paid and credited, don't just relabel the
+    // status. Denying a refund is just another status update — it goes
+    // through this same route with status back to 'delivered' and hits
+    // none of this.
+    let refundedPoints = 0;
+    if (status === 'refunded' && order.paymentStatus !== 'refunded') {
+      if (order.pointsCredited) {
+        const earnedPoints = Math.floor(order.totalAmount || 0);
+        const user = await User.findById(order.userId);
+        if (user) {
+          user.walletPoints = Math.max(0, (user.walletPoints || 0) - earnedPoints);
+          await user.save();
+          refundedPoints = earnedPoints;
+        }
+      }
+      order.paymentStatus = 'refunded';
+    }
     await order.save();
+
+    if (refundedPoints > 0) {
+      await Transaction.create({
+        userId: order.userId,
+        merchantId: req.user.id,
+        type: 'debit',
+        amount: refundedPoints,
+        currency: 'PTS',
+        description: `${refundedPoints} VIPS points reversed — order #${order.orderNumber} refunded`,
+        status: 'completed',
+        reference: `ORDER-REFUND-${order._id}`,
+      });
+    }
 
     if (order.paymentStatus === 'paid' && !order.pointsCredited) {
       const { creditPointsForOrder } = require('../utils/points');
@@ -590,22 +699,52 @@ router.put('/orders/:id/status', async (req, res) => {
 // GIFT BACK
 // ═══════════════════════════════════════════════════════════
 
+// ─── GET /api/merchant/gift-back/lookup ───────────────────
+// Resolves a scanned VIPs QR (VIPS_USER_<id>, see vips_id_view.dart) or a
+// typed phone number to a display name before the merchant confirms the
+// send — deliberately not scoped to /merchant/customers' transaction
+// history, since a gift-back's whole point can be a first-time customer.
+router.get('/gift-back/lookup', async (req, res) => {
+  try {
+    const { userId, phone } = req.query;
+    if (!userId && !phone) {
+      return res.status(400).json({ success: false, message: 'userId or phone is required' });
+    }
+    const recipient = userId
+      ? await User.findById(userId).select('fullName phone')
+      : await User.findOne({ phone: String(phone).trim() }).select('fullName phone');
+    if (!recipient) return res.status(404).json({ success: false, message: 'No customer found' });
+
+    res.json({ success: true, data: { userId: recipient._id, fullName: recipient.fullName, phone: recipient.phone } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── POST /api/merchant/gift-back ─────────────────────────
 router.post('/gift-back', async (req, res) => {
   try {
-    const { userId, amount, message } = req.body;
-    if (!userId || !amount) {
-      return res.status(400).json({ success: false, message: 'userId and amount are required' });
+    const { userId, phone, amount, message } = req.body;
+    if ((!userId && !phone) || !amount) {
+      return res.status(400).json({ success: false, message: 'userId or phone, and amount, are required' });
     }
 
-    const recipient = await User.findById(userId);
-    if (!recipient) return res.status(404).json({ success: false, message: 'User not found' });
+    // The merchant-app flow only ever collects a phone number (there's no
+    // reason a merchant would know a stranger's Mongo _id) — resolving it
+    // here, rather than requiring the app to pre-resolve it via
+    // /merchant/customers, also works for a customer this merchant has
+    // never transacted with before, which that endpoint can't find (it's
+    // scoped to this merchant's existing Transaction history).
+    const recipient = userId
+      ? await User.findById(userId)
+      : await User.findOne({ phone: String(phone).trim() });
+    if (!recipient) return res.status(404).json({ success: false, message: 'No customer found with that phone number' });
 
     recipient.walletPoints = (recipient.walletPoints || 0) + parseFloat(amount);
     await recipient.save();
 
     const tx = await Transaction.create({
-      userId,
+      userId: recipient._id,
       merchantId:  req.user.id,
       type:        'gift_back',
       amount:      parseFloat(amount),
@@ -615,7 +754,7 @@ router.post('/gift-back', async (req, res) => {
       reference:   `GIFT-${Date.now()}`,
     });
 
-    res.status(201).json({ success: true, message: 'Gift back sent!', data: tx });
+    res.status(201).json({ success: true, message: 'Gift back sent!', data: { ...tx.toObject(), recipientName: recipient.fullName, recipientPhone: recipient.phone } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

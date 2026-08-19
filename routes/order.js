@@ -228,6 +228,24 @@ router.put('/:id/cancel', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── PUT /api/order/:id/request-refund ─────────────────────
+router.put('/:id/request-refund', authMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (order.status !== 'delivered') {
+      return res.status(400).json({ success: false, message: 'Only delivered orders can be refunded' });
+    }
+    order.status = 'refund_requested';
+    order.refundRequestedAt = new Date();
+    order.cancellationReason = (req.body?.reason || '').toString().slice(0, 500);
+    await order.save();
+    res.json({ success: true, message: 'Refund requested', data: order });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── POST /api/order/:id/review ───────────────────────────
 router.post('/:id/review', authMiddleware, async (req, res) => {
   try {

@@ -35,6 +35,7 @@ const userSchema = new mongoose.Schema(
     storeAddress: { type: String, default: null },
     storeCategory: { type: String, default: null },
     logo: { type: String, default: null },
+    coverImage: { type: String, default: null },
     brandColor: { type: String, default: null }, // e.g., '0xFFDC2626'
     isTrending: { type: Boolean, default: false },
     discountPercentage: { type: Number, default: 0 },
