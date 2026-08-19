@@ -141,6 +141,22 @@ router.get('/packages', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── GET /api/services/packages/current ────────────────────
+// The Packages screen's "Current" badge was permanently hardcoded to
+// Basic client-side — after a real purchase via POST
+// /packages/subscribe there was no way to find out the account's real
+// active tier.
+router.get('/packages/current', authMiddleware, async (req, res) => {
+  try {
+    const sub = await Subscription.findOne({
+      userId: req.user.id, isActive: true, endDate: { $gt: new Date() },
+    }).sort({ endDate: -1 });
+    res.json({ success: true, data: { tier: sub?.tier || 'basic', endDate: sub?.endDate || null } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── POST /api/services/packages/subscribe ────────────────
 router.post('/packages/subscribe', authMiddleware, async (req, res) => {
   try {
