@@ -110,7 +110,8 @@ app.get('/api/user/payment-methods', (req, res) => {
 });
 
 // ─── Admin: update employee ────────────────────────────────
-app.put('/api/admin/employees/:id', async (req, res) => {
+const { authMiddleware, requireRole } = require('./middleware/auth');
+app.put('/api/admin/employees/:id', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const { name, email } = req.body;
     const Employee = require('./models/Employee');
@@ -138,6 +139,10 @@ app.get('/api/health', (req, res) => {
       readyState: dbReadyState,
       status:     dbStates[dbReadyState] || 'unknown',
     },
+    // Boolean + error message only — never the raw FIREBASE_SERVICE_ACCOUNT
+    // value — so social-login misconfiguration can be diagnosed without
+    // dashboard/log access.
+    firebaseAdmin: require('./utils/firebaseAdmin').getInitStatus(),
   });
 });
 
@@ -159,7 +164,11 @@ mongoose
   .connect(process.env.MONGODB_URI)
   .then(async () => {
     console.log('✅ Connected to MongoDB');
-    await runAutoSeeder();
+    if (process.env.NODE_ENV === 'production') {
+      console.log('⚠️  Skipping auto-seeder in production (hardcoded demo accounts must not be created against a live DB).');
+    } else {
+      await runAutoSeeder();
+    }
     app.listen(PORT, () => {
       console.log(`🚀 Server running on http://localhost:${PORT}`);
       console.log(`📋 Health check: http://localhost:${PORT}/api/health`);

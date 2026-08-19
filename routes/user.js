@@ -166,12 +166,26 @@ router.post('/transfer', async (req, res) => {
   try {
     const { recipientPhone, amount, description } = req.body;
 
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Amount must be a positive number.',
+      });
+    }
+
     // Find recipient
     const recipient = await User.findOne({ phone: recipientPhone });
     if (!recipient) {
       return res.status(404).json({
         success: false,
         message: 'Recipient not found.',
+      });
+    }
+
+    if (recipient._id.equals(req.user.id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot transfer to yourself.',
       });
     }
 
@@ -234,6 +248,36 @@ router.post('/notifications/read-all', async (req, res) => {
   try {
     await UserNotification.updateMany({ userId: req.user.id, isRead: false }, { isRead: true });
     res.json({ success: true, message: 'All notifications marked as read' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── PUT /api/user/notifications/:id/read-status ──────────
+// Mark a single notification read or unread — previously only a
+// mark-everything-read endpoint existed, so individual mark-as-read/unread
+// in the app only updated local state and reverted on next load.
+router.put('/notifications/:id/read-status', async (req, res) => {
+  try {
+    const { isRead } = req.body;
+    const notification = await UserNotification.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
+      { isRead: isRead !== false },
+      { new: true }
+    );
+    if (!notification) return res.status(404).json({ success: false, message: 'Notification not found' });
+    res.json({ success: true, data: notification });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── DELETE /api/user/notifications/:id ────────────────────
+router.delete('/notifications/:id', async (req, res) => {
+  try {
+    const result = await UserNotification.deleteOne({ _id: req.params.id, userId: req.user.id });
+    if (result.deletedCount === 0) return res.status(404).json({ success: false, message: 'Notification not found' });
+    res.json({ success: true, message: 'Notification deleted' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -672,11 +716,19 @@ router.post('/referral/use', async (req, res) => {
 });
 
 // ─── POST /api/user/wallet/topup ─────────────────────────────
+// NOTE: there is no live payment gateway behind this yet (see
+// GET /payment-methods, which returns an empty card list as a placeholder),
+// so this endpoint currently mints wallet balance from a client-supplied
+// number with nothing actually charged. The cap below is a stopgap to
+// bound the exposure until a real payment gateway is wired in — it is
+// not a substitute for verifying an actual charge.
+const MAX_TOPUP_AMOUNT = 50000;
+
 router.post('/wallet/topup', async (req, res) => {
   try {
     const { vipsAmount, cardId } = req.body;
-    if (!vipsAmount || vipsAmount < 100) {
-      return res.status(400).json({ success: false, message: 'Minimum purchase is 100 VIPS' });
+    if (!vipsAmount || vipsAmount < 100 || vipsAmount > MAX_TOPUP_AMOUNT) {
+      return res.status(400).json({ success: false, message: 'Invalid top-up amount' });
     }
 
     const user = await User.findById(req.user.id);

@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
 const { authMiddleware } = require('../middleware/auth');
+const { verifyFirebaseIdToken } = require('../utils/firebaseAdmin');
 
 const router = express.Router();
 
@@ -158,6 +159,49 @@ router.put('/update-profile', authMiddleware, async (req, res) => {
       message: 'Profile updated successfully!',
       data: { user: user.toJSON() },
     });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// ─── PUT /api/auth/change-password ────────────────────────
+// Authenticated in-session password change — requires the current
+// password, unlike /reset-password which is the logged-out OTP flow.
+router.put('/change-password', authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Current password and new password are required.',
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 6 characters.',
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    res.json({ success: true, message: 'Password changed successfully!' });
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -375,29 +419,39 @@ router.post('/merchant-verify-otp', async (req, res) => {
 
 // ─── POST /api/auth/social ────────────────────────────────
 // Find-or-create a user from a social provider (Google / Facebook / Apple / Phone).
-// Client sends: { email, name, providerUid, provider, phone? }
-// `phone` is the real, Firebase-verified number and is only honored when
-// provider === 'phone' — for other providers it is ignored so an OAuth
-// account can never impersonate an existing phone-registered account.
+// Client sends: { idToken, provider }
+// `idToken` is a Firebase ID token for the signed-in user; it is verified
+// server-side with the Firebase Admin SDK and all identity fields (uid,
+// email, phone) are taken from the verified claims — never from the
+// request body — so a caller cannot forge someone else's identity.
 router.post('/social', async (req, res) => {
   try {
-    const { email, name, providerUid, provider, phone } = req.body;
+    const { idToken, provider } = req.body;
 
-    if (!providerUid) {
-      return res.status(400).json({ success: false, message: 'providerUid is required' });
+    if (!idToken) {
+      return res.status(400).json({ success: false, message: 'idToken is required' });
     }
 
-    const socialEmail = (email || '').toLowerCase().trim() || `${providerUid}@social.vips.app`;
+    let decoded;
+    try {
+      decoded = await verifyFirebaseIdToken(idToken);
+    } catch (err) {
+      console.error('[auth/social] verifyFirebaseIdToken failed:', err.code || err.name, '-', err.message);
+      return res.status(401).json({ success: false, message: 'Invalid or expired sign-in token.' });
+    }
+
+    const providerUid = decoded.uid;
+    const socialEmail = (decoded.email || '').toLowerCase().trim() || `${providerUid}@social.vips.app`;
     const socialPhone =
-      provider === 'phone' && phone
-        ? phone.trim()
+      provider === 'phone' && decoded.phone_number
+        ? decoded.phone_number.trim()
         : `social_${providerUid}`;
 
     let user = await User.findOne({ $or: [{ email: socialEmail }, { phone: socialPhone }] });
 
     if (!user) {
       user = await User.create({
-        fullName : name || 'VIPs User',
+        fullName : decoded.name || 'VIPs User',
         email    : socialEmail,
         phone    : socialPhone,
         password : crypto.randomBytes(32).toString('hex'),
@@ -416,6 +470,7 @@ router.post('/social', async (req, res) => {
 
     res.json({ success: true, message: 'Social login successful!', data: { user: user.toJSON(), token } });
   } catch (error) {
+    console.error('[auth/social] unexpected error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -425,16 +480,31 @@ router.post('/social', async (req, res) => {
 // email. Unlike /social this never creates a new account — merchants must
 // already exist via business registration, matching the same "must already
 // exist" rule /merchant-login enforces for phone+OTP sign-in.
-// Client sends: { email, providerUid, provider }
+// Client sends: { idToken }. The Firebase ID token is verified server-side
+// and the email used to look up the merchant comes from the verified
+// claims, never from the request body.
 router.post('/merchant-social', async (req, res) => {
   try {
-    const { email, providerUid, provider } = req.body;
+    const { idToken } = req.body;
 
-    if (!providerUid || !email) {
-      return res.status(400).json({ success: false, message: 'email and providerUid are required' });
+    if (!idToken) {
+      return res.status(400).json({ success: false, message: 'idToken is required' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    let decoded;
+    try {
+      decoded = await verifyFirebaseIdToken(idToken);
+    } catch (err) {
+      console.error('[auth/merchant-social] verifyFirebaseIdToken failed:', err.code || err.name, '-', err.message);
+      return res.status(401).json({ success: false, message: 'Invalid or expired sign-in token.' });
+    }
+
+    const email = (decoded.email || '').toLowerCase().trim();
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'This sign-in method has no verified email.' });
+    }
+
+    const user = await User.findOne({ email });
     if (!user || user.role !== 'merchant') {
       return res.status(401).json({ success: false, message: 'No merchant account found with this email.' });
     }
@@ -450,6 +520,7 @@ router.post('/merchant-social', async (req, res) => {
 
     res.json({ success: true, message: 'Social login successful!', data: { user: user.toJSON(), token } });
   } catch (error) {
+    console.error('[auth/merchant-social] unexpected error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 });

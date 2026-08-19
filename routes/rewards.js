@@ -56,8 +56,8 @@ router.put('/coupons/:id', authMiddleware, async (req, res) => {
     if (expiryDate !== undefined) updates.expiryDate = new Date(expiryDate);
     if (isActive !== undefined) updates.isActive = isActive;
 
-    const coupon = await Coupon.findByIdAndUpdate(
-      req.params.id,
+    const coupon = await Coupon.findOneAndUpdate(
+      { _id: req.params.id, merchantId: req.user.id },
       { $set: updates },
       { new: true, runValidators: true }
     );
@@ -71,7 +71,7 @@ router.put('/coupons/:id', authMiddleware, async (req, res) => {
 // ─── DELETE /api/rewards/coupons/:id ──────────────────
 router.delete('/coupons/:id', authMiddleware, async (req, res) => {
   try {
-    const coupon = await Coupon.findByIdAndDelete(req.params.id);
+    const coupon = await Coupon.findOneAndDelete({ _id: req.params.id, merchantId: req.user.id });
     if (!coupon) return res.status(404).json({ success: false, message: 'Coupon not found' });
     res.json({ success: true, message: 'Coupon deleted' });
   } catch (error) {
@@ -80,16 +80,49 @@ router.delete('/coupons/:id', authMiddleware, async (req, res) => {
 });
 
 // ─── POST /api/rewards/expense-to-reward ───────────────────────
+// NOTE: `amount` is a self-reported expense with no receipt/gateway
+// verification behind it, so this endpoint is inherently farmable by a
+// user repeatedly claiming expenses that never happened. The caps below
+// are a stopgap to bound the damage until expenses are tied to a
+// verified purchase (e.g. a real Order/Transaction record); they are not
+// a real fix and should be replaced once that verification exists.
+const MAX_EXPENSE_AMOUNT = 5000;
+const MAX_DAILY_EXPENSE_REWARD_POINTS = 500;
+
+// Gift Back limits — enforced in /send-gift and reported by /limits.
+// Placeholder business values pending confirmation; easy to tune later
+// since everything reads from these constants.
+const MIN_GIFT_AMOUNT = 1;
+const MAX_GIFT_AMOUNT_PER_TX = 1000;
+const MAX_DAILY_GIFT_AMOUNT = 1000;
+const MAX_MONTHLY_GIFT_AMOUNT = 10000;
+
 router.post('/expense-to-reward', authMiddleware, async (req, res) => {
   try {
     const { amount, merchantId } = req.body;
-    
-    if (!amount || amount <= 0) {
+
+    if (!amount || amount <= 0 || amount > MAX_EXPENSE_AMOUNT) {
       return res.status(400).json({ success: false, message: 'Invalid amount' });
     }
 
     // Give 10% of expense as reward points
     const pointsEarned = Math.floor(amount * 0.1);
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const todaysRewards = await Transaction.find({
+      userId: req.user.id,
+      type: 'reward',
+      reference: { $regex: '^EXP-REW-' },
+      createdAt: { $gte: startOfDay },
+    }).select('amount');
+    const totalToday = todaysRewards.reduce((sum, t) => sum + t.amount, 0);
+    if (totalToday + pointsEarned > MAX_DAILY_EXPENSE_REWARD_POINTS) {
+      return res.status(429).json({
+        success: false,
+        message: 'Daily expense-to-reward limit reached. Try again tomorrow.',
+      });
+    }
 
     const user = await User.findById(req.user.id);
     user.walletPoints += pointsEarned;
@@ -197,11 +230,37 @@ router.post('/send-gift', authMiddleware, async (req, res) => {
     if (!recipientPhone || !amount || amount <= 0) {
       return res.status(400).json({ success: false, message: 'recipientPhone and a valid amount are required' });
     }
+    if (amount < MIN_GIFT_AMOUNT || amount > MAX_GIFT_AMOUNT_PER_TX) {
+      return res.status(400).json({
+        success: false,
+        message: `Amount must be between ${MIN_GIFT_AMOUNT} and ${MAX_GIFT_AMOUNT_PER_TX} TND per gift.`,
+      });
+    }
 
     const sender = await User.findById(req.user.id);
     if (!sender) return res.status(404).json({ success: false, message: 'User not found' });
     if (sender.walletBalance < amount) {
       return res.status(400).json({ success: false, message: 'Insufficient balance' });
+    }
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+
+    const [todaysGifts, monthsGifts] = await Promise.all([
+      Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfDay } }).select('amount'),
+      Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfMonth } }).select('amount'),
+    ]);
+    const spentToday = todaysGifts.reduce((sum, t) => sum + t.amount, 0);
+    const spentThisMonth = monthsGifts.reduce((sum, t) => sum + t.amount, 0);
+
+    if (spentToday + amount > MAX_DAILY_GIFT_AMOUNT) {
+      return res.status(429).json({ success: false, message: 'Daily gift limit reached. Try again tomorrow.' });
+    }
+    if (spentThisMonth + amount > MAX_MONTHLY_GIFT_AMOUNT) {
+      return res.status(429).json({ success: false, message: 'Monthly gift limit reached.' });
     }
 
     // Deduct from sender
@@ -224,6 +283,54 @@ router.post('/send-gift', authMiddleware, async (req, res) => {
     ]);
 
     res.status(201).json({ success: true, message: 'Gift sent', data: { gift, newBalance: sender.walletBalance } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/rewards/limits ───────────────────────────────
+// Real daily/monthly limits + actual usage-to-date for the Reward
+// (expense-to-reward) and Gift Back (send-gift) flows, computed from this
+// user's real Transaction history — not display-only placeholder numbers.
+router.get('/limits', authMiddleware, async (req, res) => {
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+
+    const [todaysRewards, todaysGifts, monthsGifts] = await Promise.all([
+      Transaction.find({ userId: req.user.id, type: 'reward', reference: { $regex: '^EXP-REW-' }, createdAt: { $gte: startOfDay } }).select('amount'),
+      Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfDay } }).select('amount'),
+      Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfMonth } }).select('amount'),
+    ]);
+
+    const rewardPointsToday = todaysRewards.reduce((sum, t) => sum + t.amount, 0);
+    const giftAmountToday = todaysGifts.reduce((sum, t) => sum + t.amount, 0);
+    const giftAmountThisMonth = monthsGifts.reduce((sum, t) => sum + t.amount, 0);
+
+    res.json({
+      success: true,
+      data: {
+        reward: {
+          maxExpensePerTransaction: MAX_EXPENSE_AMOUNT,
+          dailyLimitPoints: MAX_DAILY_EXPENSE_REWARD_POINTS,
+          usedTodayPoints: rewardPointsToday,
+          remainingTodayPoints: Math.max(0, MAX_DAILY_EXPENSE_REWARD_POINTS - rewardPointsToday),
+        },
+        giftBack: {
+          minAmount: MIN_GIFT_AMOUNT,
+          maxAmountPerTransaction: MAX_GIFT_AMOUNT_PER_TX,
+          dailyLimitAmount: MAX_DAILY_GIFT_AMOUNT,
+          usedTodayAmount: giftAmountToday,
+          remainingTodayAmount: Math.max(0, MAX_DAILY_GIFT_AMOUNT - giftAmountToday),
+          monthlyLimitAmount: MAX_MONTHLY_GIFT_AMOUNT,
+          usedThisMonthAmount: giftAmountThisMonth,
+          remainingThisMonthAmount: Math.max(0, MAX_MONTHLY_GIFT_AMOUNT - giftAmountThisMonth),
+        },
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

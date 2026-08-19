@@ -1,14 +1,20 @@
 const express = require('express');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
+const User = require('../models/User');
+const Transaction = require('../models/Transaction');
 const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
+// Same conversion rate as GET /api/config/rates (index.js) — kept in sync
+// manually since rates aren't stored in the DB yet.
+const VIPS_TO_TND = 0.1;
+
 // ─── POST /api/order/create ───────────────────────────────
 router.post('/create', authMiddleware, async (req, res) => {
   try {
-    const { merchantId, items, paymentMethod, deliveryAddress, orderType, orderNote, couponCode, couponDiscountAmount } = req.body;
+    const { merchantId, items, paymentMethod, deliveryAddress, orderType, orderNote, couponCode, couponDiscountAmount, walletPointsRedeemed } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: 'Order must contain at least one item' });
@@ -28,17 +34,42 @@ router.post('/create', authMiddleware, async (req, res) => {
     const discount = Number(couponDiscountAmount) || 0;
     totalAmount = Math.max(0, totalAmount - discount);
 
+    // Redeem wallet points against the remaining total, if requested.
+    // Capped by both what the user actually has and what's left to pay —
+    // never lets a redemption push the order below zero or overdraw the
+    // wallet.
+    let pointsUsed = 0;
+    let walletDiscountAmount = 0;
+    const requestedPoints = Number(walletPointsRedeemed) || 0;
+    let user = null;
+    if (requestedPoints > 0) {
+      user = await User.findById(req.user.id);
+      if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+      const maxRedeemableByBalance = Math.max(0, Math.floor(user.walletPoints));
+      const maxRedeemableByTotal = Math.floor(totalAmount / VIPS_TO_TND);
+      pointsUsed = Math.max(0, Math.min(requestedPoints, maxRedeemableByBalance, maxRedeemableByTotal));
+      walletDiscountAmount = Math.round(pointsUsed * VIPS_TO_TND * 100) / 100;
+      totalAmount = Math.max(0, Math.round((totalAmount - walletDiscountAmount) * 100) / 100);
+    }
+
     // Normalize deliveryAddress: accept both plain string and structured object
     const addressObj = typeof deliveryAddress === 'string'
       ? { address: deliveryAddress }
       : (deliveryAddress || {});
 
+    // A bare '' or falsy value isn't a valid ObjectId — omit the field
+    // entirely rather than passing something that fails Mongoose's cast.
+    const validMerchantId = merchantId && String(merchantId).trim() ? merchantId : null;
+
     const order = await Order.create({
       userId:              req.user.id,
-      merchantId,
+      merchantId:          validMerchantId,
       items:               normalizedItems,
       totalAmount,
       couponDiscountAmount: discount,
+      walletPointsRedeemed: pointsUsed,
+      walletDiscountAmount,
       paymentMethod:       paymentMethod || 'cash',
       deliveryAddress:     addressObj,
       orderType:           orderType || 'delivery',
@@ -46,6 +77,23 @@ router.post('/create', authMiddleware, async (req, res) => {
       status:              'pending',
       pendingAt:           new Date(),
     });
+
+    if (pointsUsed > 0 && user) {
+      user.walletPoints -= pointsUsed;
+      await Promise.all([
+        user.save(),
+        Transaction.create({
+          userId:     user._id,
+          merchantId: merchantId || user._id,
+          type:       'debit',
+          amount:     pointsUsed,
+          currency:   'PTS',
+          description: `${pointsUsed} VIPS points redeemed on order #${order.orderNumber}`,
+          status:     'completed',
+          reference:  `ORDER-PTS-${order._id}`,
+        }),
+      ]);
+    }
 
     res.status(201).json({ success: true, message: 'Order created', data: order });
   } catch (error) {

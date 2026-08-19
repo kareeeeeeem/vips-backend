@@ -247,21 +247,61 @@ router.get('/products', optionalAuthMiddleware, async (req, res) => {
 });
 
 // ─── GET /api/content/search ──────────────────────────────
+// `category` and `sort` used to be silently ignored — the app's filter
+// sheet (category chips + sort options) looked functional but never
+// changed the results. Now both are actually applied.
 router.get('/search', optionalAuthMiddleware, async (req, res) => {
   try {
-    const { q = '' } = req.query;
+    const { q = '', category, sort } = req.query;
     const regex = new RegExp(q, 'i');
+    const catRegex = category && category !== 'All' ? new RegExp(`^${category}$`, 'i') : null;
+
+    // "Outings" in the category picker means "only show outings", not a
+    // literal category value to match against every collection.
+    const onlyOutings = catRegex && category.toLowerCase() === 'outings';
+
+    const dealFilter = { $or: [{ title: regex }, { description: regex }] };
+    const outingFilter = { $or: [{ title: regex }, { subtitle: regex }, { category: regex }] };
+    const merchantFilter = { role: 'merchant', $or: [{ storeName: regex }, { storeCategory: regex }] };
+    const productFilter = { $or: [{ name: regex }, { description: regex }, { category: regex }] };
+
+    if (catRegex && !onlyOutings) {
+      dealFilter.category = catRegex;
+      merchantFilter.storeCategory = catRegex;
+      productFilter.category = catRegex;
+    }
+
+    let dealSort = {}, outingSort = {}, productSort = {};
+    switch (sort) {
+      case 'Price: Low to High':
+        dealSort = { currentPrice: 1 };
+        productSort = { price: 1 };
+        break;
+      case 'Price: High to Low':
+        dealSort = { currentPrice: -1 };
+        productSort = { price: -1 };
+        break;
+      case 'Newest':
+        dealSort = outingSort = productSort = { createdAt: -1 };
+        break;
+      case 'Rating':
+        dealSort = { rating: -1 };
+        outingSort = { rating: -1 };
+        break;
+      default:
+        break; // Relevance — no explicit sort
+    }
 
     const [deals, outings, merchants, products] = await Promise.all([
-      Deal.find({ $or: [{ title: regex }, { description: regex }] }).limit(5),
-      Outing.find({ $or: [{ title: regex }, { subtitle: regex }, { category: regex }] }).limit(5),
-      User.find({ role: 'merchant', $or: [{ storeName: regex }, { storeCategory: regex }] })
+      onlyOutings ? [] : Deal.find(dealFilter).sort(dealSort).limit(5),
+      catRegex && !onlyOutings ? [] : Outing.find(outingFilter).sort(outingSort).limit(5),
+      onlyOutings ? [] : User.find(merchantFilter)
         .select('storeName storeCategory logo brandColor discountPercentage').limit(5),
-      Product.find({ $or: [{ name: regex }, { description: regex }, { category: regex }] }).limit(5),
+      onlyOutings ? [] : Product.find(productFilter).sort(productSort).limit(5),
     ]);
 
-    // If everything empty, reseed and retry once
-    if (!deals.length && !outings.length && !merchants.length && !products.length) {
+    // If everything empty (and no filter narrowed it down), reseed and retry once
+    if (!deals.length && !outings.length && !merchants.length && !products.length && !catRegex) {
       await runAutoSeeder();
     }
 

@@ -35,7 +35,11 @@ const orderSchema = new mongoose.Schema(
     orderNumber: { type: Number, unique: true, sparse: true },
 
     userId:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    merchantId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    // Not required: seeded Deal documents commonly have merchantId: null
+    // (no specific merchant attached), and an order must still be
+    // creatable for those — this was `required: true` and made every
+    // checkout for a merchant-less deal fail with a validation error.
+    merchantId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
     items: [orderItemSchema],
 
@@ -43,6 +47,8 @@ const orderSchema = new mongoose.Schema(
     couponDiscountAmount:  { type: Number, default: 0 },
     couponDiscountTitle:   { type: String, default: '' },
     storeDiscountAmount:   { type: Number, default: 0 },
+    walletPointsRedeemed:  { type: Number, default: 0 },
+    walletDiscountAmount:  { type: Number, default: 0 },
     totalTaxAmount:        { type: Number, default: 0 },
     deliveryCharge:        { type: Number, default: 0 },
     additionalCharge:      { type: Number, default: 0 },
