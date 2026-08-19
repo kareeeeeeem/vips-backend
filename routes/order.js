@@ -132,10 +132,22 @@ router.get('/my-orders', authMiddleware, async (req, res) => {
 
 // ─── GET /api/order/trips ─────────────────────────────────
 // Must be defined BEFORE /:id to avoid route conflict
+// Maps the Shipping screen's filter chips (widgets/filter.dart-equivalent
+// in shipping_controller.dart's _buildFilterSheet) onto real Order.status
+// values — used to hardcode status:'delivered' regardless of which chip
+// was tapped, so every filter but the default showed identical results.
+const TRIP_STATUS_GROUPS = {
+  Pending:   ['pending'],
+  Active:    ['confirmed', 'processing', 'ready', 'handover', 'picked_up'],
+  Completed: ['delivered'],
+  Cancelled: ['canceled', 'cancelled'],
+};
+
 router.get('/trips', authMiddleware, async (req, res) => {
   try {
-    const { from, to } = req.query;
-    const filter = { userId: req.user.id, status: 'delivered', hiddenFromTrips: { $ne: true } };
+    const { from, to, status } = req.query;
+    const filter = { userId: req.user.id, hiddenFromTrips: { $ne: true } };
+    filter.status = (status && TRIP_STATUS_GROUPS[status]) ? { $in: TRIP_STATUS_GROUPS[status] } : 'delivered';
     if (from && to) {
       filter.createdAt = { $gte: new Date(from), $lte: new Date(to) };
     }

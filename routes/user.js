@@ -520,16 +520,33 @@ router.get('/reports', async (req, res) => {
       .limit(50)
       .populate('merchantId', 'storeName fullName');
 
-    const reports = transactions.map(t => ({
-      id: t._id,
-      title: t.description || `${t.type} transaction`,
-      type: t.type,
-      date: t.createdAt,
-      amount: t.amount,
-      status: t.status,
-      description: t.description || '',
-      reference: t.reference,
-    }));
+    // The app's Report screen has dedicated Coupon/Package tabs, but
+    // Transaction.type (models/Transaction.js) has no 'coupon'/'package'
+    // values — those tabs were always empty. Both are real, identifiable
+    // by the reference prefix each flow already stamps on its Transaction
+    // (SUB- for package subscriptions in routes/services.js; VCH-/REDEEM-/
+    // ORDER-PTS- for gift-voucher purchases, points-redeemed vouchers, and
+    // points spent as an order discount, in routes/rewards.js and
+    // routes/order.js), so derive the report-facing type from that instead
+    // of the raw ledger type.
+    const reports = transactions.map(t => {
+      let reportType = t.type;
+      if (t.reference?.startsWith('SUB-')) {
+        reportType = 'package';
+      } else if (/^(VCH-|REDEEM-|ORDER-PTS-)/.test(t.reference || '')) {
+        reportType = 'coupon';
+      }
+      return {
+        id: t._id,
+        title: t.description || `${t.type} transaction`,
+        type: reportType,
+        date: t.createdAt,
+        amount: t.amount,
+        status: t.status,
+        description: t.description || '',
+        reference: t.reference,
+      };
+    });
 
     res.json({ success: true, data: reports });
   } catch (error) {
