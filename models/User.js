@@ -68,6 +68,9 @@ const userSchema = new mongoose.Schema(
     profileImage: { type: String, default: null },
     isVerified: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },
+    // Email-based two-factor: when on, POST /auth/login sends an OTP
+    // instead of a token, and the client must call /auth/2fa/verify.
+    twoFactorEnabled: { type: Boolean, default: false },
 
     // Payment methods — display data only (last4/expiry), never raw card
     // numbers or CVV. No route currently writes to this (card entry is

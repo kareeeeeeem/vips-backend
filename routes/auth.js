@@ -110,6 +110,27 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // Two-factor: password alone isn't enough — send an OTP and stop
+    // short of issuing a token. The client finishes via /auth/2fa/verify.
+    if (user.twoFactorEnabled) {
+      if (!user.email) {
+        return res.status(400).json({
+          success: false,
+          message: 'Two-factor is enabled but this account has no email to send a code to.',
+        });
+      }
+      const otp = await issueOtp(user);
+      console.log(`🔑 2FA OTP for ${user.email}: ${otp}`);
+      const { sent, error: mailError } = await sendOtpEmail(user.email, otp, 'sign in to your VIPs account');
+      if (!sent) console.error(`2FA OTP email to ${user.email} was not sent: ${mailError}`);
+
+      return res.json({
+        success: true,
+        message: 'Verification code sent to your email.',
+        data: { requires2FA: true, email: user.email },
+      });
+    }
+
     // Generate token
     const token = jwt.sign(
       { id: user._id, email: user.email, role: user.role },
@@ -134,6 +155,82 @@ router.post('/login', async (req, res) => {
       success: false,
       message: error.message,
     });
+  }
+});
+
+// ─── POST /api/auth/2fa/verify ────────────────────────────
+// Second step of login when the account has two-factor enabled — the
+// OTP sent by /auth/login above proves identity, so this is the one
+// place that issues a token without a password on this request.
+router.post('/2fa/verify', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ success: false, message: 'Email and code are required.' });
+    }
+
+    const hashedOtp = crypto.createHash('sha256').update(otp).digest('hex');
+    const user = await User.findOne({
+      email: email.toLowerCase().trim(),
+      resetPasswordToken: hashedOtp,
+      resetPasswordExpires: { $gt: new Date() },
+    });
+    if (!user) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired code.' });
+    }
+
+    // One-time use — unlike /auth/verify-otp (which leaves the token
+    // alone for the forgot-password flow's follow-up request), this OTP
+    // directly issues a token, so it must not be replayable.
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    user.lastLogin = new Date();
+    await user.save({ validateBeforeSave: false });
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+
+    res.json({
+      success: true,
+      message: 'Login successful!',
+      data: { user: user.toJSON(), token },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── PUT /api/auth/2fa ─────────────────────────────────────
+// Enable/disable two-factor — requires the current password both ways,
+// so a stolen unlocked session can't silently turn protection off.
+router.put('/2fa', authMiddleware, async (req, res) => {
+  try {
+    const { enabled, currentPassword } = req.body;
+    if (typeof enabled !== 'boolean' || !currentPassword) {
+      return res.status(400).json({ success: false, message: '`enabled` and currentPassword are required.' });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
+    }
+
+    user.twoFactorEnabled = enabled;
+    await user.save({ validateBeforeSave: false });
+
+    res.json({
+      success: true,
+      message: enabled ? 'Two-factor authentication enabled.' : 'Two-factor authentication disabled.',
+      data: { twoFactorEnabled: user.twoFactorEnabled },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
