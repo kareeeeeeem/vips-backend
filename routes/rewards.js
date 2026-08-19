@@ -451,7 +451,7 @@ router.post('/validate-qr', authMiddleware, async (req, res) => {
       });
     }
 
-    // Check coupon code
+    // Check coupon code (merchant-created, via Coupon management)
     const Coupon = require('../models/Coupon');
     const coupon = await Coupon.findOne({ code, isActive: true }).catch(() => null);
     if (coupon) {
@@ -462,6 +462,22 @@ router.post('/validate-qr', authMiddleware, async (req, res) => {
         success: true,
         message: `Coupon ${code} is valid!`,
         data: { type: 'coupon', coupon },
+      });
+    }
+
+    // Check site-wide promotion code (seeded marketing promos, distinct
+    // from merchant-created Coupons — same shape of check, different
+    // collection, since the two aren't related).
+    const Promotion = require('../models/Promotion');
+    const promotion = await Promotion.findOne({ code, isActive: true }).catch(() => null);
+    if (promotion) {
+      if (promotion.expiresAt && new Date(promotion.expiresAt) < new Date()) {
+        return res.status(400).json({ success: false, message: 'This promotion has expired' });
+      }
+      return res.json({
+        success: true,
+        message: `Promotion ${code} is valid!`,
+        data: { type: 'promotion', promotion },
       });
     }
 
