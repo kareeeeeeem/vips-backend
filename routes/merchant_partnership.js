@@ -34,6 +34,7 @@ router.post('/register', async (req, res) => {
       taxId, registrationNumber,
       logoUrl, bannerUrl, description, website, socialMedia,
       schedule, loyaltyType, documents: docList,
+      minRewardPercent, minPurchaseAmount, redeemPointsValue, redeemDinarValue,
     } = req.body;
 
     const businessName = _bn || _sn || '';
@@ -77,6 +78,13 @@ router.post('/register', async (req, res) => {
       description:        description        || '',
       website:            website            || '',
       socialMedia:        socialMedia        || {},
+      schedule:           schedule           || {},
+      loyaltyType:        loyaltyType === 'private' ? 'private' : 'everywhere',
+      documents:          Array.isArray(docList) ? docList.map((url) => ({ type: 'document', url })) : [],
+      minRewardPercent:   minRewardPercent   ?? 0.5,
+      minPurchaseAmount:  minPurchaseAmount  ?? 1,
+      redeemPointsValue:  redeemPointsValue  ?? 100,
+      redeemDinarValue:   redeemDinarValue   ?? 1,
       status:             'pending',
     });
 
