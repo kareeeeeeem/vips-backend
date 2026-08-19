@@ -558,7 +558,20 @@ router.put('/orders/:id/status', async (req, res) => {
     const tsField = STATUS_TIMESTAMP[status];
     order.status = status;
     if (tsField) order[tsField] = new Date();
+
+    // Cash on delivery settles at the door — mark it paid and earn the
+    // customer their points at the same moment an online gateway's webhook
+    // would (routes/payment.js). Online-method orders are left alone here;
+    // their paymentStatus is only ever set by the gateway confirming.
+    if (status === 'delivered' && order.paymentMethod === 'cash' && order.paymentStatus === 'pending') {
+      order.paymentStatus = 'paid';
+    }
     await order.save();
+
+    if (order.paymentStatus === 'paid' && !order.pointsCredited) {
+      const { creditPointsForOrder } = require('../utils/points');
+      await creditPointsForOrder(order);
+    }
 
     try {
       const { push } = require('./merchant_notifications');

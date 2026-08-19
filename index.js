@@ -50,6 +50,7 @@ const servicesRoutes  = require('./routes/services');
 const rewardsRoutes   = require('./routes/rewards');
 const favoritesRoutes = require('./routes/favorites');
 const cartRoutes      = require('./routes/cart');
+const paymentRoutes   = require('./routes/payment');
 
 app.use('/api/auth',      authRoutes);
 app.use('/api/user',      userRoutes);
@@ -59,6 +60,7 @@ app.use('/api/services',  servicesRoutes);
 app.use('/api/rewards',   rewardsRoutes);
 app.use('/api/favorites', favoritesRoutes);
 app.use('/api/cart',      cartRoutes);
+app.use('/api/payment',   paymentRoutes);
 
 // ═══════════════════════════════════════════════════════════
 // MERCHANT-SIDE ROUTES
@@ -143,6 +145,9 @@ app.get('/api/health', (req, res) => {
     // value — so social-login misconfiguration can be diagnosed without
     // dashboard/log access.
     firebaseAdmin: require('./utils/firebaseAdmin').getInitStatus(),
+    mailer:        require('./utils/mailer').getInitStatus(),
+    paymee:        require('./utils/paymee').getInitStatus(),
+    paypal:        require('./utils/paypal').getInitStatus(),
   });
 });
 

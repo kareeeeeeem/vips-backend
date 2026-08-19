@@ -67,8 +67,15 @@ const orderSchema = new mongoose.Schema(
     },
     orderType:     { type: String, enum: ['delivery', 'takeaway', 'dine_in'], default: 'delivery' },
     orderNote:     { type: String, default: '' },
-    paymentMethod: { type: String, enum: ['wallet', 'cash', 'card', 'online'], default: 'cash' },
+    paymentMethod: { type: String, enum: ['wallet', 'cash', 'card', 'online', 'paymee', 'paypal'], default: 'cash' },
     paymentStatus: { type: String, enum: ['pending', 'paid', 'failed', 'refunded'], default: 'pending' },
+    // Gateway-side identifier: Paymee payment token or PayPal order id.
+    // Set on initiate/create, used to match the webhook/capture callback
+    // back to this order.
+    paymentReference: { type: String, default: null },
+    // Guards utils/points.js's creditPointsForOrder against double-crediting
+    // on a webhook retry or a repeated status update.
+    pointsCredited: { type: Boolean, default: false },
 
     otp:            { type: String, default: '' },
     processingTime: { type: Number, default: 30 },
@@ -101,6 +108,7 @@ orderSchema.index({ userId: 1, createdAt: -1 });
 orderSchema.index({ merchantId: 1, status: 1 });
 orderSchema.index({ merchantId: 1, createdAt: -1 });
 orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ paymentReference: 1 }, { sparse: true });
 
 // Auto-assign a sequential orderNumber on first save
 orderSchema.pre('save', async function (next) {
