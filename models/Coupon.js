@@ -7,7 +7,7 @@ const couponSchema = new mongoose.Schema(
     discount:           { type: Number, required: true },
     discountPercentage: { type: Number },            // populated via pre-save for legacy compat
     maxDiscountAmount:  { type: Number, default: null },
-    type:               { type: String, enum: ['percentage', 'fixed', 'voucher'], default: 'percentage' },
+    type:               { type: String, enum: ['percentage', 'fixed', 'voucher', 'shipping'], default: 'percentage' },
     expiryDate:         { type: Date, required: true },
     isActive:           { type: Boolean, default: true },
     merchantId:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -19,6 +19,11 @@ const couponSchema = new mongoose.Schema(
     minOrderAmount:     { type: Number, default: 0 },
     description:        { type: String, default: '' },
     tags:               [{ type: String }],
+    // Set only on personal vouchers redeemed via POST /rewards/redeem-points
+    // (routes/rewards.js) — null for merchant-created/general coupons,
+    // which anyone can apply. When set, only this user may apply the code.
+    userId:             { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    pointsCost:         { type: Number, default: 0 },
   },
   { timestamps: true }
 );

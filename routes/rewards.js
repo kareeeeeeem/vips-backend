@@ -158,6 +158,12 @@ router.post('/apply-coupon', authMiddleware, async (req, res) => {
     if (!coupon) {
       return res.status(404).json({ success: false, message: 'Invalid or expired coupon' });
     }
+    // Personal vouchers redeemed via POST /rewards/redeem-points are
+    // scoped to whoever redeemed them — not usable by anyone who just
+    // learns the code.
+    if (coupon.userId && String(coupon.userId) !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'This voucher belongs to another account' });
+    }
 
     if (new Date() > coupon.expiryDate) {
       return res.status(400).json({ success: false, message: 'Coupon expired' });
@@ -455,6 +461,9 @@ router.post('/validate-qr', authMiddleware, async (req, res) => {
     const Coupon = require('../models/Coupon');
     const coupon = await Coupon.findOne({ code, isActive: true }).catch(() => null);
     if (coupon) {
+      if (coupon.userId && String(coupon.userId) !== req.user.id) {
+        return res.status(403).json({ success: false, message: 'This voucher belongs to another account' });
+      }
       if (coupon.expiryDate && new Date(coupon.expiryDate) < new Date()) {
         return res.status(400).json({ success: false, message: 'This coupon has expired' });
       }
@@ -482,6 +491,93 @@ router.post('/validate-qr', authMiddleware, async (req, res) => {
     }
 
     return res.status(404).json({ success: false, message: 'Invalid QR code' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// POINTS → VOUCHER REDEMPTION
+// ═══════════════════════════════════════════════════════════
+//
+// A fixed catalog (not a DB collection — this is a real, deliberate
+// product decision, not a placeholder) of what walletPoints can be traded
+// for. Redeeming issues a real, personal, single-use Coupon (see the
+// userId field added to models/Coupon.js) applicable at checkout through
+// the exact same /rewards/validate-qr → apply path every other coupon
+// already goes through.
+const VOUCHER_CATALOG = [
+  { id: 'disc5',    title: '5% Discount',   type: 'percentage', discount: 5,  pointsCost: 500 },
+  { id: 'disc10',   title: '10% Discount',  type: 'percentage', discount: 10, pointsCost: 1000 },
+  { id: 'disc20',   title: '20% Discount',  type: 'percentage', discount: 20, pointsCost: 2000 },
+  { id: 'freeship', title: 'Free Shipping', type: 'shipping',   discount: 100, pointsCost: 300 },
+  { id: 'off10tnd', title: '10 TND Off',    type: 'fixed',      discount: 10, pointsCost: 400 },
+];
+const VOUCHER_VALIDITY_DAYS = 30;
+
+// ─── GET /api/rewards/voucher-catalog ──────────────────────
+router.get('/voucher-catalog', authMiddleware, async (req, res) => {
+  res.json({ success: true, data: VOUCHER_CATALOG });
+});
+
+// ─── POST /api/rewards/redeem-points ───────────────────────
+router.post('/redeem-points', authMiddleware, async (req, res) => {
+  try {
+    const { tierId } = req.body;
+    const tier = VOUCHER_CATALOG.find((t) => t.id === tierId);
+    if (!tier) return res.status(400).json({ success: false, message: 'Unknown voucher tier' });
+
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if ((user.walletPoints || 0) < tier.pointsCost) {
+      return res.status(400).json({ success: false, message: 'Not enough points for this voucher' });
+    }
+
+    user.walletPoints -= tier.pointsCost;
+
+    const code = `VIPS-${tier.id.toUpperCase()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+    const expiryDate = new Date(Date.now() + VOUCHER_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
+
+    const [voucher] = await Promise.all([
+      Coupon.create({
+        code,
+        discount: tier.discount,
+        type: tier.type,
+        expiryDate,
+        userId: user._id,
+        pointsCost: tier.pointsCost,
+        maxUsage: 1,
+        description: tier.title,
+      }),
+      user.save(),
+      Transaction.create({
+        userId: user._id,
+        type: 'expense',
+        amount: tier.pointsCost,
+        currency: 'PTS',
+        description: `Redeemed ${tier.title} voucher`,
+        status: 'completed',
+        reference: `REDEEM-${Date.now()}`,
+      }),
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: 'Voucher redeemed!',
+      data: { voucher, newPointsBalance: user.walletPoints },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/rewards/my-vouchers ──────────────────────────
+// Personal vouchers this user has redeemed — separate from GET /coupons
+// (general/merchant coupons anyone can apply).
+router.get('/my-vouchers', authMiddleware, async (req, res) => {
+  try {
+    const vouchers = await Coupon.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    res.json({ success: true, data: vouchers });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
