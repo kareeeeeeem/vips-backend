@@ -97,6 +97,13 @@ const userSchema = new mongoose.Schema(
     resetPasswordToken: { type: String, default: null },
     resetPasswordExpires: { type: Date, default: null },
 
+    // In-app security PIN (hashed, like password) — gates sensitive
+    // screens (e.g. Wallet). Separate from the account password: lower
+    // stakes, so it's set once after signup and can be reset with the
+    // real password as proof of identity. null until the user actually
+    // sets one via POST /auth/pin.
+    pin: { type: String, default: null },
+
     // VIPs Club Check-in
     lastCheckIn: { type: Date, default: null },
     checkInStreak: { type: Number, default: 0 },
@@ -149,15 +156,36 @@ userSchema.pre('save', async function (next) {
   next();
 });
 
+// Hash PIN before saving (same treatment as password)
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('pin') || !this.pin) return next();
+  this.pin = await bcrypt.hash(this.pin, 12);
+  next();
+});
+
 // Compare password method
 userSchema.methods.comparePassword = async function (candidatePassword) {
   return bcrypt.compare(candidatePassword, this.password);
 };
 
-// Remove password from JSON output
+// Compare PIN method
+userSchema.methods.comparePin = async function (candidatePin) {
+  if (!this.pin) return false;
+  return bcrypt.compare(candidatePin, this.pin);
+};
+
+// Remove password/pin hashes from JSON output, expose only whether a PIN
+// has been set (the frontend needs this to decide whether to show the
+// Create PIN flow, without ever seeing the hash itself).
 userSchema.methods.toJSON = function () {
   const obj = this.toObject();
+  obj.hasPin = Boolean(obj.pin);
   delete obj.password;
+  delete obj.pin;
+  // Hashed OTP + expiry — internal reset-flow state, never useful (or
+  // safe) to expose in an API response.
+  delete obj.resetPasswordToken;
+  delete obj.resetPasswordExpires;
   return obj;
 };
 
