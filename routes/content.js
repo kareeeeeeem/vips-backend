@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Deal = require('../models/Deal');
 const Outing = require('../models/Outing');
 const User = require('../models/User');
@@ -267,12 +268,13 @@ router.get('/trending-merchants', optionalAuthMiddleware, async (req, res) => {
 // ─── GET /api/content/products ────────────────────────────
 router.get('/products', optionalAuthMiddleware, async (req, res) => {
   try {
-    const { category } = req.query;
+    const { category, merchantId } = req.query;
     const filter = {};
     if (category && category !== 'All') filter.category = category;
+    if (merchantId && mongoose.Types.ObjectId.isValid(merchantId)) filter.merchantId = merchantId;
 
     let products = await Product.find(filter).sort({ createdAt: -1 });
-    if (products.length === 0) {
+    if (products.length === 0 && !merchantId) {
       await runAutoSeeder();
       products = await Product.find(filter).sort({ createdAt: -1 });
     }

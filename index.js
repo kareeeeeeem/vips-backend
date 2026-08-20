@@ -73,12 +73,17 @@ const merchantCreditRoutes     = require('./routes/merchant_credit');
 const merchantPartnershipRoutes= require('./routes/merchant_partnership');
 const merchantSubscriptionRoutes=require('./routes/merchant_subscription');
 const merchantNotifRoutes      = require('./routes/merchant_notifications');
-const assetsRoutes             = require('./routes/assets');
-const hrmRoutes                = require('./routes/hrm');
+// Stock/assets/tax-rates/staff (HRM) are all served by the crud sub-routers
+// mounted inside merchant.js itself at these same paths — dedicated route
+// files for them (routes/assets.js, routes/hrm.js, routes/tax.js) used to
+// be mounted here too but were 100% unreachable dead code, since Express
+// matches '/api/merchant' (registered first) before ever reaching these.
+// Only the /dues/:id/collect route isn't covered by merchant.js's generic
+// dues CRUD sub-router, so dues.js stays mounted for that one route.
 const duesRoutes               = require('./routes/dues');
-const taxRoutes                = require('./routes/tax');
 
-// Core merchant endpoints (profile, orders, finance, cashiers, etc.)
+// Core merchant endpoints (profile, orders, finance, cashiers, stock,
+// assets, tax-rates, staff, dues CRUD, etc.)
 app.use('/api/merchant',                    merchantRoutes);
 
 // Feature-specific merchant endpoints
@@ -89,10 +94,7 @@ app.use('/api/merchant/credits',            merchantCreditRoutes);
 app.use('/api/merchant/partnership',        merchantPartnershipRoutes);
 app.use('/api/merchant/subscription',       merchantSubscriptionRoutes);
 app.use('/api/merchant/notifications',      merchantNotifRoutes);
-app.use('/api/merchant/assets',             assetsRoutes);
-app.use('/api/merchant/staff',              hrmRoutes);
 app.use('/api/merchant/dues',               duesRoutes);
-app.use('/api/merchant/tax-rates',          taxRoutes);
 
 // ═══════════════════════════════════════════════════════════
 // UPLOAD ROUTE
@@ -104,11 +106,6 @@ app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 // ─── Config: conversion rates ─────────────────────────────
 app.get('/api/config/rates', (req, res) => {
   res.json({ success: true, data: { vipsToTnd: 0.1, conversionRate: 0.1 } });
-});
-
-// ─── User: payment methods (placeholder — no live gateway) ─
-app.get('/api/user/payment-methods', (req, res) => {
-  res.json({ success: true, data: { cards: [] } });
 });
 
 // ─── Admin: update employee ────────────────────────────────
