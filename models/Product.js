@@ -18,6 +18,10 @@ const productSchema = new mongoose.Schema(
     vat:           { type: Number, default: 0 },
     taxMethod:     { type: String, enum: ['Exclusive', 'Inclusive', 'None'], default: 'Exclusive' },
     productType:   { type: String, default: 'Product' },
+    // Low-stock alert threshold. The merchant create/edit form has always
+    // asked for an "Alert Quantity", but there was nowhere to store it and
+    // the value was silently discarded on every save.
+    alertQty:      { type: Number, default: 0 },
 
     // Matches exactly what POST /products/:id/comment pushes — was
     // previously undeclared, so pushes may not have persisted under

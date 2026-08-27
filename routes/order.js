@@ -1,6 +1,8 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
+const Deal = require('../models/Deal');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { authMiddleware } = require('../middleware/auth');
@@ -20,15 +22,50 @@ router.post('/create', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Order must contain at least one item' });
     }
 
-    // Normalize items: map frontend field names to schema field names
-    const normalizedItems = items.map((item) => ({
-      productId:    item.productId || item.id,
-      item_name:    item.name || item.item_name || '',
-      price:        Number(item.price) || 0,
-      quantity:     Number(item.quantity) || 1,
-      tax_amount:   Number(item.tax_amount) || 0,
-      discount_on_item: Number(item.discount_on_item) || 0,
-    }));
+    // Prices come from the database, never from the request. This used to
+    // take `item.price` straight off the body and total the order from it, so
+    // a modified client could order a D 12.500 product for D 0.001 — the
+    // server simply believed whatever price it was handed.
+    const normalizedItems = [];
+    for (const item of items) {
+      const id = item.productId || item.id;
+      const quantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
+
+      let priced = null;
+      let name = item.name || item.item_name || '';
+
+      if (id && mongoose.Types.ObjectId.isValid(id)) {
+        const product = await Product.findById(id).select('name price discountPrice');
+        if (product) {
+          priced = (product.discountPrice != null && product.discountPrice > 0)
+            ? product.discountPrice
+            : product.price;
+          name = product.name || name;
+        } else {
+          const deal = await Deal.findById(id).select('title currentPrice');
+          if (deal) {
+            priced = deal.currentPrice;
+            name = deal.title || name;
+          }
+        }
+      }
+
+      if (priced === null) {
+        return res.status(400).json({
+          success: false,
+          message: `Item "${name || id}" is no longer available`,
+        });
+      }
+
+      normalizedItems.push({
+        productId:        id,
+        item_name:        name,
+        price:            Number(priced) || 0,
+        quantity,
+        tax_amount:       Number(item.tax_amount) || 0,
+        discount_on_item: Number(item.discount_on_item) || 0,
+      });
+    }
 
     let totalAmount = normalizedItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
     const discount = Number(couponDiscountAmount) || 0;
@@ -93,6 +130,26 @@ router.post('/create', authMiddleware, async (req, res) => {
           reference:  `ORDER-PTS-${order._id}`,
         }),
       ]);
+    }
+
+    // Tell the merchant a customer just ordered. Merchant notifications only
+    // ever fired when the merchant changed a status themselves — i.e. they
+    // were told about their own action and never about the one event that
+    // actually needs their attention, so the Notifications screen sat empty
+    // while real orders came in.
+    if (validMerchantId) {
+      try {
+        const { push } = require('./merchant_notifications');
+        await push(
+          validMerchantId,
+          'New Order',
+          `Order #${order.orderNumber} — D ${Number(order.totalAmount || 0).toFixed(2)}`,
+          'order',
+          // orderNumber travels alongside the id: the merchant order screen
+          // is addressed by the numeric order number, not the Mongo id.
+          { orderId: order._id, orderNumber: order.orderNumber },
+        );
+      } catch (_) {}
     }
 
     res.status(201).json({ success: true, message: 'Order created', data: order });
@@ -269,9 +326,35 @@ router.post('/:id/review', authMiddleware, async (req, res) => {
     const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
+    // Only a delivered order can be reviewed. The route checked ownership and
+    // nothing else, so a customer could rate an order the instant they placed
+    // it — and those ratings feed the merchant's public average through
+    // GET /content/merchants/:id/reviews. (Refunds already gate on delivered.)
+    if (order.status !== 'delivered') {
+      return res.status(400).json({
+        success: false,
+        message: 'You can review an order once it has been delivered',
+      });
+    }
+
     order.rating = Number(rating);
     order.review = review || '';
     await order.save();
+
+    // 'review' is one of MerchantNotification's real types but nothing ever
+    // emitted one, so a merchant was never told they had been reviewed.
+    if (order.merchantId) {
+      try {
+        const { push } = require('./merchant_notifications');
+        await push(
+          order.merchantId,
+          'New Review',
+          `${order.rating}★ on order #${order.orderNumber}${order.review ? ` — "${order.review}"` : ''}`,
+          'review',
+          { orderId: order._id, orderNumber: order.orderNumber },
+        );
+      } catch (_) {}
+    }
 
     res.json({ success: true, message: 'Review submitted successfully', data: order });
   } catch (error) {

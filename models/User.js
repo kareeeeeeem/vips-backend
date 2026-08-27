@@ -34,6 +34,7 @@ const userSchema = new mongoose.Schema(
     storeName: { type: String, default: null },
     storeAddress: { type: String, default: null },
     storeCategory: { type: String, default: null },
+    storeDescription: { type: String, default: null },
     logo: { type: String, default: null },
     coverImage: { type: String, default: null },
     brandColor: { type: String, default: null }, // e.g., '0xFFDC2626'
@@ -52,6 +53,10 @@ const userSchema = new mongoose.Schema(
         addedAt: { type: Date, default: Date.now },
       },
     ],
+
+    // Merchants this user follows (role: 'customer' docs use this; a
+    // merchant's own follower count is `User.countDocuments({ following: merchantId })`).
+    following: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 
     cart: [
       {
@@ -86,6 +91,21 @@ const userSchema = new mongoose.Schema(
         expiryDate: { type: String },
         isDefault: { type: Boolean, default: false },
         createdAt: { type: Date, default: Date.now },
+      },
+    ],
+
+    // Saved bank destinations a merchant can withdraw walletBalance to.
+    // Bank-transfer details only — no card data, so nothing here is in PCI
+    // scope (unlike `paymentMethods` above, which deliberately has no write
+    // endpoint for that reason). Used by the merchant wallet's payout flow,
+    // which previously made the merchant retype these on every request.
+    payoutAccounts: [
+      {
+        bankName:      { type: String, default: '' },
+        accountName:   { type: String, required: true },
+        accountNumber: { type: String, required: true },
+        isDefault:     { type: Boolean, default: false },
+        createdAt:     { type: Date, default: Date.now },
       },
     ],
 

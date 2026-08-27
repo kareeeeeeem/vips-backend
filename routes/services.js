@@ -7,6 +7,20 @@ const { authMiddleware, optionalAuthMiddleware } = require('../middleware/auth')
 
 const router = express.Router();
 
+// ─── Real-provider integration gates ──────────────────────
+// Mobile recharge and utility bill payment/inquiry have no actual telecom
+// or utility provider behind them (no Orange/Ooredoo/Tunisie Telecom/
+// STEG/SONEDE API integration exists). They used to debit the customer's
+// real wallet balance and show "Recharged/Paid successfully!" regardless —
+// real money taken, no real service ever delivered. Until a real provider
+// (or aggregator) API key is set, these stay honestly disabled instead of
+// faking success, mirroring how /payment/methods already gates Paymee/
+// PayPal on whether real credentials are configured.
+const TELECOM_RECHARGE_CONFIGURED = !!process.env.TELECOM_RECHARGE_API_KEY;
+const UTILITY_BILLS_CONFIGURED = !!process.env.UTILITY_BILLS_API_KEY;
+const NOT_CONFIGURED_MESSAGE =
+  'This service isn\'t available yet — real provider integration is still pending.';
+
 // ─── Seed bill services if empty ──────────────────────────
 async function seedBillServices() {
   try {
@@ -31,6 +45,21 @@ async function seedBillServices() {
 }
 seedBillServices();
 
+// ─── GET /api/services/status ──────────────────────────────
+// Lets the app show real-integration availability up front (grey out /
+// label "Coming soon") instead of letting the user go through a whole
+// recharge/bill flow only to hit a 503 at the very last step. Same idea
+// as GET /payment/methods for Paymee/PayPal.
+router.get('/status', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      mobileRecharge: { configured: TELECOM_RECHARGE_CONFIGURED },
+      utilityBills: { configured: UTILITY_BILLS_CONFIGURED },
+    },
+  });
+});
+
 // ─── GET /api/services/bills ──────────────────────────────
 router.get('/bills', optionalAuthMiddleware, async (req, res) => {
   try {
@@ -47,6 +76,9 @@ router.get('/bills', optionalAuthMiddleware, async (req, res) => {
 
 // ─── POST /api/services/pay-bill ──────────────────────────
 router.post('/pay-bill', authMiddleware, async (req, res) => {
+  if (!UTILITY_BILLS_CONFIGURED) {
+    return res.status(503).json({ success: false, message: NOT_CONFIGURED_MESSAGE });
+  }
   try {
     const { billServiceId, amount, referenceNumber } = req.body;
 
@@ -208,6 +240,9 @@ router.post('/packages/subscribe', authMiddleware, async (req, res) => {
 
 // ─── POST /api/services/mobile-recharge ───────────────────
 router.post('/mobile-recharge', authMiddleware, async (req, res) => {
+  if (!TELECOM_RECHARGE_CONFIGURED) {
+    return res.status(503).json({ success: false, message: NOT_CONFIGURED_MESSAGE });
+  }
   try {
     const { operator, amount, phoneNumber } = req.body;
 
@@ -299,6 +334,9 @@ router.get('/organizations', async (req, res) => {
 // ─── POST /api/services/bill-inquiry ─────────────────────────
 // Validate subscriber + account and return bill details before payment
 router.post('/bill-inquiry', authMiddleware, async (req, res) => {
+  if (!UTILITY_BILLS_CONFIGURED) {
+    return res.status(503).json({ success: false, message: NOT_CONFIGURED_MESSAGE });
+  }
   try {
     const { billServiceId, subscriberNumber, accountNumber } = req.body;
     if (!billServiceId || !subscriberNumber) {
@@ -308,7 +346,7 @@ router.post('/bill-inquiry', authMiddleware, async (req, res) => {
     const service = await BillService.findById(billServiceId).catch(() => null);
     const serviceName = service?.name ?? 'Bill Service';
 
-    // Simulate a bill lookup — in production this would call the external utility API
+    // Real utility-provider lookup goes here once UTILITY_BILLS_API_KEY is set.
     const dueDate = new Date(Date.now() + 7 * 86400000).toLocaleDateString('en-GB', {
       day: '2-digit', month: '2-digit', year: 'numeric',
     });

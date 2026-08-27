@@ -126,7 +126,7 @@ router.post('/subscribe', async (req, res) => {
         merchantId:  req.user.id,
         type:        'expense',
         amount:      price,
-        currency:    'GMD',
+        currency:    'TND',
         description: `Subscription — ${plan.name} (${billingCycle})`,
         status:      'completed',
         reference:   `SUB-${Date.now()}`,

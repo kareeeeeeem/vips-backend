@@ -162,7 +162,7 @@ router.post('/:id/boost', async (req, res) => {
         merchantId:  req.user.id,
         type:        'expense',
         amount:      parseFloat(boostBudget),
-        currency:    'GMD',
+        currency:    'TND',
         description: `Ad Boost — ${ad.title}`,
         status:      'completed',
         reference:   `BOOST-${ad._id}`,

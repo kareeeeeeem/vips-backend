@@ -322,6 +322,7 @@ router.get('/vips-club', async (req, res) => {
     // Compute rank by walletPoints
     const rank = await User.countDocuments({
       role: 'customer',
+      isActive: true,
       walletPoints: { $gt: user.walletPoints },
     });
 
@@ -592,6 +593,19 @@ router.delete('/contacts/:id', async (req, res) => {
   }
 });
 
+// ─── PATCH /api/user/contacts/:id/favorite ────────────────
+router.patch('/contacts/:id/favorite', async (req, res) => {
+  try {
+    const contact = await Contact.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!contact) return res.status(404).json({ success: false, message: 'Contact not found' });
+    contact.isFavorite = !contact.isFavorite;
+    await contact.save();
+    res.json({ success: true, data: contact });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── GET /api/user/leaderboard ────────────────────────────
 router.get('/leaderboard', async (req, res) => {
   try {
@@ -732,50 +746,14 @@ router.post('/referral/use', async (req, res) => {
   }
 });
 
-// ─── POST /api/user/wallet/topup ─────────────────────────────
-// NOTE: there is no live payment gateway behind this yet (see
-// GET /payment-methods, which returns an empty card list as a placeholder),
-// so this endpoint currently mints wallet balance from a client-supplied
-// number with nothing actually charged. The cap below is a stopgap to
-// bound the exposure until a real payment gateway is wired in — it is
-// not a substitute for verifying an actual charge.
-const MAX_TOPUP_AMOUNT = 50000;
-
-router.post('/wallet/topup', async (req, res) => {
-  try {
-    const { vipsAmount, cardId } = req.body;
-    if (!vipsAmount || vipsAmount < 100 || vipsAmount > MAX_TOPUP_AMOUNT) {
-      return res.status(400).json({ success: false, message: 'Invalid top-up amount' });
-    }
-
-    const user = await User.findById(req.user.id);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
-    user.walletPoints = (user.walletPoints || 0) + parseInt(vipsAmount);
-    user.walletBalance = (user.walletBalance || 0) + (parseInt(vipsAmount) * 0.1);
-    await user.save();
-
-    await Transaction.create({
-      userId: user._id,
-      type: 'credit',
-      amount: vipsAmount,
-      currency: 'PTS',
-      description: `VIPS credit purchase via card ****${cardId || '0000'}`,
-      status: 'completed',
-      reference: `TOP-${Date.now()}`,
-    });
-
-    res.json({
-      success: true,
-      message: `${vipsAmount} VIPS added to your wallet!`,
-      data: { newBalance: user.walletPoints },
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
 // ─── GET /api/user/payment-methods ───────────────────────────
+// NOTE: real wallet top-ups happen only through the gateway-verified flow in
+// routes/payment.js (/paymee/topup-initiate, /paypal/topup-create + webhook
+// crediting) — there used to be a POST /wallet/topup here that minted wallet
+// balance directly from a client-supplied number with no charge behind it at
+// all; it was dead from the app's side (credit_controller.dart already only
+// calls the real gateway flow) but remained a live free-money exploit for
+// anyone hitting the API directly. Removed.
 router.get('/payment-methods', async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select('paymentMethods');

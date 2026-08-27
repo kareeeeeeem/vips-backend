@@ -44,6 +44,7 @@ router.post('/register', async (req, res) => {
       ownerName, ownerNameAr, storeName, storeNameAr, businessType,
       category, jobTitle, phone, email, address, apartment, locationName,
       description, schedule, loyaltyType, documents, tin, facebook, instagram, website,
+      licenseExpiry,
     } = req.body;
     const merchantId = req.user.id;
 
@@ -64,6 +65,7 @@ router.post('/register', async (req, res) => {
       loyaltyType:    loyaltyType === 'private' ? 'private' : 'everywhere',
       taxId:          tin || '',
       website:        website || '',
+      ...(licenseExpiry ? { licenseExpiry: new Date(licenseExpiry) } : {}),
       'socialMedia.facebook':  facebook || '',
       'socialMedia.instagram': instagram || '',
       status: 'pending',
@@ -82,9 +84,20 @@ router.post('/register', async (req, res) => {
 
     // Update user profile with the subset of registration info User itself
     // tracks (used for display elsewhere in the merchant app).
-    await User.findByIdAndUpdate(merchantId, {
-      $set: { storeName, storeCategory: category, phone, address, description }
-    });
+    // `address` / `description` are NOT User fields — the schema calls them
+    // storeAddress / storeDescription, so passing them through verbatim meant
+    // Mongoose strict mode dropped both while the route still answered
+    // "Registration submitted successfully": a merchant's real street address
+    // and store description never made it out of the registration record.
+    const userUpdate = {};
+    if (storeName   !== undefined) userUpdate.storeName        = storeName;
+    if (category    !== undefined) userUpdate.storeCategory    = category;
+    if (phone       !== undefined) userUpdate.phone            = phone;
+    if (address     !== undefined) userUpdate.storeAddress     = address;
+    if (description !== undefined) userUpdate.storeDescription = description;
+    if (Object.keys(userUpdate).length) {
+      await User.findByIdAndUpdate(merchantId, { $set: userUpdate });
+    }
     res.json({ success: true, message: 'Registration submitted successfully', data: registration });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -101,30 +114,46 @@ router.get('/dashboard', async (req, res) => {
     const merchantId = req.user.id;
     const merchantObjectId = new (require('mongoose').Types.ObjectId)(merchantId);
 
+    // ?period=today|week|month|all (default all) — powers the period selector
+    // on the merchant dashboard's Performance card. Cumulative, not exclusive:
+    // "month" includes this week and today.
+    const period = String(req.query.period || 'all').toLowerCase();
+    const startOf = () => {
+      const d = new Date(); d.setHours(0, 0, 0, 0);
+      if (period === 'today') return d;
+      if (period === 'week')  { const w = new Date(d); w.setDate(d.getDate() - d.getDay()); return w; }
+      if (period === 'month') return new Date(d.getFullYear(), d.getMonth(), 1);
+      return null;
+    };
+    const since = startOf();
+    const dateFilter = since ? { createdAt: { $gte: since } } : {};
+
     const [agg, pending, total, dueAgg, stockAgg] = await Promise.all([
       Transaction.aggregate([
-        { $match: { merchantId: merchantObjectId, status: 'completed' } },
+        { $match: { merchantId: merchantObjectId, status: 'completed', ...dateFilter } },
         { $group: {
             _id: '$type',
             total: { $sum: '$amount' },
             count: { $sum: 1 },
         }},
       ]),
-      Transaction.countDocuments({ merchantId, status: 'pending' }),
-      Transaction.countDocuments({ merchantId }),
+      Transaction.countDocuments({ merchantId, status: 'pending', ...dateFilter }),
+      Transaction.countDocuments({ merchantId, ...dateFilter }),
       // Sale Due / Due Collect cards: real outstanding-vs-collected totals
       // from the Due ledger (routes/dues.js), not transaction-derived.
       Due.aggregate([
-        { $match: { merchantId: merchantObjectId } },
+        { $match: { merchantId: merchantObjectId, ...dateFilter } },
         { $group: {
             _id: null,
             totalDue:       { $sum: { $subtract: ['$totalAmount', '$paidAmount'] } },
             totalCollected: { $sum: '$paidAmount' },
         }},
       ]),
-      // Purchase card: current inventory value (stock on hand × unit
-      // price) — there's no supplier purchase-order log in the schema, so
-      // this is the closest real number rather than a fabricated one.
+      // Stock Value card: current inventory value (stock on hand × unit
+      // price). There is no supplier purchase-order log in the schema, so
+      // this is inventory on hand — a point-in-time balance, deliberately
+      // NOT filtered by ?period (a "today" filter on a stock level is
+      // meaningless). The app labels this card "Stock Value" accordingly.
       Stock.aggregate([
         { $match: { merchantId: merchantObjectId } },
         { $group: { _id: null, value: { $sum: { $multiply: ['$currentStock', '$unitPrice'] } } } },
@@ -151,7 +180,12 @@ router.get('/dashboard', async (req, res) => {
         totalDueCollect:     dueAgg[0]?.totalCollected || 0,
         pendingTransactions: pending,
         netProfit:           totalSales - totalExpenses,
+        // Total VIPs points this merchant has issued to customers in the
+        // period (rewards on spend + gift backs). Both are point outflows
+        // in PTS — netProfit is dinars and must never be shown as a VIPs figure.
+        totalVipsIssued:     totalRewards + totalGiftBack,
         transactionCount:    total,
+        period,
       },
     });
   } catch (error) {
@@ -170,22 +204,20 @@ router.get('/stats', async (req, res) => {
     const weekStart  = new Date(today); weekStart.setDate(today.getDate() - today.getDay());
     const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
 
+    // Group by type + raw createdAt bucket flags rather than a $switch, so the
+    // periods stay CUMULATIVE. The previous $switch stopped at the first
+    // matching branch, which meant a transaction from today was counted in
+    // "today" and then excluded from "week" and "month" — making both of those
+    // totals silently too low.
     const agg = await Transaction.aggregate([
       { $match: { merchantId: moid, status: 'completed' } },
       {
         $group: {
           _id: {
-            type:   '$type',
-            period: {
-              $switch: {
-                branches: [
-                  { case: { $gte: ['$createdAt', today]      }, then: 'today' },
-                  { case: { $gte: ['$createdAt', weekStart]  }, then: 'week'  },
-                  { case: { $gte: ['$createdAt', monthStart] }, then: 'month' },
-                ],
-                default: 'older',
-              },
-            },
+            type:    '$type',
+            isToday: { $gte: ['$createdAt', today] },
+            isWeek:  { $gte: ['$createdAt', weekStart] },
+            isMonth: { $gte: ['$createdAt', monthStart] },
           },
           total: { $sum: '$amount' },
           count: { $sum: 1 },
@@ -194,8 +226,11 @@ router.get('/stats', async (req, res) => {
     ]);
 
     const build = (period) => {
-      const rows = agg.filter(r => r._id.period === period);
-      const get  = (type) => rows.find(r => r._id.type === type)?.total || 0;
+      const flag = { today: 'isToday', week: 'isWeek', month: 'isMonth' }[period];
+      const rows = agg.filter(r => r._id[flag]);
+      const get  = (type) => rows
+        .filter(r => r._id.type === type)
+        .reduce((sum, r) => sum + r.total, 0);
       const cnt  = rows.reduce((s, r) => s + r.count, 0);
       const sales    = get('income');
       const expenses = get('expense');
@@ -220,7 +255,7 @@ router.get('/wallet', async (req, res) => {
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const moid  = new (require('mongoose').Types.ObjectId)(merchantId);
 
-    const [agg, todayAgg, merchant] = await Promise.all([
+    const [agg, todayAgg, merchant, pendingPointsAgg, pendingPayoutAgg] = await Promise.all([
       Transaction.aggregate([
         { $match: { merchantId: moid, status: 'completed' } },
         { $group: { _id: '$type', total: { $sum: '$amount' } } },
@@ -230,6 +265,17 @@ router.get('/wallet', async (req, res) => {
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
       User.findById(merchantId).select('walletBalance walletPoints storeName'),
+      // Points movements not yet settled. The wallet screen has a
+      // "N points pending" line that had no field behind it at all.
+      Transaction.aggregate([
+        { $match: { merchantId: moid, status: 'pending', type: { $in: ['reward', 'gift_back', 'credit'] } } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
+      // Currency already requested for payout and held, but not yet paid.
+      Payout.aggregate([
+        { $match: { merchantId: moid, status: { $in: ['pending', 'approved'] } } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]),
     ]);
 
     const byType = {};
@@ -241,12 +287,14 @@ router.get('/wallet', async (req, res) => {
     res.json({
       success: true,
       data: {
-        balance:      merchant?.walletBalance || 0,
-        points:       merchant?.walletPoints  || 0,
-        totalVipsIn:  totalIn,
-        totalVipsOut: totalOut,
-        todayEarning: todayAgg[0]?.total || 0,
-        netBalance:   totalIn - totalOut,
+        balance:       merchant?.walletBalance || 0,
+        points:        merchant?.walletPoints  || 0,
+        pendingPoints: pendingPointsAgg[0]?.total || 0,
+        pendingPayout: pendingPayoutAgg[0]?.total || 0,
+        totalVipsIn:   totalIn,
+        totalVipsOut:  totalOut,
+        todayEarning:  todayAgg[0]?.total || 0,
+        netBalance:    totalIn - totalOut,
       },
     });
   } catch (error) {
@@ -296,6 +344,76 @@ router.post('/wallet/payout', async (req, res) => {
   }
 });
 
+// ─── Payout accounts (saved bank destinations) ────────────
+// GET / POST / DELETE  /api/merchant/wallet/payout-accounts
+// Deliberately bank-transfer details only — no card numbers, so nothing here
+// falls in PCI scope.
+
+router.get('/wallet/payout-accounts', async (req, res) => {
+  try {
+    const merchant = await User.findById(req.user.id).select('payoutAccounts');
+    res.json({ success: true, data: merchant?.payoutAccounts || [] });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.post('/wallet/payout-accounts', async (req, res) => {
+  try {
+    const { bankName, accountName, accountNumber, isDefault } = req.body;
+    if (!accountName || !accountNumber) {
+      return res.status(400).json({ success: false, message: 'Account name and number are required' });
+    }
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    merchant.payoutAccounts = merchant.payoutAccounts || [];
+    const duplicate = merchant.payoutAccounts.find(
+      a => a.accountNumber === String(accountNumber).trim()
+    );
+    if (duplicate) {
+      return res.status(400).json({ success: false, message: 'That account is already saved' });
+    }
+
+    const makeDefault = isDefault === true || merchant.payoutAccounts.length === 0;
+    if (makeDefault) merchant.payoutAccounts.forEach(a => { a.isDefault = false; });
+
+    merchant.payoutAccounts.push({
+      bankName:      String(bankName || '').trim(),
+      accountName:   String(accountName).trim(),
+      accountNumber: String(accountNumber).trim(),
+      isDefault:     makeDefault,
+    });
+    await merchant.save();
+    res.status(201).json({ success: true, message: 'Payout account saved', data: merchant.payoutAccounts });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.delete('/wallet/payout-accounts/:id', async (req, res) => {
+  try {
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    const before = (merchant.payoutAccounts || []).length;
+    merchant.payoutAccounts = (merchant.payoutAccounts || []).filter(
+      a => String(a._id) !== String(req.params.id)
+    );
+    if (merchant.payoutAccounts.length === before) {
+      return res.status(404).json({ success: false, message: 'Payout account not found' });
+    }
+    // Never leave the list without a default.
+    if (merchant.payoutAccounts.length && !merchant.payoutAccounts.some(a => a.isDefault)) {
+      merchant.payoutAccounts[0].isDefault = true;
+    }
+    await merchant.save();
+    res.json({ success: true, message: 'Payout account removed', data: merchant.payoutAccounts });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── GET /api/merchant/wallet/payouts ─────────────────────
 router.get('/wallet/payouts', async (req, res) => {
   try {
@@ -324,10 +442,34 @@ router.get('/profile', async (req, res) => {
 // ─── PUT /api/merchant/profile ────────────────────────────
 router.put('/profile', async (req, res) => {
   try {
-    const { storeName, storeCategory, phone, address, description, logo, coverImage, brandColor, profileImage } = req.body;
+    const {
+      storeName, storeCategory, phone, logo, coverImage, brandColor, profileImage,
+      // The app sends these under their plain names; the User schema stores
+      // them as storeAddress / storeDescription. Previously they were passed
+      // straight through as `address` / `description`, which Mongoose's strict
+      // mode silently dropped — the route still answered "Profile updated"
+      // while nothing was saved. Accept either spelling and map to the real
+      // schema fields.
+      address, storeAddress, description, storeDescription,
+    } = req.body;
+
+    // Build the $set from only the keys actually supplied, so a partial
+    // update (e.g. logo-only after an image upload) can't blank the rest.
+    const update = {};
+    const setIf = (key, value) => { if (value !== undefined) update[key] = value; };
+    setIf('storeName', storeName);
+    setIf('storeCategory', storeCategory);
+    setIf('phone', phone);
+    setIf('logo', logo);
+    setIf('coverImage', coverImage);
+    setIf('brandColor', brandColor);
+    setIf('profileImage', profileImage);
+    setIf('storeAddress', storeAddress !== undefined ? storeAddress : address);
+    setIf('storeDescription', storeDescription !== undefined ? storeDescription : description);
+
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { storeName, storeCategory, phone, address, description, logo, coverImage, brandColor, profileImage },
+      update,
       { new: true, runValidators: true }
     ).select('-password');
     res.json({ success: true, message: 'Profile updated', data: user });
@@ -345,7 +487,13 @@ router.get('/customers', async (req, res) => {
   try {
     const { search, page = 1, limit = 50 } = req.query;
 
-    const customerIds = await Transaction.distinct('userId', { merchantId: req.user.id });
+    const moid = mongoose.Types.ObjectId.createFromHexString(String(req.user.id));
+    // The merchant's own bookkeeping entries (POST /merchant/finance) are
+    // stored with userId === merchantId, so a plain distinct() listed the
+    // merchant as one of their own customers — complete with "visits"
+    // counted from their own income/expense records.
+    const customerIds = (await Transaction.distinct('userId', { merchantId: req.user.id }))
+      .filter((id) => String(id) !== String(req.user.id));
 
     const userFilter = { _id: { $in: customerIds } };
     if (search) {
@@ -364,7 +512,38 @@ router.get('/customers', async (req, res) => {
       User.countDocuments(userFilter),
     ]);
 
-    res.json({ success: true, data: { customers, total } });
+    // Per-customer stats scoped to THIS merchant. The merchant Customers
+    // screen shows Visits / Earned / Spent and a "Last visit" date; none of
+    // them were served here, so Visits and Spent rendered 0 for everyone,
+    // "Earned" showed the customer's platform-wide wallet balance as though
+    // this merchant had given it, and "Last visit" was the signup date.
+    const POINTS_IN  = ['gift_back', 'reward', 'credit'];
+    const POINTS_OUT = ['expense', 'debit'];
+    const statsAgg = await Transaction.aggregate([
+      { $match: { merchantId: moid, userId: { $in: customers.map(c => c._id), $ne: moid } } },
+      { $group: {
+          _id: '$userId',
+          totalVisits:  { $sum: 1 },
+          lastVisit:    { $max: '$createdAt' },
+          pointsEarned: { $sum: { $cond: [{ $in: ['$type', POINTS_IN] },  '$amount', 0] } },
+          pointsSpent:  { $sum: { $cond: [{ $in: ['$type', POINTS_OUT] }, '$amount', 0] } },
+      }},
+    ]);
+    const statsById = {};
+    statsAgg.forEach(r => { statsById[String(r._id)] = r; });
+
+    const enriched = customers.map(c => {
+      const st = statsById[String(c._id)] || {};
+      return {
+        ...c.toObject(),
+        totalVisits:  st.totalVisits  || 0,
+        pointsEarned: st.pointsEarned || 0,
+        pointsSpent:  st.pointsSpent  || 0,
+        lastVisit:    st.lastVisit    || null,
+      };
+    });
+
+    res.json({ success: true, data: { customers: enriched, total } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -377,10 +556,31 @@ router.get('/customers', async (req, res) => {
 // ─── GET /api/merchant/transactions ───────────────────────
 router.get('/transactions', async (req, res) => {
   try {
-    const { type, status, page = 1, limit = 20 } = req.query;
+    const { type, status, from, to, page = 1, limit = 20 } = req.query;
     const filter = { merchantId: req.user.id };
     if (type)   filter.type   = type;
     if (status) filter.status = status;
+
+    // Date-range filter, backing the wallet screen's range chip (which used
+    // to render the fixed literal "From: 11/26  To: 12/26" and filter nothing).
+    // A bare 'YYYY-MM-DD' is treated as a whole day in UTC; a full ISO
+    // timestamp is used exactly as given (the app sends the client's own
+    // end-of-day instant, so the range matches the calendar the merchant
+    // actually picked rather than the server's timezone).
+    const isBareDate = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v));
+    const fromDate = from ? new Date(from) : null;
+    const toDate   = to   ? new Date(to)   : null;
+    const fromValid = fromDate && !isNaN(fromDate.getTime());
+    const toValid   = toDate   && !isNaN(toDate.getTime());
+    if (fromValid || toValid) {
+      filter.createdAt = {};
+      if (fromValid) filter.createdAt.$gte = fromDate;
+      if (toValid) {
+        filter.createdAt.$lte = isBareDate(to)
+          ? new Date(toDate.getTime() + 24 * 60 * 60 * 1000 - 1)
+          : toDate;
+      }
+    }
 
     const [transactions, total] = await Promise.all([
       Transaction.find(filter)
@@ -412,7 +612,7 @@ router.post('/transaction', async (req, res) => {
       merchantId:  req.user.id,
       type,
       amount:      parseFloat(amount),
-      currency:    currency || 'GMD',
+      currency:    currency || 'TND',
       description: description || '',
       status:      'completed',
       reference:   `TXN-${Date.now()}`,
@@ -428,19 +628,33 @@ router.post('/transaction', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 // ─── GET /api/merchant/finance ────────────────────────────
+const INCOME_TYPES = ['income', 'reward', 'gift_back', 'credit'];
+
 router.get('/finance', async (req, res) => {
   try {
-    const { type, page = 1, limit = 20 } = req.query;
+    const { type, category, account, page = 1, limit = 20 } = req.query;
     const filter = { merchantId: req.user.id };
-    if (type) filter.type = type;
+    if (type)     filter.type     = type;
+    if (category) filter.category = category;
+    if (account)  filter.account  = account;
 
-    const [txs, all] = await Promise.all([
+    const [txs, total, all] = await Promise.all([
       Transaction.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(parseInt(limit)),
-      Transaction.find({ merchantId: req.user.id }),
+      Transaction.countDocuments(filter),
+      Transaction.find({ merchantId: req.user.id }).select('type amount account'),
     ]);
 
-    const totalIncome  = all.filter(t => ['income', 'reward', 'gift_back'].includes(t.type)).reduce((s, t) => s + t.amount, 0);
-    const totalExpense = all.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
+    const isIncome = t => INCOME_TYPES.includes(t.type);
+    const sum = list => list.reduce((s, t) => s + (t.amount || 0), 0);
+
+    const totalIncome  = sum(all.filter(isIncome));
+    const totalExpense = sum(all.filter(t => !isIncome(t)));
+
+    // Per-account balances, derived from the journal rather than hardcoded.
+    // `account` defaults to 'Cash' on the schema, so pre-existing rows written
+    // before the field existed still land in the Cash column.
+    const forAccount = name => all.filter(t => (t.account || 'Cash') === name);
+    const balanceOf = name => sum(forAccount(name).filter(isIncome)) - sum(forAccount(name).filter(t => !isIncome(t)));
 
     res.json({
       success: true,
@@ -448,8 +662,18 @@ router.get('/finance', async (req, res) => {
         transactions: txs,
         totalIncome,
         totalExpense,
-        cashBalance:  totalIncome - totalExpense,
-        bankBalance:  0,
+        cashBalance: balanceOf('Cash'),
+        bankBalance: balanceOf('Bank'),
+        // Per-account in/out, so the Accounts screen can show real statement
+        // figures instead of the placeholder numbers it used to hardcode.
+        accounts: ['Cash', 'Bank'].map(name => ({
+          name,
+          in:      sum(forAccount(name).filter(isIncome)),
+          out:     sum(forAccount(name).filter(t => !isIncome(t))),
+          balance: balanceOf(name),
+          count:   forAccount(name).length,
+        })),
+        pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / limit) },
       },
     });
   } catch (error) {
@@ -461,15 +685,24 @@ router.get('/finance', async (req, res) => {
 router.post('/finance', async (req, res) => {
   try {
     const { title, category, amount, type, account, description } = req.body;
-    if (!amount || !type) {
+    if (amount === undefined || amount === null || amount === '' || !type) {
       return res.status(400).json({ success: false, message: 'amount and type are required' });
+    }
+    const parsedAmount = parseFloat(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'amount must be a number greater than 0' });
+    }
+    if (account && !['Cash', 'Bank'].includes(account)) {
+      return res.status(400).json({ success: false, message: "account must be 'Cash' or 'Bank'" });
     }
     const tx = await Transaction.create({
       userId:      req.user.id,
       merchantId:  req.user.id,
       type:        type === 'income' ? 'income' : 'expense',
-      amount:      parseFloat(amount),
-      currency:    'GMD',
+      amount:      parsedAmount,
+      currency:    'TND',
+      category:    category || 'Other',
+      account:     account  || 'Cash',
       description: title || description || '',
       status:      'completed',
       reference:   `FIN-${Date.now()}`,
@@ -534,7 +767,13 @@ router.get('/orders', async (req, res) => {
     }
 
     const filter = { merchantId: req.user.id };
-    if (status && status !== 'all' && status !== '') filter.status = status;
+    if (status && status !== 'all' && status !== '') {
+      // The enum carries both spellings of cancelled, so an exact match on
+      // one of them silently hid orders stored under the other.
+      filter.status = (status === 'canceled' || status === 'cancelled')
+        ? { $in: ['canceled', 'cancelled'] }
+        : status;
+    }
 
     const parsedOffset = parseInt(offset);
     const parsedLimit  = parseInt(limit);
@@ -546,7 +785,7 @@ router.get('/orders', async (req, res) => {
         .limit(parsedLimit)
         .populate('userId', 'fullName phone email profileImage createdAt updatedAt'),
       Order.countDocuments(filter),
-      User.findById(req.user.id).select('storeName address phone logo'),
+      User.findById(req.user.id).select('storeName storeAddress phone logo'),
     ]);
 
     res.json({
@@ -620,10 +859,11 @@ router.post('/orders', async (req, res) => {
     try {
       const { push } = require('./merchant_notifications');
       await push(req.user.id, 'Order Updated',
-        `Order #${order.orderNumber} → ${status}`, 'order', { orderId: order._id });
+        `Order #${order.orderNumber} → ${status}`, 'order',
+        { orderId: order._id, orderNumber: order.orderNumber });
     } catch (_) {}
 
-    const merchant = await User.findById(req.user.id).select('storeName address phone logo');
+    const merchant = await User.findById(req.user.id).select('storeName storeAddress phone logo');
     res.json({ success: true, message: 'Order status updated successfully', data: order.toMerchantJSON(merchant) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -636,7 +876,7 @@ router.get('/orders/:id', async (req, res) => {
     const order = await findMerchantOrder(req.params.id, req.user.id);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
-    const merchant = await User.findById(req.user.id).select('storeName address phone logo');
+    const merchant = await User.findById(req.user.id).select('storeName storeAddress phone logo');
     res.json(order.toMerchantJSON(merchant));
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -680,13 +920,28 @@ router.get('/orders/:id/items', async (req, res) => {
 // Legacy endpoint kept for compatibility; forwards to the same logic
 router.put('/orders/:id/status', async (req, res) => {
   try {
-    const { status } = req.body;
+    // `reason` was accepted by the app and sent on every cancellation, but
+    // never read here — Order.cancellationReason stayed empty forever, so
+    // nobody could tell why a merchant cancelled an order.
+    const { status, reason } = req.body;
+    // Validate up front — an unknown value used to reach order.save() and
+    // come back as a raw Mongoose validation error in a 500.
+    const ALLOWED = Order.schema.path('status').enumValues;
+    if (!status || !ALLOWED.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `status must be one of: ${ALLOWED.join(', ')}`,
+      });
+    }
     const order = await findMerchantOrder(req.params.id, req.user.id);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
     const tsField = STATUS_TIMESTAMP[status];
     order.status = status;
     if (tsField) order[tsField] = new Date();
+    if ((status === 'canceled' || status === 'cancelled') && typeof reason === 'string' && reason.trim()) {
+      order.cancellationReason = reason.trim();
+    }
 
     // Cash on delivery settles at the door — mark it paid and earn the
     // customer their points at the same moment an online gateway's webhook
@@ -738,10 +993,11 @@ router.put('/orders/:id/status', async (req, res) => {
     try {
       const { push } = require('./merchant_notifications');
       await push(req.user.id, 'Order Updated',
-        `Order #${order.orderNumber} → ${status}`, 'order', { orderId: order._id });
+        `Order #${order.orderNumber} → ${status}`, 'order',
+        { orderId: order._id, orderNumber: order.orderNumber });
     } catch (_) {}
 
-    const merchant = await User.findById(req.user.id).select('storeName address phone logo');
+    const merchant = await User.findById(req.user.id).select('storeName storeAddress phone logo');
     res.json({ success: true, message: 'Order status updated', data: order.toMerchantJSON(merchant) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -751,6 +1007,46 @@ router.put('/orders/:id/status', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 // GIFT BACK
 // ═══════════════════════════════════════════════════════════
+
+// ── Gift-back caps ────────────────────────────────────────
+// One source of truth for both GET /gift-back/limits (which displays them)
+// and POST /gift-back (which now enforces them). They used to live only
+// inside the /limits handler, so the send endpoint accepted any amount:
+// over the daily cap, over the per-transaction max, or negative — and a
+// negative amount subtracted points from the customer's wallet.
+const GIFT_BACK_LIMITS = {
+  DAILY:   1000,
+  MONTHLY: 10000,
+  TX_MIN:  1,
+  TX_MAX:  1000,
+};
+
+async function giftBackUsage(merchantId) {
+  const now = new Date();
+  const startOfDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const moid = require('mongoose').Types.ObjectId.createFromHexString(String(merchantId));
+
+  const [dailyUsed, monthlyUsed] = await Promise.all([
+    Transaction.aggregate([
+      { $match: { merchantId: moid, type: 'gift_back', createdAt: { $gte: startOfDay } } },
+      { $group: { _id: null, total: { $sum: '$amount' } } },
+    ]),
+    Transaction.aggregate([
+      { $match: { merchantId: moid, type: 'gift_back', createdAt: { $gte: startOfMonth } } },
+      { $group: { _id: null, total: { $sum: '$amount' } } },
+    ]),
+  ]);
+
+  const daily   = dailyUsed[0]?.total   || 0;
+  const monthly = monthlyUsed[0]?.total || 0;
+  return {
+    dailyUsed:      daily,
+    monthlyUsed:    monthly,
+    remainingDaily:   Math.max(0, GIFT_BACK_LIMITS.DAILY   - daily),
+    remainingMonthly: Math.max(0, GIFT_BACK_LIMITS.MONTHLY - monthly),
+  };
+}
 
 // ─── GET /api/merchant/gift-back/lookup ───────────────────
 // Resolves a scanned VIPs QR (VIPS_USER_<id>, see vips_id_view.dart) or a
@@ -778,8 +1074,37 @@ router.get('/gift-back/lookup', async (req, res) => {
 router.post('/gift-back', async (req, res) => {
   try {
     const { userId, phone, amount, message } = req.body;
-    if ((!userId && !phone) || !amount) {
+    if ((!userId && !phone) || amount === undefined || amount === null || amount === '') {
       return res.status(400).json({ success: false, message: 'userId or phone, and amount, are required' });
+    }
+
+    // Validate the amount before touching anyone's wallet. A negative amount
+    // used to be accepted and *subtracted* points from the recipient.
+    const amt = parseFloat(amount);
+    if (!Number.isFinite(amt)) {
+      return res.status(400).json({ success: false, message: 'amount must be a number' });
+    }
+    if (amt < GIFT_BACK_LIMITS.TX_MIN) {
+      return res.status(400).json({ success: false, message: `Minimum gift back is ${GIFT_BACK_LIMITS.TX_MIN}` });
+    }
+    if (amt > GIFT_BACK_LIMITS.TX_MAX) {
+      return res.status(400).json({ success: false, message: `Maximum gift back per transaction is ${GIFT_BACK_LIMITS.TX_MAX}` });
+    }
+
+    const usage = await giftBackUsage(req.user.id);
+    if (amt > usage.remainingDaily) {
+      return res.status(400).json({
+        success: false,
+        message: `Daily gift-back limit reached. ${usage.remainingDaily} remaining today.`,
+        data: { remainingDailyLimit: usage.remainingDaily, remainingMonthlyLimit: usage.remainingMonthly },
+      });
+    }
+    if (amt > usage.remainingMonthly) {
+      return res.status(400).json({
+        success: false,
+        message: `Monthly gift-back limit reached. ${usage.remainingMonthly} remaining this month.`,
+        data: { remainingDailyLimit: usage.remainingDaily, remainingMonthlyLimit: usage.remainingMonthly },
+      });
     }
 
     // The merchant-app flow only ever collects a phone number (there's no
@@ -793,21 +1118,32 @@ router.post('/gift-back', async (req, res) => {
       : await User.findOne({ phone: String(phone).trim() });
     if (!recipient) return res.status(404).json({ success: false, message: 'No customer found with that phone number' });
 
-    recipient.walletPoints = (recipient.walletPoints || 0) + parseFloat(amount);
+    recipient.walletPoints = (recipient.walletPoints || 0) + amt;
     await recipient.save();
 
     const tx = await Transaction.create({
       userId: recipient._id,
       merchantId:  req.user.id,
       type:        'gift_back',
-      amount:      parseFloat(amount),
+      amount:      amt,
       currency:    'PTS',
       description: message || 'Gift back from merchant',
       status:      'completed',
       reference:   `GIFT-${Date.now()}`,
     });
 
-    res.status(201).json({ success: true, message: 'Gift back sent!', data: { ...tx.toObject(), recipientName: recipient.fullName, recipientPhone: recipient.phone } });
+    const after = await giftBackUsage(req.user.id);
+    res.status(201).json({
+      success: true,
+      message: 'Gift back sent!',
+      data: {
+        ...tx.toObject(),
+        recipientName:  recipient.fullName,
+        recipientPhone: recipient.phone,
+        remainingDailyLimit:   after.remainingDaily,
+        remainingMonthlyLimit: after.remainingMonthly,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -840,40 +1176,20 @@ router.get('/gift-back/history', async (req, res) => {
 // ─── GET /api/merchant/gift-back/limits ───────────────────
 router.get('/gift-back/limits', async (req, res) => {
   try {
-    const merchantId = req.user.id;
-    const now = new Date();
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-    const DAILY_LIMIT = 1000;
-    const MONTHLY_LIMIT = 10000;
-    const TX_MIN = 1;
-    const TX_MAX = 1000;
-
-    const [dailyUsed, monthlyUsed] = await Promise.all([
-      Transaction.aggregate([
-        { $match: { merchantId: require('mongoose').Types.ObjectId.createFromHexString(merchantId), type: 'gift_back', createdAt: { $gte: startOfDay } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]),
-      Transaction.aggregate([
-        { $match: { merchantId: require('mongoose').Types.ObjectId.createFromHexString(merchantId), type: 'gift_back', createdAt: { $gte: startOfMonth } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]),
-    ]);
-
-    const dailyUsedAmt = dailyUsed[0]?.total || 0;
-    const monthlyUsedAmt = monthlyUsed[0]?.total || 0;
+    const usage = await giftBackUsage(req.user.id);
 
     res.json({
       success: true,
       data: {
         currency: 'D',
-        dailyLimit: DAILY_LIMIT,
-        remainingDailyLimit: Math.max(0, DAILY_LIMIT - dailyUsedAmt),
-        monthlyLimit: MONTHLY_LIMIT,
-        remainingMonthlyLimit: Math.max(0, MONTHLY_LIMIT - monthlyUsedAmt),
-        txMin: TX_MIN,
-        txMax: TX_MAX,
+        dailyLimit:            GIFT_BACK_LIMITS.DAILY,
+        remainingDailyLimit:   usage.remainingDaily,
+        monthlyLimit:          GIFT_BACK_LIMITS.MONTHLY,
+        remainingMonthlyLimit: usage.remainingMonthly,
+        dailyUsed:             usage.dailyUsed,
+        monthlyUsed:           usage.monthlyUsed,
+        txMin: GIFT_BACK_LIMITS.TX_MIN,
+        txMax: GIFT_BACK_LIMITS.TX_MAX,
       },
     });
   } catch (error) {
@@ -896,9 +1212,33 @@ router.get('/cashiers', async (req, res) => {
 });
 
 // ─── POST /api/merchant/cashiers ──────────────────────────
+// Fields a merchant may set on their own staff record. `merchantId` is never
+// among them — passing the raw body to findOneAndUpdate let a merchant
+// reassign a cashier to another merchant's account.
+const CASHIER_UPDATABLE = ['name', 'role', 'status', 'email', 'phone', 'salary', 'pin'];
+const CASHIER_STATUSES  = ['active', 'pending', 'removed'];
+
+function pickCashierFields(body) {
+  const out = {};
+  for (const key of CASHIER_UPDATABLE) {
+    if (body[key] !== undefined) out[key] = body[key];
+  }
+  if (out.salary !== undefined) out.salary = parseFloat(out.salary) || 0;
+  return out;
+}
+
 router.post('/cashiers', async (req, res) => {
   try {
-    const cashier = await Employee.create({ ...req.body, merchantId: req.user.id });
+    const fields = pickCashierFields(req.body);
+    // Validate up front — an empty body used to reach Mongoose and come
+    // back as a raw validation error inside a 500.
+    if (!fields.name || !String(fields.name).trim()) {
+      return res.status(400).json({ success: false, message: 'name is required' });
+    }
+    if (fields.status && !CASHIER_STATUSES.includes(fields.status)) {
+      return res.status(400).json({ success: false, message: `status must be one of: ${CASHIER_STATUSES.join(', ')}` });
+    }
+    const cashier = await Employee.create({ ...fields, merchantId: req.user.id });
     res.status(201).json({ success: true, message: 'Cashier added', data: cashier });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -908,10 +1248,20 @@ router.post('/cashiers', async (req, res) => {
 // ─── PUT /api/merchant/cashiers/:id ───────────────────────
 router.put('/cashiers/:id', async (req, res) => {
   try {
+    const fields = pickCashierFields(req.body);
+    if (Object.keys(fields).length === 0) {
+      return res.status(400).json({ success: false, message: 'No updatable fields supplied' });
+    }
+    if (fields.name !== undefined && !String(fields.name).trim()) {
+      return res.status(400).json({ success: false, message: 'name cannot be empty' });
+    }
+    if (fields.status && !CASHIER_STATUSES.includes(fields.status)) {
+      return res.status(400).json({ success: false, message: `status must be one of: ${CASHIER_STATUSES.join(', ')}` });
+    }
     const cashier = await Employee.findOneAndUpdate(
       { _id: req.params.id, merchantId: req.user.id },
-      req.body,
-      { new: true }
+      fields,
+      { new: true, runValidators: true }
     );
     if (!cashier) return res.status(404).json({ success: false, message: 'Cashier not found' });
     res.json({ success: true, data: cashier });
@@ -1022,6 +1372,20 @@ router.get('/reports', async (req, res) => {
 // CRUD SUB-ROUTES  (stock, assets, tax-rates, staff, dues)
 // ═══════════════════════════════════════════════════════════
 
+// Keys a client may never set on any of the CRUD models below. `merchantId`
+// is the important one: PUT used to hand `req.body` straight to
+// findOneAndUpdate, so a merchant could move a stock item, asset, tax rate,
+// staff member or due onto another merchant's account.
+const CRUD_PROTECTED = ['_id', 'id', '__v', 'merchantId', 'createdAt', 'updatedAt'];
+
+function stripProtected(body) {
+  const out = {};
+  for (const [key, value] of Object.entries(body || {})) {
+    if (!CRUD_PROTECTED.includes(key)) out[key] = value;
+  }
+  return out;
+}
+
 function crudRouter(Model, sortField = 'createdAt') {
   const r = express.Router();
 
@@ -1034,26 +1398,41 @@ function crudRouter(Model, sortField = 'createdAt') {
 
   r.post('/', async (req, res) => {
     try {
-      const item = await Model.create({ ...req.body, merchantId: req.user.id });
+      const item = await Model.create({ ...stripProtected(req.body), merchantId: req.user.id });
       res.status(201).json({ success: true, data: item });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    } catch (e) {
+      // A Mongoose validation failure is the caller's fault, not a server
+      // fault — it used to come back as a 500 with the raw error text.
+      const status = e.name === 'ValidationError' ? 400 : 500;
+      res.status(status).json({ success: false, message: e.message });
+    }
   });
 
   r.put('/:id', async (req, res) => {
     try {
+      const update = stripProtected(req.body);
+      if (Object.keys(update).length === 0) {
+        return res.status(400).json({ success: false, message: 'No updatable fields supplied' });
+      }
       const item = await Model.findOneAndUpdate(
         { _id: req.params.id, merchantId: req.user.id },
-        req.body,
-        { new: true }
+        update,
+        { new: true, runValidators: true }
       );
       if (!item) return res.status(404).json({ success: false, message: 'Not found' });
       res.json({ success: true, data: item });
-    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+    } catch (e) {
+      const status = e.name === 'ValidationError' ? 400 : 500;
+      res.status(status).json({ success: false, message: e.message });
+    }
   });
 
   r.delete('/:id', async (req, res) => {
     try {
-      await Model.findOneAndDelete({ _id: req.params.id, merchantId: req.user.id });
+      // A delete that matched nothing used to answer `{success: true}`, so
+      // deleting someone else's record read as a success.
+      const item = await Model.findOneAndDelete({ _id: req.params.id, merchantId: req.user.id });
+      if (!item) return res.status(404).json({ success: false, message: 'Not found' });
       res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
@@ -1086,9 +1465,25 @@ router.get('/products', async (req, res) => {
 // ─── POST /api/merchant/products ──────────────────────────
 router.post('/products', async (req, res) => {
   try {
-    const { name, category, price, image, description, isFeature, hasVariants, isActive, vat, code, taxMethod } = req.body;
+    const {
+      name, category, price, image, description, isFeature, hasVariants,
+      isActive, vat, code, taxMethod,
+      // Previously not read off the body even though the merchant form
+      // collects all three: the Type dropdown, the Alert Quantity input and
+      // the promotional price were discarded on every save.
+      productType, alertQty, discountPrice,
+    } = req.body;
     if (!name || !price || !category) {
       return res.status(400).json({ success: false, message: 'name, price, and category are required' });
+    }
+    const promo = discountPrice === null || discountPrice === undefined || discountPrice === ''
+      ? null
+      : parseFloat(discountPrice);
+    if (promo !== null && (isNaN(promo) || promo < 0)) {
+      return res.status(400).json({ success: false, message: 'discountPrice must be a positive number' });
+    }
+    if (promo !== null && promo >= parseFloat(price)) {
+      return res.status(400).json({ success: false, message: 'discountPrice must be lower than price' });
     }
     const product = await Product.create({
       merchantId: req.user.id,
@@ -1099,17 +1494,44 @@ router.post('/products', async (req, res) => {
       vat: parseFloat(vat || 0),
       code: code || '',
       taxMethod: taxMethod || 'Exclusive',
+      productType: productType || 'Product',
+      alertQty: parseFloat(alertQty || 0) || 0,
+      discountPrice: promo,
     });
     res.status(201).json({ success: true, message: 'Product created successfully', data: product });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ─── PUT /api/merchant/products/:id ───────────────────────
+// Only these may be changed through the API. The whole request body used to
+// be passed straight to findOneAndUpdate, so a merchant could reassign
+// `merchantId` (handing their product to another account) or overwrite the
+// `comments` array wholesale.
+const PRODUCT_UPDATABLE = [
+  'name', 'code', 'description', 'price', 'discountPrice', 'image',
+  'category', 'inStock', 'isActive', 'isFeature', 'hasVariants', 'stock',
+  'vat', 'taxMethod', 'productType', 'alertQty',
+];
+
 router.put('/products/:id', async (req, res) => {
   try {
+    const update = {};
+    for (const key of PRODUCT_UPDATABLE) {
+      if (req.body[key] !== undefined) update[key] = req.body[key];
+    }
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, message: 'No updatable fields supplied' });
+    }
+    if (update.discountPrice !== null && update.discountPrice !== undefined) {
+      const promo = parseFloat(update.discountPrice);
+      if (isNaN(promo) || promo < 0) {
+        return res.status(400).json({ success: false, message: 'discountPrice must be a positive number' });
+      }
+      update.discountPrice = promo;
+    }
     const product = await Product.findOneAndUpdate(
       { _id: req.params.id, merchantId: req.user.id },
-      req.body,
+      update,
       { new: true, runValidators: true }
     );
     if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
@@ -1137,7 +1559,7 @@ router.get('/coupons', async (req, res) => {
 // ─── POST /api/merchant/coupons ───────────────────────────
 router.post('/coupons', async (req, res) => {
   try {
-    const { code, discount, discountPercentage, maxDiscountAmount, expiryDate, isActive, type, tags, maxUsage, minOrderAmount } = req.body;
+    const { code, discount, discountPercentage, maxDiscountAmount, expiryDate, isActive, type, tags, maxUsage, minOrderAmount, description } = req.body;
     const discountValue = parseFloat(discount ?? discountPercentage ?? 0);
     if (!code || isNaN(discountValue)) {
       return res.status(400).json({ success: false, message: 'code and discount are required' });
@@ -1157,18 +1579,49 @@ router.post('/coupons', async (req, res) => {
       tags:              Array.isArray(tags) ? tags : [],
       maxUsage:          maxUsage ? parseInt(maxUsage) : null,
       minOrderAmount:    minOrderAmount ? parseFloat(minOrderAmount) : 0,
+      // Present on the model and on the create form, but previously not
+      // read off the request — anything the merchant typed was discarded.
+      description:       typeof description === 'string' ? description : '',
     });
     res.status(201).json({ success: true, data: coupon });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ─── PUT  /api/merchant/coupons/:id ──────────────────────
+// Same reasoning as PRODUCT_UPDATABLE. Passing the raw body here let a
+// merchant set `merchantId` (moving the coupon onto another account),
+// `userId` (turning a general coupon into someone's personal voucher) or
+// reset `usageCount` to sidestep `maxUsage`. `code` is excluded too — it is
+// the unique key customers type at checkout.
+const COUPON_UPDATABLE = [
+  'discount', 'maxDiscountAmount', 'type', 'expiryDate', 'isActive',
+  'tags', 'maxUsage', 'minOrderAmount', 'description',
+];
+
 router.put('/coupons/:id', async (req, res) => {
   try {
+    const update = {};
+    for (const key of COUPON_UPDATABLE) {
+      if (req.body[key] !== undefined) update[key] = req.body[key];
+    }
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, message: 'No updatable fields supplied' });
+    }
+    if (update.discount !== undefined) {
+      const d = parseFloat(update.discount);
+      if (isNaN(d) || d < 0) {
+        return res.status(400).json({ success: false, message: 'discount must be a positive number' });
+      }
+      update.discount = d;
+      // Kept in sync by the model's pre-save hook, which findOneAndUpdate
+      // does not run.
+      update.discountPercentage = d;
+    }
+    if (update.expiryDate !== undefined) update.expiryDate = new Date(update.expiryDate);
     const coupon = await Coupon.findOneAndUpdate(
       { _id: req.params.id, merchantId: req.user.id },
-      req.body,
-      { new: true }
+      update,
+      { new: true, runValidators: true }
     );
     if (!coupon) return res.status(404).json({ success: false, message: 'Coupon not found' });
     res.json({ success: true, data: coupon });

@@ -101,7 +101,7 @@ router.post('/', async (req, res) => {
       customerId, customerName, customerPhone,
       items, subtotal, taxAmount, taxRate,
       discountAmount, serviceCharge, grandTotal,
-      paymentMethod, paidAmount, notes, cashierId,
+      paymentMethod, paymentStatus, paidAmount, notes, cashierId,
     } = req.body;
 
     if (!items || items.length === 0) {
@@ -110,8 +110,29 @@ router.post('/', async (req, res) => {
 
     const billNumber   = `BILL-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const parsedTotal  = parseFloat(grandTotal);
-    const parsedPaid   = parseFloat(paidAmount  || parsedTotal);
+    if (!Number.isFinite(parsedTotal) || parsedTotal <= 0) {
+      return res.status(400).json({ success: false, message: 'grandTotal must be a number greater than 0' });
+    }
+
+    // `paidAmount ?? parsedTotal`, not `||`: the app sends 0 when it is
+    // generating a QR for the customer to pay, and 0 is falsy — so an
+    // explicitly-unpaid bill was being recorded as paid in full.
+    const rawPaid = (paidAmount === undefined || paidAmount === null || paidAmount === '')
+      ? parsedTotal
+      : parseFloat(paidAmount);
+    const parsedPaid   = Number.isFinite(rawPaid) ? Math.max(0, rawPaid) : 0;
     const changeAmount = Math.max(0, parsedPaid - parsedTotal);
+
+    // Honour what the caller says about payment instead of stamping every
+    // bill 'paid'. A bill awaiting a customer scan is 'pending' and must not
+    // be booked as revenue yet.
+    const ALLOWED_PAYMENT_STATUS = ['paid', 'pending', 'partial'];
+    let resolvedStatus = ALLOWED_PAYMENT_STATUS.includes(paymentStatus)
+      ? paymentStatus
+      : (parsedPaid >= parsedTotal ? 'paid' : (parsedPaid > 0 ? 'partial' : 'pending'));
+    // Keep the two consistent even if the caller contradicts itself.
+    if (resolvedStatus === 'paid' && parsedPaid < parsedTotal) resolvedStatus = 'partial';
+    if (parsedPaid <= 0) resolvedStatus = 'pending';
 
     const bill = await MerchantBill.create({
       merchantId:     req.user.id,
@@ -127,7 +148,7 @@ router.post('/', async (req, res) => {
       serviceCharge:  parseFloat(serviceCharge  || 0),
       grandTotal:     parsedTotal,
       paymentMethod:  paymentMethod || 'cash',
-      paymentStatus:  'paid',
+      paymentStatus:  resolvedStatus,
       paidAmount:     parsedPaid,
       changeAmount,
       notes:          notes || '',
@@ -135,17 +156,22 @@ router.post('/', async (req, res) => {
       status:         'active',
     });
 
-    // Record as income transaction
-    await Transaction.create({
-      userId:      customerId || req.user.id,
-      merchantId:  req.user.id,
-      type:        'income',
-      amount:      parsedTotal,
-      currency:    'GMD',
-      description: `POS Sale — ${billNumber}`,
-      status:      'completed',
-      reference:   billNumber,
-    });
+    // Record income only for money actually taken. Every bill used to book a
+    // completed income transaction for its full total the moment it was
+    // created — including the unpaid ones the app generates a QR for — so a
+    // merchant's revenue counted bills nobody had paid.
+    if (parsedPaid > 0) {
+      await Transaction.create({
+        userId:      customerId || req.user.id,
+        merchantId:  req.user.id,
+        type:        'income',
+        amount:      parsedPaid,
+        currency:    'TND',
+        description: `POS Sale — ${billNumber}`,
+        status:      resolvedStatus === 'paid' ? 'completed' : 'pending',
+        reference:   billNumber,
+      });
+    }
 
     res.status(201).json({ success: true, message: 'Bill created successfully', data: bill });
   } catch (error) {
@@ -159,6 +185,60 @@ router.get('/:id', async (req, res) => {
     const bill = await MerchantBill.findOne({ _id: req.params.id, merchantId: req.user.id });
     if (!bill) return res.status(404).json({ success: false, message: 'Bill not found' });
     res.json({ success: true, data: bill });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── PUT /api/merchant/billing/:id/pay ────────────────────
+// Settle a bill that was created 'pending' (the QR flow: the merchant
+// generates a code, the customer pays, then the bill is marked paid).
+// Without this a pending bill had no way to ever become paid.
+router.put('/:id/pay', async (req, res) => {
+  try {
+    const { paidAmount, paymentMethod } = req.body;
+    const bill = await MerchantBill.findOne({ _id: req.params.id, merchantId: req.user.id });
+    if (!bill) return res.status(404).json({ success: false, message: 'Bill not found' });
+    if (bill.status !== 'active') {
+      return res.status(400).json({ success: false, message: `Bill is ${bill.status}` });
+    }
+    if (bill.paymentStatus === 'paid') {
+      return res.status(400).json({ success: false, message: 'Bill is already paid' });
+    }
+
+    const outstanding = Math.max(0, bill.grandTotal - (bill.paidAmount || 0));
+    const raw = (paidAmount === undefined || paidAmount === null || paidAmount === '')
+      ? outstanding
+      : parseFloat(paidAmount);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return res.status(400).json({ success: false, message: 'paidAmount must be a number greater than 0' });
+    }
+    if (raw > outstanding + 1e-9) {
+      return res.status(400).json({
+        success: false,
+        message: `Payment exceeds the outstanding balance (D ${outstanding.toFixed(3)})`,
+        data: { outstanding },
+      });
+    }
+
+    bill.paidAmount    = (bill.paidAmount || 0) + raw;
+    bill.changeAmount  = Math.max(0, bill.paidAmount - bill.grandTotal);
+    bill.paymentStatus = bill.paidAmount >= bill.grandTotal ? 'paid' : 'partial';
+    if (paymentMethod) bill.paymentMethod = paymentMethod;
+    await bill.save();
+
+    await Transaction.create({
+      userId:      bill.customerId || req.user.id,
+      merchantId:  req.user.id,
+      type:        'income',
+      amount:      raw,
+      currency:    'TND',
+      description: `POS Sale — ${bill.billNumber}`,
+      status:      'completed',
+      reference:   bill.billNumber,
+    });
+
+    res.json({ success: true, message: 'Payment recorded', data: bill });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -201,7 +281,7 @@ router.put('/:id/refund', async (req, res) => {
       merchantId:  req.user.id,
       type:        'expense',
       amount:      bill.grandTotal,
-      currency:    'GMD',
+      currency:    'TND',
       description: `Refund — ${bill.billNumber}`,
       status:      'completed',
       reference:   `REF-${bill.billNumber}`,

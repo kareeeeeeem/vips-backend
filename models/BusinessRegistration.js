@@ -18,6 +18,9 @@ const businessRegistrationSchema = new mongoose.Schema(
     country:            { type: String, default: '' },
     postalCode:         { type: String, default: '' },
     taxId:              { type: String, default: '' },
+    // Expiry of the licence/identity document uploaded in the registration
+    // form's "Upload Identity" step.
+    licenseExpiry:      { type: Date, default: null },
     // Per-weekday opening hours as submitted by the 3-step registration
     // flow's "Time Info" step — shape: { Sunday: {enabled,open,close}, ... }.
     schedule:           { type: mongoose.Schema.Types.Mixed, default: {} },

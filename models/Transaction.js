@@ -23,7 +23,20 @@ const transactionSchema = new mongoose.Schema(
     },
     currency: {
       type: String,
-      default: 'USD',
+      default: 'TND',
+    },
+    // Finance-journal fields (merchant "Finance & Accounting" screen). The
+    // merchant picks both in Add Transaction; without them on the schema
+    // Mongoose strict mode silently discarded what the app sent, so every
+    // journal row read back as category "Other" / account "Cash".
+    category: {
+      type: String,
+      default: 'Other',
+    },
+    account: {
+      type: String,
+      enum: ['Cash', 'Bank'],
+      default: 'Cash',
     },
     description: {
       type: String,

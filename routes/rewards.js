@@ -32,13 +32,20 @@ const router = express.Router();
 // ─── GET /api/rewards/coupons ─────────────────────────
 router.get('/coupons', authMiddleware, async (req, res) => {
   try {
-    let coupons = await Coupon.find({
+    // A coupon with a userId is a personal voucher — only its owner may see
+    // or apply it (see the userId comment in models/Coupon.js). Without this
+    // filter every customer's "Available Coupons" list showed other people's
+    // personal voucher codes alongside the general ones.
+    const visible = {
       isActive: true,
       expiryDate: { $gt: new Date() },
-    }).sort({ createdAt: -1 });
+      $or: [{ userId: null }, { userId: req.user.id }],
+    };
+
+    let coupons = await Coupon.find(visible).sort({ createdAt: -1 });
     if (coupons.length === 0) {
       await runAutoSeeder();
-      coupons = await Coupon.find({ isActive: true, expiryDate: { $gt: new Date() } }).sort({ createdAt: -1 });
+      coupons = await Coupon.find(visible).sort({ createdAt: -1 });
     }
     res.json({ success: true, data: coupons });
   } catch (error) {
@@ -215,6 +222,19 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid voucher or amount' });
     }
 
+    // The brand was never loaded here before, so a purchase accepted any
+    // voucherId at all and ignored the brand's own min/max range.
+    const brand = await GiftVoucherBrand.findById(voucherId).catch(() => null);
+    if (!brand || !brand.isActive) {
+      return res.status(404).json({ success: false, message: 'Gift voucher brand not found' });
+    }
+    if (amount < brand.minAmount || amount > brand.maxAmount) {
+      return res.status(400).json({
+        success: false,
+        message: `Amount must be between ${brand.minAmount} and ${brand.maxAmount} ${brand.currency}`,
+      });
+    }
+
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
@@ -223,23 +243,44 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
     }
 
     user.walletPoints -= amount;
-    await user.save();
 
-    await Transaction.create({
-      userId: user._id,
-      merchantId: user._id,
-      type: 'expense',
-      amount,
-      currency: 'PTS',
-      description: `Gift voucher purchase #${voucherId}`,
-      status: 'completed',
-      reference: `VCH-${Date.now()}`,
-    });
+    // Actually issue the voucher the customer just paid for. Without this
+    // the points were deducted, a Transaction was written, and the user got
+    // nothing back — GET /rewards/my-vouchers reads Coupon documents, so a
+    // purchased gift voucher never appeared anywhere in the app.
+    const code = `VIPS-${brand.name.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8)}-${Math.random()
+      .toString(36)
+      .substr(2, 6)
+      .toUpperCase()}`;
+    const expiryDate = new Date(Date.now() + VOUCHER_VALIDITY_DAYS * 24 * 60 * 60 * 1000);
+
+    const [voucher] = await Promise.all([
+      Coupon.create({
+        code,
+        discount: amount,
+        type: 'voucher',
+        expiryDate,
+        userId: user._id,
+        pointsCost: amount,
+        maxUsage: 1,
+        description: `${brand.name} gift voucher — ${amount} ${brand.currency}`,
+      }),
+      user.save(),
+      Transaction.create({
+        userId: user._id,
+        type: 'expense',
+        amount,
+        currency: 'PTS',
+        description: `Gift voucher purchase — ${brand.name}`,
+        status: 'completed',
+        reference: `VCH-${Date.now()}`,
+      }),
+    ]);
 
     res.json({
       success: true,
       message: 'Voucher purchased successfully',
-      data: { newBalance: user.walletPoints },
+      data: { voucher, newBalance: user.walletPoints },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

@@ -13,12 +13,41 @@ const Transaction    = require('../models/Transaction');
 const router = express.Router();
 router.use(authMiddleware);
 
+// Per-transaction credit bounds. The merchant credit form has always
+// displayed "Limit: D 25 - D 1000", but nothing enforced it — the only
+// check was amount > 0, so any figure went through.
+const CREDIT_LIMITS = { MIN: 25, MAX: 1000 };
+
+// ─── GET /api/merchant/credits/limits ─────────────────────
+// Registered before GET /:id so 'limits' isn't swallowed as an id.
+router.get('/limits', (req, res) => {
+  res.json({
+    success: true,
+    data: { currency: 'D', minAmount: CREDIT_LIMITS.MIN, maxAmount: CREDIT_LIMITS.MAX },
+  });
+});
+
 // ─── GET /api/merchant/credits ────────────────────────────
 router.get('/', async (req, res) => {
   try {
     const { status, page = 1, limit = 20 } = req.query;
     const filter = { merchantId: req.user.id };
     if (status) filter.status = status;
+
+    // 'overdue' is one of MerchantCredit.status's real values and the merchant
+    // Credit screen totals it up as "dormant" — but nothing anywhere ever set
+    // it, so that figure could only ever read 0. A credit whose due date has
+    // passed while money is still owed is overdue; settle/cancel move it out
+    // of that state through their own handlers.
+    await MerchantCredit.updateMany(
+      {
+        merchantId: req.user.id,
+        status: 'active',
+        dueDate: { $ne: null, $lt: new Date() },
+        remainingAmount: { $gt: 0 },
+      },
+      { $set: { status: 'overdue' } }
+    );
 
     const [credits, total, activeAgg] = await Promise.all([
       MerchantCredit.find(filter)
@@ -28,7 +57,10 @@ router.get('/', async (req, res) => {
         .populate('customerId', 'fullName phone'),
       MerchantCredit.countDocuments(filter),
       MerchantCredit.aggregate([
-        { $match: { merchantId: new mongoose.Types.ObjectId(req.user.id), status: 'active' } },
+        { $match: {
+            merchantId: new mongoose.Types.ObjectId(req.user.id),
+            status: { $in: ['active', 'overdue'] },
+        } },
         { $group: { _id: null, total: { $sum: '$remainingAmount' } } },
       ]),
     ]);
@@ -52,8 +84,15 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const { customerId, customerName, customerPhone, amount, dueDate, description } = req.body;
-    if (!amount || parseFloat(amount) <= 0) {
+    const parsed = parseFloat(amount);
+    if (amount === undefined || amount === null || amount === '' || !Number.isFinite(parsed)) {
       return res.status(400).json({ success: false, message: 'Valid amount is required' });
+    }
+    if (parsed < CREDIT_LIMITS.MIN) {
+      return res.status(400).json({ success: false, message: `Minimum credit is D ${CREDIT_LIMITS.MIN}` });
+    }
+    if (parsed > CREDIT_LIMITS.MAX) {
+      return res.status(400).json({ success: false, message: `Maximum credit is D ${CREDIT_LIMITS.MAX}` });
     }
 
     let resolvedName  = customerName;
@@ -70,9 +109,9 @@ router.post('/', async (req, res) => {
       customerId:      customerId || null,
       customerName:    resolvedName  || 'Unknown Customer',
       customerPhone:   resolvedPhone,
-      amount:          parseFloat(amount),
+      amount:          parsed,
       paidAmount:      0,
-      remainingAmount: parseFloat(amount),
+      remainingAmount: parsed,
       dueDate:         dueDate ? new Date(dueDate) : null,
       description:     description || '',
       reference:       `CRED-${Date.now()}`,
@@ -83,8 +122,8 @@ router.post('/', async (req, res) => {
       userId:      customerId || req.user.id,
       merchantId:  req.user.id,
       type:        'credit',
-      amount:      parseFloat(amount),
-      currency:    'GMD',
+      amount:      parsed,
+      currency:    'TND',
       description: description || `Credit issued to ${resolvedName}`,
       status:      'pending',
       reference:   credit.reference,
@@ -124,9 +163,22 @@ router.put('/:id/settle', async (req, res) => {
     }
 
     const payment = parseFloat(paymentAmount);
+    const outstanding = Math.max(0, credit.amount - credit.paidAmount);
+    if (payment > outstanding + 1e-9) {
+      return res.status(400).json({
+        success: false,
+        message: `Payment exceeds the outstanding balance (D ${outstanding.toFixed(3)})`,
+        data: { remainingAmount: outstanding },
+      });
+    }
     credit.paidAmount      += payment;
     credit.remainingAmount  = Math.max(0, credit.amount - credit.paidAmount);
-    credit.status           = credit.remainingAmount <= 0 ? 'settled' : 'active';
+    // A partial payment does not un-expire a due date — a credit still past
+    // its due date with money owed stays overdue.
+    const stillOverdue = credit.dueDate && credit.dueDate < new Date();
+    credit.status = credit.remainingAmount <= 0
+      ? 'settled'
+      : (stillOverdue ? 'overdue' : 'active');
     credit.transactions.push({ amount: payment, method: method || 'cash', note: note || '' });
     await credit.save();
 
@@ -135,7 +187,7 @@ router.put('/:id/settle', async (req, res) => {
       merchantId:  req.user.id,
       type:        'income',
       amount:      payment,
-      currency:    'GMD',
+      currency:    'TND',
       description: `Credit repayment — ${credit.customerName}`,
       status:      'completed',
       reference:   `SETTLE-${Date.now()}`,

@@ -5,7 +5,28 @@
  * Requires: a running backend at BASE_URL with a seeded MongoDB.
  */
 
+require('dotenv').config();
+
 const BASE_URL = process.env.TEST_URL || 'http://localhost:3000/api';
+
+// ─── Direct-DB test seeding ────────────────────────────────────
+// Wallet points can only be earned for real through spin-wheel/check-in/
+// referral rewards or a gateway-verified top-up (routes/payment.js) — there
+// is no HTTP endpoint that mints points on request (a prior one was removed
+// as a live free-money exploit). Some flows below need a specific starting
+// balance to be deterministic, so we seed it directly in Mongo, the same
+// database the running backend under test is already using.
+const mongoose = require('mongoose');
+const User = require('../models/User');
+let dbConnected = false;
+
+async function seedWalletPoints(uid, amount) {
+  if (!dbConnected) {
+    await mongoose.connect(process.env.MONGODB_URI);
+    dbConnected = true;
+  }
+  await User.updateOne({ _id: uid }, { $inc: { walletPoints: amount } });
+}
 
 // ─── Minimal HTTP helper ─────────────────────────────────────
 async function req(method, path, body, token) {
@@ -104,21 +125,18 @@ async function testWallet() {
   assert('wallet returns points field', wallet.data?.points !== undefined, `points=${wallet.data?.points}`);
   assert('wallet returns recentTransactions array', Array.isArray(wallet.data?.recentTransactions));
 
-  // Top-up points
-  const topup = await req('POST', '/user/wallet/topup', { vipsAmount: 500, cardId: 'test-card' }, userToken);
-  assert('POST /user/wallet/topup success', topup.success === true, `msg=${topup.message}`);
-  assert('topup returns newBalance', topup.data?.newBalance !== undefined || topup.data?.walletPoints !== undefined);
-
-  // Verify points updated
+  // Seed points directly (no HTTP endpoint mints points on request — see
+  // seedWalletPoints comment above) and confirm the wallet reflects it.
+  const pointsBefore = wallet.data?.points ?? 0;
+  await seedWalletPoints(userId, 500);
   const walletAfter = await req('GET', '/user/wallet', null, userToken);
   const pointsAfter = walletAfter.data?.points ?? 0;
-  assert('wallet points increased after topup', pointsAfter >= 500, `points=${pointsAfter}`);
+  assert('wallet points increased after seeding', pointsAfter >= pointsBefore + 500, `points=${pointsAfter}`);
 
   // Transactions log
   const txLog = await req('GET', '/user/transactions', null, userToken);
   assert('GET /user/transactions success', txLog.success === true);
   assert('transactions returns array', Array.isArray(txLog.data?.transactions));
-  assert('transactions includes topup record', txLog.data?.transactions?.length >= 1);
 }
 
 // ─── FLOW 3: Rewards & Spin Wheel ───────────────────────────
@@ -155,12 +173,25 @@ async function testRewards() {
 async function testOrderFlow() {
   console.log('\n══ FLOW 4: Order Checkout → Merchant Dashboard ══');
 
-  // Create order as user
+  // Real products, created by the merchant. /order/create prices every line
+  // from the Product/Deal document rather than from the request — it used to
+  // total the order from whatever price the client claimed, so a D 29.990
+  // burger could be ordered for a millime.
+  const burger = await req('POST', '/merchant/products',
+    { name: 'Test Burger', price: 29.99, category: 'Food' }, merchantToken);
+  const fries = await req('POST', '/merchant/products',
+    { name: 'Test Fries', price: 9.99, category: 'Food' }, merchantToken);
+  const burgerId = burger.data?._id;
+  const friesId  = fries.data?._id;
+  assert('merchant products created for the order flow', !!burgerId && !!friesId,
+    `burger=${burgerId} fries=${friesId}`);
+
   const orderPayload = {
     merchantId,
     items: [
-      { productId: 'test-product-1', name: 'Test Burger', price: 29.99, quantity: 2 },
-      { productId: 'test-product-2', name: 'Test Fries', price: 9.99, quantity: 1 },
+      // Deliberately understated prices — the server must ignore them.
+      { productId: burgerId, name: 'Test Burger', price: 0.001, quantity: 2 },
+      { productId: friesId,  name: 'Test Fries',  price: 0.001, quantity: 1 },
     ],
     paymentMethod: 'cash',
     deliveryAddress: '123 Test Street, Test City',
@@ -170,6 +201,16 @@ async function testOrderFlow() {
 
   const createOrder = await req('POST', '/order/create', orderPayload, userToken);
   assert('POST /order/create success', createOrder.success === true, `msg=${createOrder.message}`);
+  assert('order is priced from the database, not the request',
+    Math.abs((createOrder.data?.totalAmount ?? 0) - (29.99 * 2 + 9.99)) < 0.01,
+    `total=${createOrder.data?.totalAmount} (expected ${29.99 * 2 + 9.99})`);
+
+  const bogus = await req('POST', '/order/create', {
+    merchantId,
+    items: [{ productId: '000000000000000000000000', name: 'Ghost', price: 5, quantity: 1 }],
+    paymentMethod: 'cash',
+  }, userToken);
+  assert('order with an unknown item is rejected', bogus.success === false, `msg=${bogus.message}`);
   assert('order has id field', !!createOrder.data?._id || !!createOrder.data?.id, `data keys=${Object.keys(createOrder.data || {}).join(',')}`);
   const orderTotal = createOrder.data?.totalAmount ?? createOrder.data?.order_amount ?? 0;
   assert('order totalAmount computed correctly', orderTotal > 0, `total=${orderTotal}`);
@@ -349,8 +390,8 @@ async function testReferral() {
 async function testGiftSend() {
   console.log('\n══ FLOW 10: Gift Send ══');
 
-  // Top up points, then convert to walletBalance — 5000 pts × 0.01 = 50 TND balance
-  await req('POST', '/user/wallet/topup', { vipsAmount: 10000, cardId: 'gift-test' }, userToken);
+  // Seed points, then convert to walletBalance — 5000 pts × 0.01 = 50 TND balance
+  await seedWalletPoints(userId, 10000);
   await req('POST', '/user/vips-club/convert', { points: 5000 }, userToken);
 
   const txsBefore = await req('GET', '/user/transactions', null, userToken);
@@ -395,6 +436,8 @@ async function runAll() {
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }
+
+  if (dbConnected) await mongoose.disconnect();
 
   console.log('\n══════════════════════════════════════════════');
   console.log(`Results: ${passed} passed / ${failed} failed`);

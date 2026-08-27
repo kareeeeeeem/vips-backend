@@ -141,6 +141,7 @@ orderSchema.methods.toMerchantJSON = function (merchantUser) {
     total_tax_amount:     o.totalTaxAmount || 0,
     payment_method:       o.paymentMethod,
     order_note:           o.orderNote     || '',
+    cancellation_reason:  o.cancellationReason || '',
     order_type:           o.orderType     || 'delivery',
     created_at:           o.createdAt?.toISOString()  || null,
     updated_at:           o.updatedAt?.toISOString()  || null,
@@ -161,7 +162,9 @@ orderSchema.methods.toMerchantJSON = function (merchantUser) {
     scheduled:            o.scheduleAt ? 1 : 0,
     store_discount_amount: o.storeDiscountAmount || 0,
     store_name:           merchantUser?.storeName    || '',
-    store_address:        merchantUser?.address      || '',
+    // `address` is not a User field — the schema calls it storeAddress, so
+    // every merchant order carried an empty store address.
+    store_address:        merchantUser?.storeAddress || merchantUser?.address || '',
     store_phone:          merchantUser?.phone        || '',
     store_lat:            null,
     store_lng:            null,

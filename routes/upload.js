@@ -18,15 +18,19 @@ const storage = multer.diskStorage({
   },
 });
 
+// Images, plus PDF for the licence/identity documents the merchant
+// registration form asks for (its own copy says "JPG, PNG or PDF", and a
+// business licence is far more often a PDF than a photo).
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = /jpeg|jpg|png|gif|webp/;
-    const ext  = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mime = allowed.test(file.mimetype);
+    const allowedExt  = /\.(jpeg|jpg|png|gif|webp|pdf)$/i;
+    const allowedMime = /^(image\/(jpeg|jpg|png|gif|webp)|application\/pdf)$/i;
+    const ext  = allowedExt.test(path.extname(file.originalname).toLowerCase());
+    const mime = allowedMime.test(file.mimetype);
     if (ext && mime) return cb(null, true);
-    cb(new Error('Only jpg/png/gif/webp images are allowed'));
+    cb(new Error('Only jpg/png/gif/webp images or PDF files are allowed'));
   },
 });
 

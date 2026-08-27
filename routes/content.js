@@ -551,4 +551,173 @@ router.post('/deals/:id/redeem', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── GET /api/content/merchants/:id/follow-status ────────────
+router.get('/merchants/:id/follow-status', optionalAuthMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid merchant id' });
+    }
+    const followerCount = await User.countDocuments({ following: req.params.id });
+    const following = req.user
+      ? !!(await User.exists({ _id: req.user.id, following: req.params.id }))
+      : false;
+    res.json({ success: true, data: { following, followerCount } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/content/merchants/:id/follow ──────────────────
+// Toggles follow state — mirrors the existing POST /favorites/toggle
+// pattern (routes/favorites.js).
+router.post('/merchants/:id/follow', authMiddleware, async (req, res) => {
+  try {
+    const merchantId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(merchantId)) {
+      return res.status(400).json({ success: false, message: 'Invalid merchant id' });
+    }
+    const merchant = await User.findOne({ _id: merchantId, role: 'merchant' });
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    const user = await User.findById(req.user.id);
+    const idx = user.following.findIndex((id) => id.toString() === merchantId);
+    if (idx === -1) {
+      user.following.push(merchantId);
+    } else {
+      user.following.splice(idx, 1);
+    }
+    await user.save();
+
+    const followerCount = await User.countDocuments({ following: merchantId });
+    res.json({ success: true, data: { following: idx === -1, followerCount } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/content/merchants/:id/reviews ──────────────────
+// Real reviews, not a separate Review model: POST /order/:id/review
+// (routes/order.js) already lets a customer rate+review their own
+// completed order, and Order carries merchantId — so a merchant's
+// reviews are just its rated orders, same source computeProductStats
+// above already draws per-product rating from.
+router.get('/merchants/:id/reviews', optionalAuthMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid merchant id' });
+    }
+    const orders = await Order.find({ merchantId: req.params.id, rating: { $gt: 0 } })
+      .populate('userId', 'fullName profileImage')
+      .sort({ updatedAt: -1 })
+      .limit(50);
+
+    const reviews = orders.map((o) => ({
+      orderId: o._id,
+      rating: o.rating,
+      review: o.review || '',
+      reviewerName: o.userId?.fullName || 'VIPs Customer',
+      reviewerAvatar: o.userId?.profileImage || null,
+      createdAt: o.updatedAt,
+    }));
+    const avgRating = reviews.length
+      ? Math.round((reviews.reduce((s, r) => s + r.rating, 0) / reviews.length) * 10) / 10
+      : 0;
+
+    res.json({ success: true, data: { reviews, avgRating, reviewCount: reviews.length } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// SPONSORED ADS  (merchant campaigns, shown to customers)
+// ═══════════════════════════════════════════════════════════
+// Merchants can create, boost and pay for ad campaigns
+// (routes/merchant_ads.js — boosting debits their real wallet balance), but
+// nothing ever served those ads to a customer: impressions, clicks and
+// conversions could only ever stay 0 and the money bought nothing. These
+// three routes are the delivery side.
+
+const MerchantAd = require('../models/MerchantAd');
+
+/// What one click costs the advertiser, in TND. Single source of truth for
+/// both the click handler and anything that reports on spend.
+const AD_COST_PER_CLICK = 0.1;
+
+// ─── GET /api/content/ads ─────────────────────────────────
+// Live campaigns a customer may be shown right now.
+router.get('/ads', async (req, res) => {
+  try {
+    const now = new Date();
+    const limit = Math.min(parseInt(req.query.limit, 10) || 10, 30);
+
+    const ads = await MerchantAd.find({
+      status: 'active',
+      startDate: { $lte: now },
+      endDate: { $gte: now },
+      $expr: {
+        $or: [
+          { $lte: ['$budget', 0] },                 // no budget cap set
+          { $lt: ['$spentAmount', '$budget'] },     // budget not used up
+        ],
+      },
+    })
+      .sort({ isBoost: -1, createdAt: -1 })
+      .limit(limit)
+      .populate('merchantId', 'storeName logo storeCategory');
+
+    res.json({
+      success: true,
+      data: ads.map((ad) => ({
+        _id: ad._id,
+        title: ad.title,
+        description: ad.description,
+        imageUrl: ad.imageUrl,
+        adType: ad.adType,
+        targetUrl: ad.targetUrl,
+        merchantId: ad.merchantId?._id || ad.merchantId,
+        storeName: ad.merchantId?.storeName || '',
+        storeLogo: ad.merchantId?.logo || '',
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/content/ads/:id/impression ─────────────────
+router.post('/ads/:id/impression', async (req, res) => {
+  try {
+    await MerchantAd.updateOne({ _id: req.params.id }, { $inc: { impressions: 1 } });
+    res.json({ success: true, message: 'Impression recorded' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/content/ads/:id/click ──────────────────────
+// Charges the campaign's budget per click and ends it once the budget is
+// used up, so a campaign cannot keep running on money that is gone.
+router.post('/ads/:id/click', async (req, res) => {
+  try {
+    const ad = await MerchantAd.findById(req.params.id);
+    if (!ad) return res.status(404).json({ success: false, message: 'Ad not found' });
+
+    ad.clicks += 1;
+    ad.spentAmount = Math.round((ad.spentAmount + AD_COST_PER_CLICK) * 100) / 100;
+    if (ad.budget > 0 && ad.spentAmount >= ad.budget) {
+      ad.status = 'ended';
+    }
+    await ad.save();
+
+    res.json({
+      success: true,
+      message: 'Click recorded',
+      data: { merchantId: ad.merchantId, targetUrl: ad.targetUrl || '' },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 module.exports = router;
