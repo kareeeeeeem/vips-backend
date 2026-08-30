@@ -110,6 +110,17 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // A banned account (User.isActive === false, set from the admin
+    // console) must not be able to obtain a token. Without this check the
+    // admin "Ban" action would only hide the row from admin lists while
+    // the user carried on using the app normally.
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been suspended. Please contact support.',
+      });
+    }
+
     // Two-factor: password alone isn't enough — send an OTP and stop
     // short of issuing a token. The client finishes via /auth/2fa/verify.
     if (user.twoFactorEnabled) {
@@ -177,6 +188,17 @@ router.post('/2fa/verify', async (req, res) => {
     });
     if (!user) {
       return res.status(400).json({ success: false, message: 'Invalid or expired code.' });
+    }
+
+    // A banned account (User.isActive === false, set from the admin
+    // console) must not be able to obtain a token. Without this check the
+    // admin "Ban" action would only hide the row from admin lists while
+    // the user carried on using the app normally.
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been suspended. Please contact support.',
+      });
     }
 
     // One-time use — unlike /auth/verify-otp (which leaves the token
@@ -563,6 +585,17 @@ router.post('/merchant-login', async (req, res) => {
       return res.status(401).json({ success: false, message: 'No merchant account found with this phone number.' });
     }
 
+    // A banned account (User.isActive === false, set from the admin
+    // console) must not be able to obtain a token. Without this check the
+    // admin "Ban" action would only hide the row from admin lists while
+    // the user carried on using the app normally.
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been suspended. Please contact support.',
+      });
+    }
+
     const otp = Math.floor(1000 + Math.random() * 9000).toString();
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
@@ -600,6 +633,17 @@ router.post('/merchant-verify-otp', async (req, res) => {
 
     if (!user) {
       return res.status(400).json({ success: false, message: 'Invalid or expired OTP.' });
+    }
+
+    // A banned account (User.isActive === false, set from the admin
+    // console) must not be able to obtain a token. Without this check the
+    // admin "Ban" action would only hide the row from admin lists while
+    // the user carried on using the app normally.
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been suspended. Please contact support.',
+      });
     }
 
     user.resetPasswordToken = undefined;
@@ -667,6 +711,15 @@ router.post('/social', async (req, res) => {
       });
     }
 
+    // A banned account (User.isActive === false, set from the admin
+    // console) must not be able to obtain a token — see /login.
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been suspended. Please contact support.',
+      });
+    }
+
     const token = jwt.sign(
       { id: user._id, email: user.email, role: user.role },
       process.env.JWT_SECRET,
@@ -715,6 +768,15 @@ router.post('/merchant-social', async (req, res) => {
     const user = await User.findOne({ email });
     if (!user || user.role !== 'merchant') {
       return res.status(401).json({ success: false, message: 'No merchant account found with this email.' });
+    }
+
+    // A banned account (User.isActive === false, set from the admin
+    // console) must not be able to obtain a token — see /login.
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been suspended. Please contact support.',
+      });
     }
 
     const token = jwt.sign(

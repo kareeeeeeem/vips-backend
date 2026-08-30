@@ -28,6 +28,24 @@ async function seedWalletPoints(uid, amount) {
   await User.updateOne({ _id: uid }, { $inc: { walletPoints: amount } });
 }
 
+/**
+ * Create a throwaway admin straight in Mongo.
+ *
+ * There is deliberately no HTTP endpoint that mints the first admin (that
+ * would be an unauthenticated privilege-escalation hole), so the suite writes
+ * one the same way seedWalletPoints writes points. Uses .save() rather than
+ * an update so the password pre-save hook hashes it.
+ */
+async function seedAdmin(admin) {
+  if (!dbConnected) {
+    await mongoose.connect(process.env.MONGODB_URI);
+    dbConnected = true;
+  }
+  const doc = new User({ ...admin, role: 'admin', isVerified: true });
+  await doc.save();
+  return doc._id.toString();
+}
+
 // ─── Minimal HTTP helper ─────────────────────────────────────
 async function req(method, path, body, token) {
   const { default: fetch } = await import('node-fetch').catch(() => {
@@ -63,6 +81,7 @@ function assert(label, condition, detail = '') {
 
 // ─── State shared between tests ──────────────────────────────
 let userToken, merchantToken, userId, merchantId, orderId, couponId;
+let adminToken, adminId;
 
 const ts = Date.now();
 const TEST_USER = {
@@ -416,6 +435,342 @@ async function testGiftSend() {
 }
 
 // ─── Runner ──────────────────────────────────────────────────
+
+// ─── FLOW 11: Admin console ──────────────────────────────────
+async function testAdmin() {
+  console.log('\n══ FLOW 11: Admin console ══');
+
+  const adminEmail = `qa_admin_${ts}@vips.test`;
+  const adminPassword = 'AdminPassword123';
+  adminId = await seedAdmin({
+    fullName: 'QA Admin',
+    email: adminEmail,
+    phone: String(ts + 2).slice(-9).padStart(9, '9'),
+    password: adminPassword,
+  });
+
+  // ── Auth gate ──
+  const asCustomer = await req('POST', '/admin/login', {
+    email: TEST_USER.email,
+    password: TEST_USER.password,
+  });
+  assert('admin login rejects a valid customer account', asCustomer.status === 401,
+    `status ${asCustomer.status}`);
+
+  const wrongPass = await req('POST', '/admin/login', {
+    email: adminEmail,
+    password: 'not-the-password',
+  });
+  assert('admin login rejects a wrong password', wrongPass.status === 401);
+
+  const login = await req('POST', '/admin/login', {
+    email: adminEmail,
+    password: adminPassword,
+  });
+  assert('admin login succeeds', login.success === true && !!login.data?.token);
+  adminToken = login.data?.token;
+
+  const noToken = await req('GET', '/admin/dashboard/stats');
+  assert('admin routes reject an anonymous request', noToken.status === 401);
+
+  const customerToken = await req('GET', '/admin/dashboard/stats', null, userToken);
+  assert('admin routes reject a customer token', customerToken.status === 403,
+    `status ${customerToken.status}`);
+
+  const me = await req('GET', '/admin/me', null, adminToken);
+  assert('GET /admin/me returns the signed-in admin',
+    me.success === true && me.data?.user?.role === 'admin');
+
+  // ── Dashboard ──
+  const stats = await req('GET', '/admin/dashboard/stats', null, adminToken);
+  assert('dashboard stats returns every section',
+    stats.success === true &&
+    typeof stats.data?.users?.total === 'number' &&
+    typeof stats.data?.merchants?.total === 'number' &&
+    typeof stats.data?.orders?.total === 'number' &&
+    typeof stats.data?.revenue?.total === 'number');
+
+  const charts = await req('GET', '/admin/dashboard/charts?days=7', null, adminToken);
+  assert('dashboard charts fills every day in the window',
+    charts.success === true && Array.isArray(charts.data?.series) &&
+    charts.data.series.length === 7,
+    `got ${charts.data?.series?.length}`);
+
+  const recent = await req('GET', '/admin/dashboard/recent?limit=3', null, adminToken);
+  assert('dashboard recent activity returns its four lists',
+    recent.success === true &&
+    Array.isArray(recent.data?.orders) &&
+    Array.isArray(recent.data?.users) &&
+    Array.isArray(recent.data?.merchants) &&
+    Array.isArray(recent.data?.pendingRegistrations));
+
+  // ── Users ──
+  const users = await req('GET', '/admin/users?limit=5', null, adminToken);
+  assert('users list is paginated',
+    users.success === true && Array.isArray(users.data?.items) &&
+    typeof users.data?.total === 'number' && typeof users.data?.pages === 'number');
+
+  const searched = await req(
+    'GET', `/admin/users?search=${encodeURIComponent(TEST_USER.email)}`, null, adminToken);
+  assert('users search finds the test customer by email',
+    searched.data?.items?.some((u) => u.email === TEST_USER.email));
+
+  const userDetail = await req('GET', `/admin/users/${userId}`, null, adminToken);
+  assert('user details include the order/spend summary',
+    userDetail.success === true &&
+    typeof userDetail.data?.stats?.orders === 'number' &&
+    typeof userDetail.data?.stats?.totalSpent === 'number');
+
+  const badId = await req('GET', '/admin/users/not-an-object-id', null, adminToken);
+  assert('a malformed id is a 400, not a 500', badId.status === 400,
+    `status ${badId.status}`);
+
+  // ── Ban must actually lock the account out, not just flag it ──
+  const ban = await req('PUT', `/admin/users/${userId}/ban`, { banned: true }, adminToken);
+  assert('banning a user succeeds', ban.success === true &&
+    ban.data?.user?.isActive === false);
+
+  const bannedLogin = await req('POST', '/auth/login', {
+    email: TEST_USER.email,
+    password: TEST_USER.password,
+  });
+  assert('a banned user can no longer log in', bannedLogin.status === 403,
+    `status ${bannedLogin.status}`);
+
+  const unban = await req('PUT', `/admin/users/${userId}/ban`, { banned: false }, adminToken);
+  assert('reinstating a user succeeds', unban.success === true &&
+    unban.data?.user?.isActive === true);
+
+  const reinstatedLogin = await req('POST', '/auth/login', {
+    email: TEST_USER.email,
+    password: TEST_USER.password,
+  });
+  assert('a reinstated user can log in again', reinstatedLogin.success === true);
+
+  const badRole = await req('PUT', `/admin/users/${userId}/role`, { role: 'wizard' }, adminToken);
+  assert('an unknown role is rejected', badRole.status === 400);
+
+  const selfDelete = await req('DELETE', `/admin/users/${adminId}`, null, adminToken);
+  assert('an admin cannot delete their own account', selfDelete.status === 400);
+
+  // ── Merchants ──
+  const merchants = await req('GET', '/admin/merchants?limit=5', null, adminToken);
+  assert('merchants list carries an approval status per row',
+    merchants.success === true && Array.isArray(merchants.data?.items) &&
+    merchants.data.items.every((m) => typeof m.approvalStatus === 'string'));
+
+  const merchantDetail = await req('GET', `/admin/merchants/${merchantId}`, null, adminToken);
+  assert('merchant details include the sales summary',
+    merchantDetail.success === true &&
+    typeof merchantDetail.data?.stats?.revenue === 'number' &&
+    typeof merchantDetail.data?.stats?.products === 'number');
+
+  const deactivate = await req(
+    'PUT', `/admin/merchants/${merchantId}/activate`, { active: false }, adminToken);
+  assert('deactivating a merchant succeeds',
+    deactivate.success === true && deactivate.data?.merchant?.isActive === false);
+
+  const reactivate = await req(
+    'PUT', `/admin/merchants/${merchantId}/activate`, { active: true }, adminToken);
+  assert('reactivating a merchant succeeds',
+    reactivate.success === true && reactivate.data?.merchant?.isActive === true);
+
+  // ── Orders ──
+  const orders = await req('GET', '/admin/orders?limit=5', null, adminToken);
+  assert('orders list joins the customer and merchant names',
+    orders.success === true && Array.isArray(orders.data?.items) &&
+    typeof orders.data?.statusCounts === 'object');
+
+  if (orderId) {
+    const orderDetail = await req('GET', `/admin/orders/${orderId}`, null, adminToken);
+    assert('order details load', orderDetail.success === true &&
+      !!orderDetail.data?.order);
+
+    const badStatus = await req(
+      'PUT', `/admin/orders/${orderId}/status`, { status: 'teleported' }, adminToken);
+    assert('an off-enum order status is rejected', badStatus.status === 400);
+
+    const setStatus = await req(
+      'PUT', `/admin/orders/${orderId}/status`, { status: 'confirmed' }, adminToken);
+    assert('an order status update stamps its timestamp',
+      setStatus.success === true && !!setStatus.data?.order?.confirmedAt);
+  }
+
+  // ── Inventory ──
+  const inventory = await req('GET', '/admin/inventory?limit=5', null, adminToken);
+  assert('inventory list reports platform totals',
+    inventory.success === true && Array.isArray(inventory.data?.items) &&
+    typeof inventory.data?.totalValue === 'number');
+
+  const alerts = await req('GET', '/admin/inventory/alerts', null, adminToken);
+  assert('low-stock alerts cover both stock lines and products',
+    alerts.success === true && Array.isArray(alerts.data?.stock) &&
+    Array.isArray(alerts.data?.products));
+
+  // ── Reports ──
+  for (const name of ['sales', 'users', 'merchants', 'orders']) {
+    const report = await req('GET', `/admin/reports/${name}`, null, adminToken);
+    assert(`${name} report returns a summary`,
+      report.success === true && typeof report.data?.summary === 'object');
+  }
+
+  // ── Top bar: notifications and global search ──
+  const notifications = await req('GET', '/admin/notifications', null, adminToken);
+  assert('notifications return actionable items with a route',
+    notifications.success === true && Array.isArray(notifications.data?.items) &&
+    notifications.data.items.every((i) =>
+      typeof i.count === 'number' && i.count > 0 && typeof i.title === 'string'),
+    'an item with a zero count should be filtered out entirely');
+
+  assert('the notification badge counts distinct backlogs, not rows',
+    notifications.data?.total === notifications.data?.items?.length);
+
+  const search = await req('GET', `/admin/search?q=${encodeURIComponent('QA')}`, null, adminToken);
+  assert('global search spans users, merchants and orders',
+    search.success === true && Array.isArray(search.data?.users) &&
+    Array.isArray(search.data?.merchants) && Array.isArray(search.data?.orders));
+
+  const shortSearch = await req('GET', '/admin/search?q=Q', null, adminToken);
+  assert('a one-character search is an empty result, not an error',
+    shortSearch.success === true && shortSearch.data?.total === 0);
+
+  const orderSearch = await req('GET', '/admin/search?q=1059', null, adminToken);
+  assert('searching an order number finds that order',
+    orderSearch.data?.orders?.some((o) => o.orderNumber === 1059),
+    JSON.stringify(orderSearch.data?.orders?.map((o) => o.orderNumber)));
+
+  const searchNoToken = await req('GET', '/admin/search?q=QA');
+  assert('search is admin-gated', searchNoToken.status === 401);
+
+  // ── Inventory: ledger, transfers, locations ──
+  const movementsBefore = await req('GET', '/admin/inventory/movements', null, adminToken);
+  assert('the stock ledger is readable', movementsBefore.success === true &&
+    Array.isArray(movementsBefore.data?.items));
+
+  // Create a stock line as the merchant, so the ledger is proven to capture
+  // merchant-side changes and not only admin ones.
+  const stockLine = await req('POST', '/merchant/stock', {
+    name: `Ledger Item ${ts}`,
+    category: 'Supplies',
+    currentStock: 60,
+    lowStockThreshold: 10,
+    unitPrice: 2.5,
+  }, merchantToken);
+  assert('merchant can create a stock line', stockLine.success === true);
+  const stockId = stockLine.data?._id;
+
+  const afterCreate = await req('GET', `/admin/inventory/movements?stockId=${stockId}`, null, adminToken);
+  assert('creating a stock line writes an opening movement',
+    afterCreate.data?.items?.some((m) => m.type === 'initial' && m.balanceAfter === 60));
+
+  await req('PUT', `/merchant/stock/${stockId}`, { currentStock: 45 }, merchantToken);
+  const afterDecrease = await req('GET', `/admin/inventory/movements?stockId=${stockId}`, null, adminToken);
+  assert('a merchant stock decrease is recorded as an "out" with real balances',
+    afterDecrease.data?.items?.some(
+      (m) => m.type === 'out' && m.quantity === 15 && m.balanceBefore === 60 && m.balanceAfter === 45));
+
+  // A rename is not a stock movement — the ledger must not fill with no-ops.
+  const beforeRename = afterDecrease.data?.total;
+  await req('PUT', `/merchant/stock/${stockId}`, { name: `Renamed ${ts}` }, merchantToken);
+  const afterRename = await req('GET', `/admin/inventory/movements?stockId=${stockId}`, null, adminToken);
+  assert('a rename writes no movement', afterRename.data?.total === beforeRename,
+    `${beforeRename} -> ${afterRename.data?.total}`);
+
+  // Transfers
+  const transfer = await req('POST', '/admin/inventory/transfer', {
+    fromStockId: stockId,
+    toLocation: `Depot ${ts}`,
+    quantity: 20,
+    // Unique per run: an earlier run's rows carry the same text, and the
+    // search below would otherwise match those too.
+    reason: `Integration test transfer ${ts}`,
+  }, adminToken);
+  assert('a transfer to a new location succeeds', transfer.success === true);
+  assert('the transfer opens the destination line at the moved quantity',
+    transfer.data?.to?.currentStock === 20 && transfer.data?.from?.currentStock === 25);
+
+  const bothHalves = await req(
+    'GET', `/admin/inventory/movements?search=${encodeURIComponent(`Integration test transfer ${ts}`)}`,
+    null, adminToken);
+  const refs = (bothHalves.data?.items || []).map((m) => m.reference);
+  assert('both halves of the transfer share one reference',
+    refs.length === 2 && refs[0] === refs[1] && !!refs[0], JSON.stringify(refs));
+
+  const overTransfer = await req('POST', '/admin/inventory/transfer', {
+    fromStockId: stockId, toLocation: `Depot2 ${ts}`, quantity: 99999,
+  }, adminToken);
+  assert('a transfer larger than the balance on hand is refused',
+    overTransfer.status === 409, `status ${overTransfer.status}`);
+
+  const zeroTransfer = await req('POST', '/admin/inventory/transfer', {
+    fromStockId: stockId, toLocation: `Depot3 ${ts}`, quantity: 0,
+  }, adminToken);
+  assert('a zero-quantity transfer is refused', zeroTransfer.status === 400);
+
+  const sameLocation = await req('POST', '/admin/inventory/transfer', {
+    fromStockId: stockId, toLocation: 'Main', quantity: 1,
+  }, adminToken);
+  assert('a transfer to the source location is refused', sameLocation.status === 400);
+
+  const locations = await req('GET', '/admin/inventory/locations', null, adminToken);
+  assert('locations are derived from stock that actually exists',
+    locations.success === true &&
+    locations.data?.items?.some((l) => l.location === `Depot ${ts}` && l.units === 20));
+
+  const byLocation = await req(
+    'GET', `/admin/inventory?location=${encodeURIComponent(`Depot ${ts}`)}`, null, adminToken);
+  assert('inventory can be filtered to one location',
+    byLocation.data?.items?.every((i) => i.location === `Depot ${ts}`) &&
+    byLocation.data?.total === 1);
+
+  const badTransfer = await req('POST', '/admin/inventory/transfer', {
+    fromStockId: 'not-an-id', toLocation: 'X', quantity: 1,
+  }, adminToken);
+  assert('a malformed source id is a 400', badTransfer.status === 400);
+
+  // ── Platform settings ──
+  const settings = await req('GET', '/admin/settings', null, adminToken);
+  assert('settings report the admin roster and live integration status',
+    settings.success === true && Array.isArray(settings.data?.admins) &&
+    typeof settings.data?.integrations?.sendgrid === 'boolean');
+
+  const secondEmail = `qa_admin2_${ts}@vips.test`;
+  const created = await req('POST', '/admin/settings/admins', {
+    fullName: 'QA Second Admin',
+    email: secondEmail,
+    phone: String(ts + 3).slice(-9).padStart(9, '8'),
+    password: 'SecondAdmin123',
+  }, adminToken);
+  assert('a second admin can be created from the console', created.success === true);
+
+  const duplicate = await req('POST', '/admin/settings/admins', {
+    fullName: 'Dup',
+    email: secondEmail,
+    phone: String(ts + 4).slice(-9).padStart(9, '8'),
+    password: 'SecondAdmin123',
+  }, adminToken);
+  assert('a duplicate admin email is rejected', duplicate.status === 409);
+
+  const shortPassword = await req('POST', '/admin/settings/admins', {
+    fullName: 'Short',
+    email: `qa_admin3_${ts}@vips.test`,
+    phone: String(ts + 5).slice(-9).padStart(9, '8'),
+    password: 'abc',
+  }, adminToken);
+  assert('a too-short admin password is rejected', shortPassword.status === 400);
+
+  const removeSelf = await req(
+    'DELETE', `/admin/settings/admins/${adminId}`, null, adminToken);
+  assert('an admin cannot remove their own account', removeSelf.status === 400);
+
+  const secondId = created.data?.user?._id;
+  if (secondId) {
+    const removed = await req(
+      'DELETE', `/admin/settings/admins/${secondId}`, null, adminToken);
+    assert('the second admin can be removed', removed.success === true);
+  }
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -433,6 +788,7 @@ async function runAll() {
     await testMerchant();
     await testReferral();
     await testGiftSend();
+    await testAdmin();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }

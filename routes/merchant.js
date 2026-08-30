@@ -23,6 +23,7 @@ const User        = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Order       = require('../models/Order');
 const Stock       = require('../models/Stock');
+const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
 const Asset       = require('../models/Asset');
 const TaxRate     = require('../models/TaxRate');
 const Staff       = require('../models/Staff');
@@ -1386,7 +1387,7 @@ function stripProtected(body) {
   return out;
 }
 
-function crudRouter(Model, sortField = 'createdAt') {
+function crudRouter(Model, sortField = 'createdAt', hooks = {}) {
   const r = express.Router();
 
   r.get('/', async (req, res) => {
@@ -1399,6 +1400,7 @@ function crudRouter(Model, sortField = 'createdAt') {
   r.post('/', async (req, res) => {
     try {
       const item = await Model.create({ ...stripProtected(req.body), merchantId: req.user.id });
+      if (hooks.afterCreate) await hooks.afterCreate(item, req);
       res.status(201).json({ success: true, data: item });
     } catch (e) {
       // A Mongoose validation failure is the caller's fault, not a server
@@ -1414,12 +1416,18 @@ function crudRouter(Model, sortField = 'createdAt') {
       if (Object.keys(update).length === 0) {
         return res.status(400).json({ success: false, message: 'No updatable fields supplied' });
       }
+      // The pre-image is needed by the ledger hook: a movement row is only
+      // meaningful if it can say what the balance was before the change.
+      const before = hooks.afterUpdate
+        ? await Model.findOne({ _id: req.params.id, merchantId: req.user.id }).lean()
+        : null;
       const item = await Model.findOneAndUpdate(
         { _id: req.params.id, merchantId: req.user.id },
         update,
         { new: true, runValidators: true }
       );
       if (!item) return res.status(404).json({ success: false, message: 'Not found' });
+      if (hooks.afterUpdate) await hooks.afterUpdate(before, item, req);
       res.json({ success: true, data: item });
     } catch (e) {
       const status = e.name === 'ValidationError' ? 400 : 500;
@@ -1433,6 +1441,7 @@ function crudRouter(Model, sortField = 'createdAt') {
       // deleting someone else's record read as a success.
       const item = await Model.findOneAndDelete({ _id: req.params.id, merchantId: req.user.id });
       if (!item) return res.status(404).json({ success: false, message: 'Not found' });
+      if (hooks.afterDelete) await hooks.afterDelete(item, req);
       res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
   });
@@ -1440,7 +1449,50 @@ function crudRouter(Model, sortField = 'createdAt') {
   return r;
 }
 
-router.use('/stock',     crudRouter(Stock));
+// Stock is the one CRUD model with an audit trail: every merchant-side
+// change writes a StockMovement, so the admin console's movement history is
+// the whole story and not just what an admin did.
+const stockLedgerHooks = {
+  afterCreate: (item, req) => recordMovement({
+    stock: item,
+    type: 'initial',
+    quantity: item.currentStock,
+    balanceBefore: 0,
+    balanceAfter: item.currentStock,
+    reason: 'Stock line created',
+    performedBy: req.user.id,
+    performedByRole: req.user.role,
+  }),
+  afterUpdate: (before, item, req) => {
+    const from = before ? before.currentStock : 0;
+    const to = item.currentStock;
+    // A rename or price edit is not a stock movement — only log a real
+    // quantity change, otherwise the ledger fills with no-op rows.
+    if (from === to) return;
+    return recordMovement({
+      stock: item,
+      type: movementTypeForDelta(from, to),
+      quantity: Math.abs(to - from),
+      balanceBefore: from,
+      balanceAfter: to,
+      reason: 'Updated by merchant',
+      performedBy: req.user.id,
+      performedByRole: req.user.role,
+    });
+  },
+  afterDelete: (item, req) => recordMovement({
+    stock: item,
+    type: 'removed',
+    quantity: item.currentStock,
+    balanceBefore: item.currentStock,
+    balanceAfter: 0,
+    reason: 'Stock line deleted',
+    performedBy: req.user.id,
+    performedByRole: req.user.role,
+  }),
+};
+
+router.use('/stock',     crudRouter(Stock, 'createdAt', stockLedgerHooks));
 router.use('/assets',    crudRouter(Asset));
 router.use('/tax-rates', crudRouter(TaxRate));
 router.use('/staff',     crudRouter(Staff));

@@ -126,6 +126,15 @@ app.put('/api/admin/employees/:id', authMiddleware, requireRole('admin'), async 
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// ADMIN CONSOLE ROUTES
+// ═══════════════════════════════════════════════════════════
+// Mounted after the inline /api/admin/employees/:id route above so that
+// pre-existing, more specific handler keeps matching first; everything else
+// under /api/admin falls through to this router.
+const adminRoutes = require('./routes/admin');
+app.use('/api/admin', adminRoutes);
+
 // ─── Health Check ─────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   const dbStates = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
