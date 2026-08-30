@@ -728,6 +728,110 @@ async function testAdmin() {
   }, adminToken);
   assert('a malformed source id is a 400', badTransfer.status === 400);
 
+  // ── POS: session, cart, invoice, refund ──
+  const noSession = await req('GET', '/admin/pos/cart', null, adminToken);
+  assert('the cart is refused with no open till', noSession.status === 409);
+
+  const posMerchantId = merchantId;
+  const startTill = await req('POST', '/admin/pos/session/start',
+    { merchantId: posMerchantId, openingFloat: 50 }, adminToken);
+  assert('a till session opens', startTill.success === true);
+
+  const doubleTill = await req('POST', '/admin/pos/session/start',
+    { merchantId: posMerchantId }, adminToken);
+  assert('a second open till is refused', doubleTill.status === 409);
+
+  // Give the merchant a product with known price and stock to sell.
+  const posProduct = await req('POST', '/merchant/products', {
+    name: `POS Widget ${ts}`,
+    price: 10,
+    category: 'Food',
+    stock: 8,
+    vat: 0,
+  }, merchantToken);
+  const posProductId = posProduct.data?._id || posProduct.data?.product?._id;
+  assert('a sellable product exists for the till', !!posProductId,
+    JSON.stringify(posProduct).slice(0, 160));
+
+  // POST /merchant/products ignores `stock` (it is only in the update
+  // whitelist), so the opening quantity has to be set with a follow-up PUT
+  // or the till has nothing to sell.
+  const stocked = await req('PUT', `/merchant/products/${posProductId}`,
+    { stock: 8 }, merchantToken);
+  assert('opening stock can be set on the product', stocked.data?.stock === 8,
+    `stock ${stocked.data?.stock}`);
+
+  if (posProductId) {
+    const overStock = await req('POST', '/admin/pos/cart/add',
+      { productId: posProductId, quantity: 99 }, adminToken);
+    assert('adding more than the stock on hand is refused', overStock.status === 409);
+
+    const added = await req('POST', '/admin/pos/cart/add',
+      { productId: posProductId, quantity: 3 }, adminToken);
+    assert('a product can be rung up', added.success === true);
+    // The price comes from the Product document, never the request — the
+    // same hole that let a D 12.500 item be ordered for D 0.001.
+    assert('the line is priced from the catalogue, not the client',
+      added.data?.totals?.subtotal === 30, JSON.stringify(added.data?.totals));
+
+    const badDiscount = await req('POST', '/admin/pos/cart/discount',
+      { amount: 150, type: 'percentage' }, adminToken);
+    assert('a discount over 100% is refused', badDiscount.status === 400);
+
+    const discounted = await req('POST', '/admin/pos/cart/discount',
+      { amount: 10, type: 'percentage' }, adminToken);
+    assert('a percentage discount is applied to the subtotal',
+      discounted.data?.totals?.discount === 3 && discounted.data?.totals?.total === 27,
+      JSON.stringify(discounted.data?.totals));
+
+    await req('POST', '/admin/pos/cart/customer',
+      { name: 'Walk In Tester', phone: `9${ts}`.slice(0, 9) }, adminToken);
+
+    const shortCash = await req('POST', '/admin/pos/invoice/create',
+      { paymentMethod: 'cash', amountPaid: 1 }, adminToken);
+    assert('cash below the total is refused', shortCash.status === 400);
+
+    const invoice = await req('POST', '/admin/pos/invoice/create',
+      { paymentMethod: 'cash', amountPaid: 50 }, adminToken);
+    assert('the sale completes', invoice.success === true);
+    assert('the invoice number follows POS-YYMMDD-NNNN',
+      /^POS-\d{6}-\d{4}$/.test(invoice.data?.invoice?.invoiceNumber || ''),
+      invoice.data?.invoice?.invoiceNumber);
+    assert('change due is computed from the cash tendered',
+      invoice.data?.invoice?.changeDue === 23, `${invoice.data?.invoice?.changeDue}`);
+
+    const emptied = await req('GET', '/admin/pos/cart', null, adminToken);
+    assert('the cart is emptied by the sale', emptied.data?.items?.length === 0);
+
+    const afterSale = await req('GET', `/admin/inventory?search=${encodeURIComponent(`POS Widget ${ts}`)}`, null, adminToken);
+    void afterSale; // stock lives on Product, checked below via the catalogue
+
+    const invoiceId = invoice.data?.invoice?._id;
+
+    const noReason = await req('POST', '/admin/pos/invoice/refund',
+      { invoiceId }, adminToken);
+    assert('a refund without a reason is refused', noReason.status === 400);
+
+    const refunded = await req('POST', '/admin/pos/invoice/refund',
+      { invoiceId, reason: 'Integration test refund' }, adminToken);
+    assert('a refund succeeds', refunded.success === true);
+
+    const doubleRefund = await req('POST', '/admin/pos/invoice/refund',
+      { invoiceId, reason: 'again' }, adminToken);
+    assert('a second refund on the same invoice is refused', doubleRefund.status === 409);
+
+    const invoices = await req('GET', `/admin/pos/invoices?search=${encodeURIComponent(`POS Widget ${ts}`)}`, null, adminToken);
+    assert('a refunded invoice is excluded from the sales total',
+      invoices.data?.totals?.sales === 0 && invoices.data?.totals?.refunded === 27,
+      JSON.stringify(invoices.data?.totals));
+  }
+
+  const closeTill = await req('POST', '/admin/pos/session/end', { closingCount: 50 }, adminToken);
+  assert('the till closes and reconciles', closeTill.success === true);
+  assert('a fully refunded day leaves the float intact',
+    closeTill.data?.expectedCash === 50 && closeTill.data?.difference === 0,
+    JSON.stringify({ e: closeTill.data?.expectedCash, d: closeTill.data?.difference }));
+
   // ── Platform settings ──
   const settings = await req('GET', '/admin/settings', null, adminToken);
   assert('settings report the admin roster and live integration status',

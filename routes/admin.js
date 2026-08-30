@@ -1814,6 +1814,14 @@ router.get('/search', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// POINT OF SALE
+// ═══════════════════════════════════════════════════════════
+// Its own file — the till has enough surface (sessions, cart, invoices,
+// customers) that folding it in here would bury the rest. Mounted inside
+// this router so it inherits the admin gate above rather than re-declaring it.
+router.use('/pos', require('./admin_pos'));
+
+// ═══════════════════════════════════════════════════════════
 // PLATFORM SETTINGS
 // ═══════════════════════════════════════════════════════════
 
