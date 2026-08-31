@@ -14,8 +14,12 @@ const router = express.Router();
 // routes/admin.js. The mount only checks `pos.read`, so each route states its
 // own requirement — otherwise a read-only viewer could open a till and take
 // money, which is exactly what happened before this was added.
-const canRead  = requirePermission('pos.read');
-const canWrite = requirePermission('pos.write');
+const canRead    = requirePermission('pos.read');
+const canWrite   = requirePermission('pos.update');
+const canSell    = requirePermission('pos.create');
+const canOpen    = requirePermission('pos.open_session');
+const canClose   = requirePermission('pos.close_session');
+const canRefund  = requirePermission('pos.refund');
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -103,7 +107,7 @@ async function requireOpenSession(req, res) {
 // ═══════════════════════════════════════════════════════════
 
 /** POST /api/admin/pos/session/start  { merchantId, openingFloat } */
-router.post('/session/start', canWrite, async (req, res) => {
+router.post('/session/start', canOpen, async (req, res) => {
   try {
     const { merchantId } = req.body;
     if (!isValidId(merchantId)) {
@@ -180,7 +184,7 @@ router.get('/session', canRead, async (req, res) => {
 });
 
 /** POST /api/admin/pos/session/end  { closingCount } */
-router.post('/session/end', canWrite, async (req, res) => {
+router.post('/session/end', canClose, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -478,7 +482,7 @@ router.post('/cart/customer', canWrite, async (req, res) => {
  * nothing about the money comes from the request body except how much cash
  * was handed over.
  */
-router.post('/invoice/create', canWrite, async (req, res) => {
+router.post('/invoice/create', canSell, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -700,7 +704,7 @@ router.get('/invoice/:id', canRead, async (req, res) => {
  * POST /api/admin/pos/invoice/refund  { invoiceId, reason }
  * Full refund: puts the stock back and reverses the session's takings.
  */
-router.post('/invoice/refund', canWrite, async (req, res) => {
+router.post('/invoice/refund', canRefund, async (req, res) => {
   try {
     const { invoiceId } = req.body;
     if (!isValidId(invoiceId)) {
@@ -787,7 +791,7 @@ router.get('/customers', canRead, async (req, res) => {
  * is random: the customer resets it through the normal forgot-password flow
  * rather than being handed one at the counter.
  */
-router.post('/customers', canWrite, async (req, res) => {
+router.post('/customers', requirePermission('users.create'), async (req, res) => {
   try {
     const { fullName, phone } = req.body;
     if (!String(fullName || '').trim() || !String(phone || '').trim()) {

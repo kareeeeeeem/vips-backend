@@ -20,10 +20,12 @@ const {
 
 const router = express.Router();
 
-// Mounted at /api/admin/reports behind the admin gate. Reading a report is
-// the one thing every role can do, so a single read permission covers the
-// group; export is separately a read too — it is the same data in a file.
-const canRead = requirePermission('reports.read');
+// Mounted at /api/admin/reports behind the admin gate. Viewing a report and
+// taking the data out of the system are separate decisions: `reports.export`
+// is its own grant, so a read-only account cannot walk away with a customer
+// list in a file.
+const canRead   = requirePermission('reports.read');
+const canExport = requirePermission('reports.export');
 
 /**
  * Match stages for the two places revenue comes from.
@@ -841,7 +843,7 @@ const EXPORTS = {
   ]},
 };
 
-router.get('/export', canRead, async (req, res) => {
+router.get('/export', canExport, async (req, res) => {
   try {
     const type = String(req.query.type || '').toLowerCase();
     const spec = EXPORTS[type];

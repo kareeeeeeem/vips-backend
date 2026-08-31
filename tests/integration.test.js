@@ -909,11 +909,23 @@ async function testAdmin() {
     typeof profile.data?.adminRole === 'string' && Array.isArray(profile.data?.permissions));
 
   const catalogue = await req('GET', '/admin/permissions', null, adminToken);
-  assert('the permission catalogue lists modules and built-in roles',
+  assert('the permission catalogue covers 10 modules and 5 roles',
     catalogue.success === true &&
-    Array.isArray(catalogue.data?.permissions) &&
-    catalogue.data.permissions.includes('orders.write') &&
-    catalogue.data?.builtInRoles?.length === 4);
+    catalogue.data?.modules?.length === 10 &&
+    catalogue.data?.builtInRoles?.length === 5 &&
+    catalogue.data.permissions.length === 47,
+    `${catalogue.data?.modules?.length} modules, ${catalogue.data?.builtInRoles?.length} roles, ${catalogue.data?.permissions?.length} permissions`);
+
+  assert('every permission carries a label and an enforcement flag',
+    (catalogue.data?.catalogue || []).every(
+      (c) => typeof c.label === 'string' && typeof c.enforced === 'boolean'));
+
+  // A permission that gates no route is declared as such rather than being
+  // presented as a grant that does something.
+  const unenforced = (catalogue.data?.catalogue || []).filter((c) => !c.enforced);
+  assert('permissions that gate nothing say why',
+    unenforced.length > 0 && unenforced.every((c) => c.reason.length > 0),
+    JSON.stringify(unenforced.map((c) => c.key)));
 
   // A viewer is the real test of the gate: read everything, change nothing.
   const viewerEmail = `viewer_${ts}@vips.test`;
@@ -953,8 +965,12 @@ async function testAdmin() {
   assert('a viewer cannot open a till', viewerTill.status === 403,
     `status ${viewerTill.status}`);
 
+  // Under the expanded model the viewer role carries no POS permission at
+  // all — reading till receipts means reading takings, which is not part of
+  // a read-only observer's remit.
   const viewerReceipts = await req('GET', '/admin/pos/invoices?limit=1', null, viewerToken);
-  assert('a viewer can still read receipts', viewerReceipts.success === true);
+  assert('a viewer cannot read till receipts', viewerReceipts.status === 403,
+    `status ${viewerReceipts.status}`);
 
   // A manager writes but never deletes.
   const managerEmail = `manager_${ts}@vips.test`;
@@ -995,10 +1011,100 @@ async function testAdmin() {
   assert('an unknown permission string is rejected', badPermission.status === 400);
 
   const grant = await req('PUT', `/admin/staff/${viewerCreated.data?.staff?._id}`,
-    { permissions: ['orders.write'] }, adminToken);
+    { permissions: ['orders.cancel'] }, adminToken);
   assert('an extra permission can be granted on top of a role',
     grant.success === true &&
-    grant.data?.effectivePermissions?.includes('orders.write'));
+    grant.data?.effectivePermissions?.includes('orders.cancel'));
+
+  const retiredName = await req('PUT', `/admin/staff/${viewerCreated.data?.staff?._id}`,
+    { permissions: ['orders.write'] }, adminToken);
+  assert('a permission name from the old three-action model is rejected',
+    retiredName.status === 400, `status ${retiredName.status}`);
+
+  // ── Per-action boundaries ──
+  const cashierEmail = `cashier_${ts}@vips.test`;
+  await req('POST', '/admin/staff', {
+    fullName: 'QA Cashier',
+    email: cashierEmail,
+    phone: `82${ts}`.slice(0, 12),
+    password: 'CashierPass1',
+    adminRole: 'cashier',
+  }, adminToken);
+  const cashierToken = (await req('POST', '/admin/login',
+    { email: cashierEmail, password: 'CashierPass1' })).data?.token;
+  assert('a cashier can sign in', !!cashierToken);
+
+  const cashierProducts = await req('GET', '/admin/products?limit=1', null, cashierToken);
+  assert('a cashier can read the catalogue', cashierProducts.success === true);
+
+  const cashierTill = await req('POST', '/admin/pos/session/start',
+    { merchantId }, cashierToken);
+  // A cashier who cannot open a till cannot do the job at all, so the role
+  // carries open_session and close_session.
+  assert('a cashier can open a till', cashierTill.success === true, cashierTill.message);
+  await req('POST', '/admin/pos/session/end', { closingCount: 0 }, cashierToken);
+
+  const cashierRefund = await req('POST', '/admin/pos/invoice/refund',
+    { invoiceId: '6a94b0000000000000000000', reason: 'x' }, cashierToken);
+  assert('a cashier cannot refund', cashierRefund.status === 403);
+
+  const cashierUsers = await req('GET', '/admin/users?limit=1', null, cashierToken);
+  assert('a cashier cannot read customers', cashierUsers.status === 403);
+
+  const cashierReports = await req('GET', '/admin/reports/sales', null, cashierToken);
+  assert('a cashier cannot read reports', cashierReports.status === 403);
+
+  // Ban and unban are separate grants on one endpoint, so the direction the
+  // body asks for is what gets checked.
+  const managerBanDirection = await req('PUT', `/admin/users/${userId}/ban`,
+    { banned: true }, managerToken);
+  assert('a manager can ban', managerBanDirection.success === true);
+  await req('PUT', `/admin/users/${userId}/ban`, { banned: false }, managerToken);
+
+  const managerProductCreate = await req('POST', '/admin/products', {
+    merchantId, name: `Blocked ${ts}`, price: 1, category: 'Food',
+  }, managerToken);
+  assert('a manager cannot create a product', managerProductCreate.status === 403);
+
+  const managerAssignRole = await req('PUT',
+    `/admin/staff/${viewerCreated.data?.staff?._id}`, { adminRole: 'admin' }, managerToken);
+  assert('a manager cannot assign a role', managerAssignRole.status === 403);
+
+  // Reading a report and taking the data out of the system are separate
+  // decisions, so a read-only account cannot export a customer list.
+  const viewerExport = await req('GET',
+    '/admin/reports/export?type=sales&format=csv', null, viewerToken);
+  assert('a viewer cannot export', viewerExport.status === 403,
+    `status ${viewerExport.status}`);
+
+  const viewerReport = await req('GET', '/admin/reports/sales', null, viewerToken);
+  assert('a viewer can still read a report', viewerReport.success === true);
+
+  // ── Admin products ──
+  const productCreated = await req('POST', '/admin/products', {
+    merchantId, name: `Admin Product ${ts}`, price: 9.5, category: 'Food', costPrice: 4,
+  }, adminToken);
+  assert('an admin can add a product to a catalogue', productCreated.success === true,
+    productCreated.message);
+  const adminProductId = productCreated.data?.product?._id;
+
+  const badDiscount = await req('PUT', `/admin/products/${adminProductId}`,
+    { discountPrice: 99 }, adminToken);
+  assert('a discount above the list price is rejected', badDiscount.status === 400);
+
+  const priced = await req('PUT', `/admin/products/${adminProductId}`,
+    { discountPrice: 7 }, adminToken);
+  assert('a valid discount is accepted', priced.success === true);
+
+  const productRemoved = await req('DELETE', `/admin/products/${adminProductId}`, null, adminToken);
+  assert('an unsold product can be deleted', productRemoved.success === true);
+
+  // ── Admin-created customer ──
+  const walkIn = await req('POST', '/admin/users', {
+    fullName: 'Walk In Customer', phone: `83${ts}`.slice(0, 12),
+  }, adminToken);
+  assert('an admin can create a customer account', walkIn.success === true,
+    walkIn.message);
 
   // Custom roles
   const customRole = await req('POST', '/admin/roles', {

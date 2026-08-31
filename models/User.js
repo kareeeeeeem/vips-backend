@@ -40,7 +40,7 @@ const userSchema = new mongoose.Schema(
     // ledger would read "System" and receipts would lose the cashier's name.
     adminRole: {
       type: String,
-      enum: ['super_admin', 'admin', 'manager', 'viewer'],
+      enum: ['super_admin', 'admin', 'manager', 'cashier', 'viewer'],
       default: 'admin',
     },
     // Grants beyond the role's defaults. '*' means everything, which is what

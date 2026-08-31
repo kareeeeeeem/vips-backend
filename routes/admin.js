@@ -5,10 +5,15 @@ const mongoose = require('mongoose');
 const adminAuth = require('../middleware/adminAuth');
 const {
   ALL_PERMISSIONS,
+  hasPermission,
+  PERMISSION_CATALOGUE,
   ROLE_PERMISSIONS,
+  ROLES,
+  MODULE_ACTIONS,
   permissionsFor,
+  unknownPermissions,
   requirePermission,
-  requireAdminRole,
+  requireAnyPermission,
 } = require('../middleware/permissions');
 
 const User                 = require('../models/User');
@@ -475,7 +480,7 @@ router.get('/users/:id', requirePermission('users.read'), async (req, res) => {
  * issue a token for — so this genuinely locks the account out rather than
  * only hiding it from admin lists.
  */
-router.put('/users/:id/ban', requirePermission('users.write'), async (req, res) => {
+router.put('/users/:id/ban', requireAnyPermission('users.ban', 'users.unban'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -489,6 +494,17 @@ router.put('/users/:id/ban', requirePermission('users.write'), async (req, res) 
     // Accept an explicit flag; fall back to a toggle so the caller does not
     // have to read the current state first.
     const banned = typeof req.body.banned === 'boolean' ? req.body.banned : user.isActive;
+
+    // The route accepts either grant; which one is actually needed depends on
+    // the direction, so it is checked here rather than at the gate.
+    const needed = banned ? 'users.ban' : 'users.unban';
+    if (!hasPermission(req.admin, needed)) {
+      return res.status(403).json({
+        success: false,
+        message: `Your role does not allow this (${needed} required).`,
+      });
+    }
+
     user.isActive = !banned;
     await user.save({ validateBeforeSave: false });
 
@@ -503,7 +519,7 @@ router.put('/users/:id/ban', requirePermission('users.write'), async (req, res) 
 });
 
 /** PUT /api/admin/users/:id/role  { role } */
-router.put('/users/:id/role', requirePermission('users.write'), async (req, res) => {
+router.put('/users/:id/role', requirePermission('users.update'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -566,6 +582,52 @@ router.delete('/users/:id', requirePermission('users.delete'), async (req, res) 
       success: true,
       message: 'User deleted.',
       data: { deletedId: req.params.id, ordersRetained: orders },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * POST /api/admin/users — create a customer account from the console.
+ *
+ * For someone who walks in without the app. The password is random and never
+ * shown: they take it over with the normal forgot-password flow, so nobody
+ * ends up sharing a password over a counter.
+ */
+router.post('/users', requirePermission('users.create'), async (req, res) => {
+  try {
+    const { fullName, phone } = req.body;
+    if (!String(fullName || '').trim() || !String(phone || '').trim()) {
+      return res.status(400).json({ success: false, message: 'Name and phone are required.' });
+    }
+
+    const email = String(req.body.email || '').toLowerCase().trim() ||
+      `walkin_${Date.now()}@customer.vips.local`;
+
+    const existing = await User.findOne({
+      $or: [{ email }, { phone: String(phone).trim() }],
+    });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: 'An account with that email or phone already exists.',
+      });
+    }
+
+    const user = await User.create({
+      fullName: String(fullName).trim(),
+      email,
+      phone: String(phone).trim(),
+      password: require('crypto').randomBytes(24).toString('hex'),
+      role: 'customer',
+      city: String(req.body.city || '').trim() || null,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `${user.fullName} added. They set a password via "forgot password".`,
+      data: { user: user.toJSON() },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -706,7 +768,7 @@ router.get('/merchants/:id', requirePermission('merchants.read'), async (req, re
  * merchant account, since an approved merchant that still cannot log in
  * would make the button look like it did nothing.
  */
-router.put('/merchants/:id/approve', requirePermission('merchants.write'), async (req, res) => {
+router.put('/merchants/:id/approve', requirePermission('merchants.approve'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -752,7 +814,7 @@ router.put('/merchants/:id/approve', requirePermission('merchants.write'), async
 });
 
 /** PUT /api/admin/merchants/:id/activate  { active: true|false } */
-router.put('/merchants/:id/activate', requirePermission('merchants.write'), async (req, res) => {
+router.put('/merchants/:id/activate', requireAnyPermission('merchants.activate', 'merchants.deactivate'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -760,6 +822,15 @@ router.put('/merchants/:id/activate', requirePermission('merchants.write'), asyn
     if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found.' });
 
     const active = typeof req.body.active === 'boolean' ? req.body.active : !merchant.isActive;
+
+    const needed = active ? 'merchants.activate' : 'merchants.deactivate';
+    if (!hasPermission(req.admin, needed)) {
+      return res.status(403).json({
+        success: false,
+        message: `Your role does not allow this (${needed} required).`,
+      });
+    }
+
     merchant.isActive = active;
     await merchant.save({ validateBeforeSave: false });
 
@@ -906,7 +977,7 @@ router.get('/orders/:id', requirePermission('orders.read'), async (req, res) => 
  * Stamps the matching *At timestamp too, so the timeline the customer and
  * merchant apps both render stays consistent with an admin-side change.
  */
-router.put('/orders/:id/status', requirePermission('orders.write'), async (req, res) => {
+router.put('/orders/:id/status', requirePermission('orders.update'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -951,7 +1022,7 @@ router.put('/orders/:id/status', requirePermission('orders.write'), async (req, 
  * DELETE /api/admin/orders/:id — cancels rather than destroys.
  * Orders are financial records; wiping one would rewrite past revenue.
  */
-router.delete('/orders/:id', requirePermission('orders.delete'), async (req, res) => {
+router.delete('/orders/:id', requirePermission('orders.cancel'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -1047,7 +1118,7 @@ router.get('/inventory', requirePermission('inventory.read'), async (req, res) =
 });
 
 /** PUT /api/admin/inventory/:id  { currentStock, lowStockThreshold, unitPrice, category, name } */
-router.put('/inventory/:id', requirePermission('inventory.write'), async (req, res) => {
+router.put('/inventory/:id', requireAnyPermission('inventory.update', 'inventory.adjust'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -1162,7 +1233,7 @@ router.get('/inventory/movements', requirePermission('inventory.read'), async (r
  * or a destination `toLocation`, in which case the sibling line for the same
  * item at that location is found or created.
  */
-router.post('/inventory/transfer', requirePermission('inventory.write'), async (req, res) => {
+router.post('/inventory/transfer', requirePermission('inventory.transfer'), async (req, res) => {
   try {
     const { fromStockId, toStockId, toLocation, quantity } = req.body;
 
@@ -1308,6 +1379,95 @@ router.get('/inventory/locations', requirePermission('inventory.read'), async (r
         })),
       },
     });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** POST /api/admin/inventory — open a stock line for a merchant. */
+router.post('/inventory', requirePermission('inventory.create'), async (req, res) => {
+  try {
+    const { merchantId, name } = req.body;
+    if (!isValidId(merchantId)) {
+      return res.status(400).json({ success: false, message: 'A valid merchant id is required.' });
+    }
+    if (!String(name || '').trim()) {
+      return res.status(400).json({ success: false, message: 'An item name is required.' });
+    }
+
+    const merchant = await User.findOne({ _id: merchantId, role: 'merchant' });
+    if (!merchant) {
+      return res.status(404).json({ success: false, message: 'Merchant not found.' });
+    }
+
+    const numbers = {};
+    for (const key of ['currentStock', 'lowStockThreshold', 'unitPrice']) {
+      if (req.body[key] === undefined) continue;
+      const value = Number(req.body[key]);
+      if (!Number.isFinite(value) || value < 0) {
+        return res.status(400).json({
+          success: false,
+          message: `${key} must be a number of 0 or more.`,
+        });
+      }
+      numbers[key] = value;
+    }
+
+    const item = await Stock.create({
+      merchantId,
+      name: String(name).trim(),
+      category: String(req.body.category || 'General').trim(),
+      location: String(req.body.location || 'Main').trim(),
+      ...numbers,
+    });
+
+    // Same ledger the merchant routes write to, so a line opened here has an
+    // opening balance in the history like any other.
+    await recordMovement({
+      stock: item,
+      type: 'initial',
+      quantity: item.currentStock,
+      balanceBefore: 0,
+      balanceAfter: item.currentStock,
+      reason: 'Stock line opened from the admin console',
+      performedBy: req.user.id,
+      performedByRole: 'admin',
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `${item.name} added to ${merchant.storeName || merchant.fullName}.`,
+      data: { item: item.toJSON() },
+    });
+  } catch (error) {
+    const status = error.name === 'ValidationError' ? 400 : 500;
+    res.status(status).json({ success: false, message: error.message });
+  }
+});
+
+/** DELETE /api/admin/inventory/:id */
+router.delete('/inventory/:id', requirePermission('inventory.delete'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+
+    const item = await Stock.findById(req.params.id);
+    if (!item) return res.status(404).json({ success: false, message: 'Stock item not found.' });
+
+    await recordMovement({
+      stock: item,
+      type: 'removed',
+      quantity: item.currentStock,
+      balanceBefore: item.currentStock,
+      balanceAfter: 0,
+      reason: String(req.body.reason || 'Removed from the admin console'),
+      performedBy: req.user.id,
+      performedByRole: 'admin',
+    });
+    // The ledger row is written before the delete so the history keeps the
+    // item name and its closing balance after the line itself is gone.
+    await item.deleteOne();
+
+    res.json({ success: true, message: 'Stock line removed.', data: { deletedId: req.params.id } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1549,6 +1709,7 @@ router.get('/search', requirePermission('dashboard.read'), async (req, res) => {
 // customers) that folding it in here would bury the rest. Mounted inside
 // this router so it inherits the admin gate above rather than re-declaring it.
 router.use('/pos', requirePermission('pos.read'), require('./admin_pos'));
+router.use('/products', require('./admin_products'));
 
 // ═══════════════════════════════════════════════════════════
 // PLATFORM SETTINGS
@@ -1599,7 +1760,7 @@ router.get('/settings', requirePermission('settings.read'), async (req, res) => 
  * *first* one is deliberately not possible over HTTP — see
  * scripts/create-admin.js.
  */
-router.post('/settings/admins', requirePermission('staff.write'), async (req, res) => {
+router.post('/settings/admins', requirePermission('staff.create'), async (req, res) => {
   try {
     const { fullName, email, phone, password } = req.body;
     if (!fullName || !email || !phone || !password) {
@@ -1676,9 +1837,17 @@ router.get('/permissions', requirePermission('staff.read'), async (req, res) => 
       message: 'Permission catalogue',
       data: {
         permissions: ALL_PERMISSIONS,
-        builtInRoles: Object.entries(ROLE_PERMISSIONS).map(([name, permissions]) => ({
+        // The descriptive form: what each permission means, and whether it
+        // actually gates a route yet. A permission that gates nothing is
+        // said so rather than shown as a checkbox that quietly does nothing.
+        catalogue: PERMISSION_CATALOGUE,
+        modules: Object.entries(MODULE_ACTIONS).map(([name, actions]) => ({
           name,
-          permissions,
+          actions: Object.keys(actions),
+        })),
+        builtInRoles: ROLES.map((name) => ({
+          name,
+          permissions: ROLE_PERMISSIONS[name],
           isBuiltIn: true,
         })),
         customRoles: custom,
@@ -1754,7 +1923,7 @@ router.get('/staff/:id', requirePermission('staff.read'), async (req, res) => {
 });
 
 /** POST /api/admin/staff — create a console operator. */
-router.post('/staff', requirePermission('staff.write'), async (req, res) => {
+router.post('/staff', requirePermission('staff.create'), async (req, res) => {
   try {
     const { fullName, email, phone, password, adminRole } = req.body;
     if (!fullName || !email || !phone || !password) {
@@ -1814,7 +1983,7 @@ router.post('/staff', requirePermission('staff.write'), async (req, res) => {
 });
 
 /** PUT /api/admin/staff/:id — change a console operator's role or details. */
-router.put('/staff/:id', requirePermission('staff.write'), async (req, res) => {
+router.put('/staff/:id', requirePermission('staff.update'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -1822,6 +1991,12 @@ router.put('/staff/:id', requirePermission('staff.write'), async (req, res) => {
     if (!staff) return res.status(404).json({ success: false, message: 'Admin not found.' });
 
     if (req.body.adminRole !== undefined) {
+      if (!hasPermission(req.admin, 'staff.assign_role')) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your role does not allow this (staff.assign_role required).',
+        });
+      }
       if (!ROLE_PERMISSIONS[req.body.adminRole]) {
         return res.status(400).json({
           success: false,
@@ -1849,9 +2024,13 @@ router.put('/staff/:id', requirePermission('staff.write'), async (req, res) => {
     }
 
     if (Array.isArray(req.body.permissions)) {
-      const unknown = req.body.permissions.filter(
-        (p) => p !== '*' && !ALL_PERMISSIONS.includes(p) && !p.endsWith('.*')
-      );
+      if (!hasPermission(req.admin, 'staff.assign_permissions')) {
+        return res.status(403).json({
+          success: false,
+          message: 'Your role does not allow this (staff.assign_permissions required).',
+        });
+      }
+      const unknown = unknownPermissions(req.body.permissions);
       if (unknown.length) {
         return res.status(400).json({
           success: false,
@@ -1947,7 +2126,7 @@ router.get('/roles', requirePermission('staff.read'), async (req, res) => {
 });
 
 /** POST /api/admin/roles */
-router.post('/roles', requirePermission('staff.write'), async (req, res) => {
+router.post('/roles', requirePermission('staff.assign_permissions'), async (req, res) => {
   try {
     const name = String(req.body.name || '').trim();
     if (!name) return res.status(400).json({ success: false, message: 'A role name is required.' });
@@ -1959,9 +2138,7 @@ router.post('/roles', requirePermission('staff.write'), async (req, res) => {
     }
 
     const permissions = Array.isArray(req.body.permissions) ? req.body.permissions : [];
-    const unknown = permissions.filter(
-      (p) => p !== '*' && !ALL_PERMISSIONS.includes(p) && !p.endsWith('.*')
-    );
+    const unknown = unknownPermissions(permissions);
     if (unknown.length) {
       return res.status(400).json({
         success: false,
@@ -1988,7 +2165,7 @@ router.post('/roles', requirePermission('staff.write'), async (req, res) => {
 });
 
 /** PUT /api/admin/roles/:id */
-router.put('/roles/:id', requirePermission('staff.write'), async (req, res) => {
+router.put('/roles/:id', requirePermission('staff.assign_permissions'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -1996,9 +2173,7 @@ router.put('/roles/:id', requirePermission('staff.write'), async (req, res) => {
     if (!role) return res.status(404).json({ success: false, message: 'Role not found.' });
 
     if (Array.isArray(req.body.permissions)) {
-      const unknown = req.body.permissions.filter(
-        (p) => p !== '*' && !ALL_PERMISSIONS.includes(p) && !p.endsWith('.*')
-      );
+      const unknown = unknownPermissions(req.body.permissions);
       if (unknown.length) {
         return res.status(400).json({
           success: false,
@@ -2018,7 +2193,7 @@ router.put('/roles/:id', requirePermission('staff.write'), async (req, res) => {
 });
 
 /** DELETE /api/admin/roles/:id */
-router.delete('/roles/:id', requirePermission('staff.delete'), async (req, res) => {
+router.delete('/roles/:id', requirePermission('staff.assign_permissions'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
