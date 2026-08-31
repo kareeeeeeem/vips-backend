@@ -832,6 +832,119 @@ async function testAdmin() {
     closeTill.data?.expectedCash === 50 && closeTill.data?.difference === 0,
     JSON.stringify({ e: closeTill.data?.expectedCash, d: closeTill.data?.difference }));
 
+  // ── Roles and permissions ──
+  const profile = await req('GET', '/admin/me', null, adminToken);
+  assert('/me reports the admin role and effective permissions',
+    typeof profile.data?.adminRole === 'string' && Array.isArray(profile.data?.permissions));
+
+  const catalogue = await req('GET', '/admin/permissions', null, adminToken);
+  assert('the permission catalogue lists modules and built-in roles',
+    catalogue.success === true &&
+    Array.isArray(catalogue.data?.permissions) &&
+    catalogue.data.permissions.includes('orders.write') &&
+    catalogue.data?.builtInRoles?.length === 4);
+
+  // A viewer is the real test of the gate: read everything, change nothing.
+  const viewerEmail = `viewer_${ts}@vips.test`;
+  const viewerCreated = await req('POST', '/admin/staff', {
+    fullName: 'QA Viewer',
+    email: viewerEmail,
+    phone: `77${ts}`.slice(0, 12),
+    password: 'ViewerPass1',
+    adminRole: 'viewer',
+  }, adminToken);
+  assert('a viewer account can be created', viewerCreated.success === true,
+    viewerCreated.message);
+
+  const viewerLogin = await req('POST', '/admin/login',
+    { email: viewerEmail, password: 'ViewerPass1' });
+  const viewerToken = viewerLogin.data?.token;
+  assert('the viewer can sign in', !!viewerToken);
+
+  const viewerRead = await req('GET', '/admin/users?limit=1', null, viewerToken);
+  assert('a viewer can read users', viewerRead.success === true);
+
+  const viewerBan = await req('PUT', `/admin/users/${userId}/ban`, { banned: true }, viewerToken);
+  assert('a viewer cannot ban', viewerBan.status === 403, `status ${viewerBan.status}`);
+
+  const viewerDelete = await req('DELETE', `/admin/users/${userId}`, null, viewerToken);
+  assert('a viewer cannot delete', viewerDelete.status === 403);
+
+  const viewerStaff = await req('POST', '/admin/staff', {
+    fullName: 'x', email: `x${ts}@y.z`, phone: `78${ts}`.slice(0, 12), password: 'abcdef',
+  }, viewerToken);
+  assert('a viewer cannot create staff', viewerStaff.status === 403);
+
+  // The hole this caught the first time: the POS mount only checked
+  // pos.read, so a read-only account could open a till and take money.
+  const viewerTill = await req('POST', '/admin/pos/session/start',
+    { merchantId }, viewerToken);
+  assert('a viewer cannot open a till', viewerTill.status === 403,
+    `status ${viewerTill.status}`);
+
+  const viewerReceipts = await req('GET', '/admin/pos/invoices?limit=1', null, viewerToken);
+  assert('a viewer can still read receipts', viewerReceipts.success === true);
+
+  // A manager writes but never deletes.
+  const managerEmail = `manager_${ts}@vips.test`;
+  await req('POST', '/admin/staff', {
+    fullName: 'QA Manager',
+    email: managerEmail,
+    phone: `79${ts}`.slice(0, 12),
+    password: 'ManagerPass1',
+    adminRole: 'manager',
+  }, adminToken);
+  const managerToken = (await req('POST', '/admin/login',
+    { email: managerEmail, password: 'ManagerPass1' })).data?.token;
+
+  const managerBan = await req('PUT', `/admin/users/${userId}/ban`, { banned: false }, managerToken);
+  assert('a manager can write', managerBan.success === true);
+
+  const managerDelete = await req('DELETE', `/admin/users/${userId}`, null, managerToken);
+  assert('a manager cannot delete', managerDelete.status === 403);
+
+  const managerStaff = await req('POST', '/admin/staff', {
+    fullName: 'y', email: `y${ts}@y.z`, phone: `80${ts}`.slice(0, 12), password: 'abcdef',
+  }, managerToken);
+  assert('a manager cannot manage staff', managerStaff.status === 403);
+
+  // Only a super admin may mint another super admin.
+  const escalate = await req('POST', '/admin/staff', {
+    fullName: 'Escalation',
+    email: `esc_${ts}@vips.test`,
+    phone: `81${ts}`.slice(0, 12),
+    password: 'EscPass1234',
+    adminRole: 'super_admin',
+  }, adminToken);
+  assert('a plain admin cannot create a super admin', escalate.status === 403,
+    `status ${escalate.status}`);
+
+  const badPermission = await req('PUT', `/admin/staff/${viewerCreated.data?.staff?._id}`,
+    { permissions: ['orders.teleport'] }, adminToken);
+  assert('an unknown permission string is rejected', badPermission.status === 400);
+
+  const grant = await req('PUT', `/admin/staff/${viewerCreated.data?.staff?._id}`,
+    { permissions: ['orders.write'] }, adminToken);
+  assert('an extra permission can be granted on top of a role',
+    grant.success === true &&
+    grant.data?.effectivePermissions?.includes('orders.write'));
+
+  // Custom roles
+  const customRole = await req('POST', '/admin/roles', {
+    name: `qa_role_${ts}`,
+    description: 'Integration test role',
+    permissions: ['reports.read', 'orders.read'],
+  }, adminToken);
+  assert('a custom role can be created', customRole.success === true);
+
+  const dupBuiltIn = await req('POST', '/admin/roles',
+    { name: 'super_admin', permissions: [] }, adminToken);
+  assert('a custom role cannot shadow a built-in name', dupBuiltIn.status === 409);
+
+  const deletedRole = await req('DELETE', `/admin/roles/${customRole.data?.role?._id}`,
+    null, adminToken);
+  assert('a custom role can be deleted', deletedRole.success === true);
+
   // ── Platform settings ──
   const settings = await req('GET', '/admin/settings', null, adminToken);
   assert('settings report the admin roster and live integration status',

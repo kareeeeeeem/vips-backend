@@ -6,9 +6,16 @@ const Product    = require('../models/Product');
 const PosSession = require('../models/PosSession');
 const PosInvoice = require('../models/PosInvoice');
 
+const { requirePermission } = require('../middleware/permissions');
+
 const router = express.Router();
 
-// Mounted under /api/admin/pos, behind the admin gate applied in routes/admin.js.
+// Mounted under /api/admin/pos, behind the admin gate applied in
+// routes/admin.js. The mount only checks `pos.read`, so each route states its
+// own requirement — otherwise a read-only viewer could open a till and take
+// money, which is exactly what happened before this was added.
+const canRead  = requirePermission('pos.read');
+const canWrite = requirePermission('pos.write');
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -96,7 +103,7 @@ async function requireOpenSession(req, res) {
 // ═══════════════════════════════════════════════════════════
 
 /** POST /api/admin/pos/session/start  { merchantId, openingFloat } */
-router.post('/session/start', async (req, res) => {
+router.post('/session/start', canWrite, async (req, res) => {
   try {
     const { merchantId } = req.body;
     if (!isValidId(merchantId)) {
@@ -151,7 +158,7 @@ router.post('/session/start', async (req, res) => {
 });
 
 /** GET /api/admin/pos/session — the caller's open till plus its cart. */
-router.get('/session', async (req, res) => {
+router.get('/session', canRead, async (req, res) => {
   try {
     const session = await openSessionFor(req.user.id);
     if (!session) {
@@ -173,7 +180,7 @@ router.get('/session', async (req, res) => {
 });
 
 /** POST /api/admin/pos/session/end  { closingCount } */
-router.post('/session/end', async (req, res) => {
+router.post('/session/end', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -213,7 +220,7 @@ router.post('/session/end', async (req, res) => {
 });
 
 /** GET /api/admin/pos/sessions — session history. */
-router.get('/sessions', async (req, res) => {
+router.get('/sessions', canRead, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const filter = {};
@@ -252,7 +259,7 @@ router.get('/sessions', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 /** GET /api/admin/pos/cart */
-router.get('/cart', async (req, res) => {
+router.get('/cart', canRead, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -263,7 +270,7 @@ router.get('/cart', async (req, res) => {
 });
 
 /** POST /api/admin/pos/cart/add  { productId, quantity } */
-router.post('/cart/add', async (req, res) => {
+router.post('/cart/add', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -324,7 +331,7 @@ router.post('/cart/add', async (req, res) => {
 });
 
 /** PUT /api/admin/pos/cart/update  { itemId, quantity } */
-router.put('/cart/update', async (req, res) => {
+router.put('/cart/update', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -360,7 +367,7 @@ router.put('/cart/update', async (req, res) => {
 });
 
 /** DELETE /api/admin/pos/cart/remove/:id */
-router.delete('/cart/remove/:id', async (req, res) => {
+router.delete('/cart/remove/:id', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -377,7 +384,7 @@ router.delete('/cart/remove/:id', async (req, res) => {
 });
 
 /** DELETE /api/admin/pos/cart/clear */
-router.delete('/cart/clear', async (req, res) => {
+router.delete('/cart/clear', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -397,7 +404,7 @@ router.delete('/cart/clear', async (req, res) => {
 });
 
 /** POST /api/admin/pos/cart/discount  { amount, type } */
-router.post('/cart/discount', async (req, res) => {
+router.post('/cart/discount', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -422,7 +429,7 @@ router.post('/cart/discount', async (req, res) => {
 });
 
 /** POST /api/admin/pos/cart/customer  { customerId } or { name, phone } */
-router.post('/cart/customer', async (req, res) => {
+router.post('/cart/customer', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -471,7 +478,7 @@ router.post('/cart/customer', async (req, res) => {
  * nothing about the money comes from the request body except how much cash
  * was handed over.
  */
-router.post('/invoice/create', async (req, res) => {
+router.post('/invoice/create', canWrite, async (req, res) => {
   try {
     const session = await requireOpenSession(req, res);
     if (!session) return;
@@ -582,7 +589,7 @@ router.post('/invoice/create', async (req, res) => {
 });
 
 /** GET /api/admin/pos/invoices — history with filters. */
-router.get('/invoices', async (req, res) => {
+router.get('/invoices', canRead, async (req, res) => {
   try {
     const page  = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
@@ -660,7 +667,7 @@ router.get('/invoices', async (req, res) => {
 });
 
 /** GET /api/admin/pos/invoice/:id */
-router.get('/invoice/:id', async (req, res) => {
+router.get('/invoice/:id', canRead, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Invalid invoice id.' });
@@ -693,7 +700,7 @@ router.get('/invoice/:id', async (req, res) => {
  * POST /api/admin/pos/invoice/refund  { invoiceId, reason }
  * Full refund: puts the stock back and reverses the session's takings.
  */
-router.post('/invoice/refund', async (req, res) => {
+router.post('/invoice/refund', canWrite, async (req, res) => {
   try {
     const { invoiceId } = req.body;
     if (!isValidId(invoiceId)) {
@@ -753,7 +760,7 @@ router.post('/invoice/refund', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 /** GET /api/admin/pos/customers?search= */
-router.get('/customers', async (req, res) => {
+router.get('/customers', canRead, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const filter = { role: 'customer' };
@@ -780,7 +787,7 @@ router.get('/customers', async (req, res) => {
  * is random: the customer resets it through the normal forgot-password flow
  * rather than being handed one at the counter.
  */
-router.post('/customers', async (req, res) => {
+router.post('/customers', canWrite, async (req, res) => {
   try {
     const { fullName, phone } = req.body;
     if (!String(fullName || '').trim() || !String(phone || '').trim()) {

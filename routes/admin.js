@@ -2,7 +2,14 @@ const express = require('express');
 const jwt     = require('jsonwebtoken');
 const mongoose = require('mongoose');
 
-const { authMiddleware, requireRole } = require('../middleware/auth');
+const adminAuth = require('../middleware/adminAuth');
+const {
+  ALL_PERMISSIONS,
+  ROLE_PERMISSIONS,
+  permissionsFor,
+  requirePermission,
+  requireAdminRole,
+} = require('../middleware/permissions');
 
 const User                 = require('../models/User');
 const Order                = require('../models/Order');
@@ -13,6 +20,7 @@ const BusinessRegistration = require('../models/BusinessRegistration');
 const Payout               = require('../models/Payout');
 const MerchantAd           = require('../models/MerchantAd');
 const StockMovement        = require('../models/StockMovement');
+const Role                 = require('../models/Role');
 
 const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
 
@@ -127,14 +135,31 @@ router.post('/login', async (req, res) => {
 });
 
 // ─── Everything below requires a valid admin token ─────────
-router.use(authMiddleware, requireRole('admin'));
+// adminAuth loads the account on every request rather than trusting the
+// token's claims, so a demotion or a disabled account takes effect at once
+// instead of when the token finally expires.
+router.use(adminAuth);
 
-/** GET /api/admin/me — the signed-in admin's own profile. */
+/**
+ * GET /api/admin/me — the signed-in admin's profile and effective permissions.
+ *
+ * The console reads `permissions` to hide controls the caller cannot use.
+ * That is presentation only: every one of those actions is gated server-side
+ * too, so hiding a button is a courtesy rather than the security boundary.
+ */
 router.get('/me', async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ success: false, message: 'Admin not found.' });
-    res.json({ success: true, message: 'Admin profile', data: { user: user.toJSON() } });
+    res.json({
+      success: true,
+      message: 'Admin profile',
+      data: {
+        user: user.toJSON(),
+        adminRole: user.adminRole,
+        permissions: permissionsFor(user),
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -155,7 +180,7 @@ router.post('/logout', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 /** GET /api/admin/dashboard/stats — the overview cards. */
-router.get('/dashboard/stats', async (req, res) => {
+router.get('/dashboard/stats', requirePermission('dashboard.read'), async (req, res) => {
   try {
     const since30 = daysAgo(30);
 
@@ -242,7 +267,7 @@ router.get('/dashboard/stats', async (req, res) => {
  * One point per calendar day. Days with no orders are filled in with zeros
  * so the client can plot a continuous line instead of guessing the gaps.
  */
-router.get('/dashboard/charts', async (req, res) => {
+router.get('/dashboard/charts', requirePermission('dashboard.read'), async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
     const since = daysAgo(days - 1);
@@ -297,7 +322,7 @@ router.get('/dashboard/charts', async (req, res) => {
 });
 
 /** GET /api/admin/dashboard/recent — the activity feed. */
-router.get('/dashboard/recent', async (req, res) => {
+router.get('/dashboard/recent', requirePermission('dashboard.read'), async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
 
@@ -349,7 +374,7 @@ router.get('/dashboard/recent', async (req, res) => {
  * GET /api/admin/users
  * ?search= &role= &status=active|banned &from= &to= &page= &limit=
  */
-router.get('/users', async (req, res) => {
+router.get('/users', requirePermission('users.read'), async (req, res) => {
   try {
     const { page, limit, skip } = paginate(req.query);
     const filter = {};
@@ -393,7 +418,7 @@ router.get('/users', async (req, res) => {
 });
 
 /** GET /api/admin/users/:id — profile plus the order/spend summary. */
-router.get('/users/:id', async (req, res) => {
+router.get('/users/:id', requirePermission('users.read'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -450,7 +475,7 @@ router.get('/users/:id', async (req, res) => {
  * issue a token for — so this genuinely locks the account out rather than
  * only hiding it from admin lists.
  */
-router.put('/users/:id/ban', async (req, res) => {
+router.put('/users/:id/ban', requirePermission('users.write'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -478,7 +503,7 @@ router.put('/users/:id/ban', async (req, res) => {
 });
 
 /** PUT /api/admin/users/:id/role  { role } */
-router.put('/users/:id/role', async (req, res) => {
+router.put('/users/:id/role', requirePermission('users.write'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -520,7 +545,7 @@ router.put('/users/:id/role', async (req, res) => {
  * Hard delete. Orders are intentionally left in place — they are financial
  * records, and removing them would silently rewrite past revenue figures.
  */
-router.delete('/users/:id', async (req, res) => {
+router.delete('/users/:id', requirePermission('users.delete'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -557,7 +582,7 @@ router.delete('/users/:id', async (req, res) => {
  * Each row carries its BusinessRegistration status so the list can show
  * "awaiting approval" without a second request per merchant.
  */
-router.get('/merchants', async (req, res) => {
+router.get('/merchants', requirePermission('merchants.read'), async (req, res) => {
   try {
     const { page, limit, skip } = paginate(req.query);
     const filter = { role: 'merchant' };
@@ -620,7 +645,7 @@ router.get('/merchants', async (req, res) => {
 });
 
 /** GET /api/admin/merchants/:id — profile, registration, sales summary. */
-router.get('/merchants/:id', async (req, res) => {
+router.get('/merchants/:id', requirePermission('merchants.read'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -681,7 +706,7 @@ router.get('/merchants/:id', async (req, res) => {
  * merchant account, since an approved merchant that still cannot log in
  * would make the button look like it did nothing.
  */
-router.put('/merchants/:id/approve', async (req, res) => {
+router.put('/merchants/:id/approve', requirePermission('merchants.write'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -727,7 +752,7 @@ router.put('/merchants/:id/approve', async (req, res) => {
 });
 
 /** PUT /api/admin/merchants/:id/activate  { active: true|false } */
-router.put('/merchants/:id/activate', async (req, res) => {
+router.put('/merchants/:id/activate', requirePermission('merchants.write'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -757,7 +782,7 @@ router.put('/merchants/:id/activate', async (req, res) => {
  * Refuses while the merchant still has live orders — deleting then would
  * strand customers holding an order nobody owns.
  */
-router.delete('/merchants/:id', async (req, res) => {
+router.delete('/merchants/:id', requirePermission('merchants.delete'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -795,7 +820,7 @@ router.delete('/merchants/:id', async (req, res) => {
  * ?search= &status= &paymentStatus= &orderType= &userId= &merchantId=
  * &from= &to= &page= &limit=
  */
-router.get('/orders', async (req, res) => {
+router.get('/orders', requirePermission('orders.read'), async (req, res) => {
   try {
     const { page, limit, skip } = paginate(req.query);
     const filter = {};
@@ -860,7 +885,7 @@ router.get('/orders', async (req, res) => {
 });
 
 /** GET /api/admin/orders/:id */
-router.get('/orders/:id', async (req, res) => {
+router.get('/orders/:id', requirePermission('orders.read'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -881,7 +906,7 @@ router.get('/orders/:id', async (req, res) => {
  * Stamps the matching *At timestamp too, so the timeline the customer and
  * merchant apps both render stays consistent with an admin-side change.
  */
-router.put('/orders/:id/status', async (req, res) => {
+router.put('/orders/:id/status', requirePermission('orders.write'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -926,7 +951,7 @@ router.put('/orders/:id/status', async (req, res) => {
  * DELETE /api/admin/orders/:id — cancels rather than destroys.
  * Orders are financial records; wiping one would rewrite past revenue.
  */
-router.delete('/orders/:id', async (req, res) => {
+router.delete('/orders/:id', requirePermission('orders.delete'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -965,7 +990,7 @@ router.delete('/orders/:id', async (req, res) => {
  * GET /api/admin/inventory
  * Every merchant's stock in one list. ?search= &merchantId= &lowStock=true
  */
-router.get('/inventory', async (req, res) => {
+router.get('/inventory', requirePermission('inventory.read'), async (req, res) => {
   try {
     const { page, limit, skip } = paginate(req.query);
     const filter = {};
@@ -1022,7 +1047,7 @@ router.get('/inventory', async (req, res) => {
 });
 
 /** PUT /api/admin/inventory/:id  { currentStock, lowStockThreshold, unitPrice, category, name } */
-router.put('/inventory/:id', async (req, res) => {
+router.put('/inventory/:id', requirePermission('inventory.write'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -1072,7 +1097,7 @@ router.put('/inventory/:id', async (req, res) => {
  * GET /api/admin/inventory/movements
  * The stock ledger. ?merchantId= &stockId= &type= &search= &from= &to=
  */
-router.get('/inventory/movements', async (req, res) => {
+router.get('/inventory/movements', requirePermission('inventory.read'), async (req, res) => {
   try {
     const { page, limit, skip } = paginate(req.query);
     const filter = {};
@@ -1137,7 +1162,7 @@ router.get('/inventory/movements', async (req, res) => {
  * or a destination `toLocation`, in which case the sibling line for the same
  * item at that location is found or created.
  */
-router.post('/inventory/transfer', async (req, res) => {
+router.post('/inventory/transfer', requirePermission('inventory.write'), async (req, res) => {
   try {
     const { fromStockId, toStockId, toLocation, quantity } = req.body;
 
@@ -1250,7 +1275,7 @@ router.post('/inventory/transfer', async (req, res) => {
 });
 
 /** GET /api/admin/inventory/locations — the warehouses actually in use. */
-router.get('/inventory/locations', async (req, res) => {
+router.get('/inventory/locations', requirePermission('inventory.read'), async (req, res) => {
   try {
     const filter = {};
     if (req.query.merchantId && isValidId(req.query.merchantId)) {
@@ -1289,7 +1314,7 @@ router.get('/inventory/locations', async (req, res) => {
 });
 
 /** GET /api/admin/inventory/alerts — everything at or below its threshold. */
-router.get('/inventory/alerts', async (req, res) => {
+router.get('/inventory/alerts', requirePermission('inventory.read'), async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
 
@@ -1345,7 +1370,7 @@ router.get('/inventory/alerts', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 /** GET /api/admin/reports/sales?from=&to= — revenue by day, payment method, top merchants. */
-router.get('/reports/sales', async (req, res) => {
+router.get('/reports/sales', requirePermission('reports.read'), async (req, res) => {
   try {
     const range = dateRangeFilter(req.query) || { createdAt: { $gte: daysAgo(29) } };
     const revenueMatch = { ...range, status: { $in: REVENUE_STATUSES } };
@@ -1430,7 +1455,7 @@ router.get('/reports/sales', async (req, res) => {
 });
 
 /** GET /api/admin/reports/users?from=&to= — growth, role split, top spenders. */
-router.get('/reports/users', async (req, res) => {
+router.get('/reports/users', requirePermission('reports.read'), async (req, res) => {
   try {
     const range = dateRangeFilter(req.query) || { createdAt: { $gte: daysAgo(29) } };
 
@@ -1500,7 +1525,7 @@ router.get('/reports/users', async (req, res) => {
 });
 
 /** GET /api/admin/reports/merchants — approval funnel, categories, performance. */
-router.get('/reports/merchants', async (req, res) => {
+router.get('/reports/merchants', requirePermission('reports.read'), async (req, res) => {
   try {
     const [byApproval, byCategory, performance, totalMerchants] = await Promise.all([
       BusinessRegistration.aggregate([
@@ -1574,7 +1599,7 @@ router.get('/reports/merchants', async (req, res) => {
 });
 
 /** GET /api/admin/reports/orders?from=&to= — status/type/payment breakdowns. */
-router.get('/reports/orders', async (req, res) => {
+router.get('/reports/orders', requirePermission('reports.read'), async (req, res) => {
   try {
     const range = dateRangeFilter(req.query) || { createdAt: { $gte: daysAgo(29) } };
 
@@ -1656,7 +1681,7 @@ router.get('/reports/orders', async (req, res) => {
  * from ever showing a stale or invented number: if the count is 3, there are
  * genuinely 3 things waiting.
  */
-router.get('/notifications', async (req, res) => {
+router.get('/notifications', requirePermission('dashboard.read'), async (req, res) => {
   try {
     const [
       pendingApprovals, pendingOrders, refundRequests,
@@ -1748,7 +1773,7 @@ router.get('/notifications', async (req, res) => {
  * One search box across users, merchants and orders, so the operator does not
  * have to guess which section a name or order number lives in.
  */
-router.get('/search', async (req, res) => {
+router.get('/search', requirePermission('dashboard.read'), async (req, res) => {
   try {
     const term = String(req.query.q || '').trim();
     if (term.length < 2) {
@@ -1819,7 +1844,7 @@ router.get('/search', async (req, res) => {
 // Its own file — the till has enough surface (sessions, cart, invoices,
 // customers) that folding it in here would bury the rest. Mounted inside
 // this router so it inherits the admin gate above rather than re-declaring it.
-router.use('/pos', require('./admin_pos'));
+router.use('/pos', requirePermission('pos.read'), require('./admin_pos'));
 
 // ═══════════════════════════════════════════════════════════
 // PLATFORM SETTINGS
@@ -1831,7 +1856,7 @@ router.use('/pos', require('./admin_pos'));
  * hopes is configured — the same signal /api/health exposes, plus the admin
  * roster, so the Settings screen never has to claim a state it cannot see.
  */
-router.get('/settings', async (req, res) => {
+router.get('/settings', requirePermission('settings.read'), async (req, res) => {
   try {
     const [admins, adminCount] = await Promise.all([
       User.find({ role: 'admin' })
@@ -1870,7 +1895,7 @@ router.get('/settings', async (req, res) => {
  * *first* one is deliberately not possible over HTTP — see
  * scripts/create-admin.js.
  */
-router.post('/settings/admins', async (req, res) => {
+router.post('/settings/admins', requirePermission('staff.write'), async (req, res) => {
   try {
     const { fullName, email, phone, password } = req.body;
     if (!fullName || !email || !phone || !password) {
@@ -1908,7 +1933,7 @@ router.post('/settings/admins', async (req, res) => {
 });
 
 /** DELETE /api/admin/settings/admins/:id — never the last one, never yourself. */
-router.delete('/settings/admins/:id', async (req, res) => {
+router.delete('/settings/admins/:id', requirePermission('staff.delete'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;
 
@@ -1926,6 +1951,350 @@ router.delete('/settings/admins/:id', async (req, res) => {
 
     await admin.deleteOne();
     res.json({ success: true, message: 'Admin removed.', data: { deletedId: req.params.id } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// STAFF AND ROLES
+// ═══════════════════════════════════════════════════════════
+// "Staff" here means console operators — admin accounts with a role. The
+// separate `Staff` model is a merchant's own employees (name, salary, leave)
+// and is a different thing entirely, reached through /api/merchant/staff.
+
+/** GET /api/admin/permissions — the catalogue, so the UI is never out of step. */
+router.get('/permissions', requirePermission('staff.read'), async (req, res) => {
+  try {
+    const custom = await Role.find({ isActive: true }).select('name description permissions').lean();
+    res.json({
+      success: true,
+      message: 'Permission catalogue',
+      data: {
+        permissions: ALL_PERMISSIONS,
+        builtInRoles: Object.entries(ROLE_PERMISSIONS).map(([name, permissions]) => ({
+          name,
+          permissions,
+          isBuiltIn: true,
+        })),
+        customRoles: custom,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** GET /api/admin/staff — console operators. */
+router.get('/staff', requirePermission('staff.read'), async (req, res) => {
+  try {
+    const { page, limit, skip } = paginate(req.query);
+    const filter = { role: 'admin' };
+    if (req.query.adminRole) filter.adminRole = req.query.adminRole;
+    if (req.query.search) {
+      const rx = new RegExp(escapeRegex(req.query.search.trim()), 'i');
+      filter.$or = [{ fullName: rx }, { email: rx }, { phone: rx }];
+    }
+
+    const [items, total] = await Promise.all([
+      User.find(filter)
+        .sort({ createdAt: 1 }).skip(skip).limit(limit)
+        .select('fullName email phone adminRole permissions isActive createdAt lastLogin')
+        .lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      message: 'Console staff',
+      data: {
+        items: items.map((a) => ({ ...a, effectivePermissions: permissionsFor(a) })),
+        total, page, limit,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** POST /api/admin/staff — create a console operator. */
+router.post('/staff', requirePermission('staff.write'), async (req, res) => {
+  try {
+    const { fullName, email, phone, password, adminRole } = req.body;
+    if (!fullName || !email || !phone || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Full name, email, phone and password are all required.',
+      });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+    }
+
+    const roleToSet = adminRole || 'viewer';
+    if (!ROLE_PERMISSIONS[roleToSet]) {
+      return res.status(400).json({
+        success: false,
+        message: `Role must be one of: ${Object.keys(ROLE_PERMISSIONS).join(', ')}.`,
+      });
+    }
+    // Only a super admin may mint another super admin, or nothing stops an
+    // ordinary admin promoting themselves past their own ceiling.
+    if (roleToSet === 'super_admin' && req.admin.adminRole !== 'super_admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only a super admin can create another super admin.',
+      });
+    }
+
+    const normalisedEmail = String(email).toLowerCase().trim();
+    const existing = await User.findOne({ $or: [{ email: normalisedEmail }, { phone }] });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: 'An account with that email or phone already exists.',
+      });
+    }
+
+    const staff = await User.create({
+      fullName: String(fullName).trim(),
+      email: normalisedEmail,
+      phone: String(phone).trim(),
+      password,
+      role: 'admin',
+      adminRole: roleToSet,
+      permissions: Array.isArray(req.body.permissions) ? req.body.permissions : [],
+      isVerified: true,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `${staff.fullName} added as ${roleToSet.replace('_', ' ')}.`,
+      data: { staff: staff.toJSON() },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** PUT /api/admin/staff/:id — change a console operator's role or details. */
+router.put('/staff/:id', requirePermission('staff.write'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+
+    const staff = await User.findOne({ _id: req.params.id, role: 'admin' });
+    if (!staff) return res.status(404).json({ success: false, message: 'Admin not found.' });
+
+    if (req.body.adminRole !== undefined) {
+      if (!ROLE_PERMISSIONS[req.body.adminRole]) {
+        return res.status(400).json({
+          success: false,
+          message: `Role must be one of: ${Object.keys(ROLE_PERMISSIONS).join(', ')}.`,
+        });
+      }
+      if (req.body.adminRole === 'super_admin' && req.admin.adminRole !== 'super_admin') {
+        return res.status(403).json({
+          success: false,
+          message: 'Only a super admin can grant super admin.',
+        });
+      }
+      // Demoting the last super admin would leave nobody able to grant the
+      // role back — the same lockout the last-admin guard prevents.
+      if (staff.adminRole === 'super_admin' && req.body.adminRole !== 'super_admin') {
+        const supers = await User.countDocuments({ role: 'admin', adminRole: 'super_admin' });
+        if (supers <= 1) {
+          return res.status(409).json({
+            success: false,
+            message: 'This is the only super admin — promote another one first.',
+          });
+        }
+      }
+      staff.adminRole = req.body.adminRole;
+    }
+
+    if (Array.isArray(req.body.permissions)) {
+      const unknown = req.body.permissions.filter(
+        (p) => p !== '*' && !ALL_PERMISSIONS.includes(p) && !p.endsWith('.*')
+      );
+      if (unknown.length) {
+        return res.status(400).json({
+          success: false,
+          message: `Unknown permission(s): ${unknown.join(', ')}.`,
+        });
+      }
+      if (req.body.permissions.includes('*') && req.admin.adminRole !== 'super_admin') {
+        return res.status(403).json({
+          success: false,
+          message: 'Only a super admin can grant the full permission set.',
+        });
+      }
+      staff.permissions = req.body.permissions;
+    }
+
+    if (typeof req.body.fullName === 'string' && req.body.fullName.trim()) {
+      staff.fullName = req.body.fullName.trim();
+    }
+    if (typeof req.body.isActive === 'boolean') {
+      if (String(staff._id) === String(req.user.id) && req.body.isActive === false) {
+        return res.status(400).json({
+          success: false,
+          message: 'You cannot disable your own account.',
+        });
+      }
+      staff.isActive = req.body.isActive;
+    }
+
+    await staff.save({ validateBeforeSave: false });
+
+    res.json({
+      success: true,
+      message: 'Admin updated.',
+      data: { staff: staff.toJSON(), effectivePermissions: permissionsFor(staff) },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** DELETE /api/admin/staff/:id */
+router.delete('/staff/:id', requirePermission('staff.delete'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+
+    if (String(req.params.id) === String(req.user.id)) {
+      return res.status(400).json({ success: false, message: 'You cannot remove your own account.' });
+    }
+
+    const staff = await User.findOne({ _id: req.params.id, role: 'admin' });
+    if (!staff) return res.status(404).json({ success: false, message: 'Admin not found.' });
+
+    if (staff.adminRole === 'super_admin' && req.admin.adminRole !== 'super_admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only a super admin can remove another super admin.',
+      });
+    }
+
+    const remaining = await User.countDocuments({ role: 'admin' });
+    if (remaining <= 1) {
+      return res.status(409).json({ success: false, message: 'The last admin cannot be removed.' });
+    }
+
+    await staff.deleteOne();
+    res.json({ success: true, message: 'Admin removed.', data: { deletedId: req.params.id } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── Custom roles ──────────────────────────────────────────
+
+/** GET /api/admin/roles */
+router.get('/roles', requirePermission('staff.read'), async (req, res) => {
+  try {
+    const roles = await Role.find({}).sort({ createdAt: -1 }).lean();
+    res.json({
+      success: true,
+      message: 'Roles',
+      data: {
+        items: roles,
+        // The four built-ins are code, not rows, so they are listed
+        // alongside rather than pretending to be editable records.
+        builtIn: Object.entries(ROLE_PERMISSIONS).map(([name, permissions]) => ({
+          name, permissions, isBuiltIn: true,
+        })),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** POST /api/admin/roles */
+router.post('/roles', requirePermission('staff.write'), async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ success: false, message: 'A role name is required.' });
+    if (ROLE_PERMISSIONS[name]) {
+      return res.status(409).json({
+        success: false,
+        message: `"${name}" is a built-in role name.`,
+      });
+    }
+
+    const permissions = Array.isArray(req.body.permissions) ? req.body.permissions : [];
+    const unknown = permissions.filter(
+      (p) => p !== '*' && !ALL_PERMISSIONS.includes(p) && !p.endsWith('.*')
+    );
+    if (unknown.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Unknown permission(s): ${unknown.join(', ')}.`,
+      });
+    }
+
+    const existing = await Role.findOne({ name });
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'That role already exists.' });
+    }
+
+    const role = await Role.create({
+      name,
+      description: String(req.body.description || '').trim(),
+      permissions,
+      createdBy: req.user.id,
+    });
+
+    res.status(201).json({ success: true, message: 'Role created.', data: { role } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** PUT /api/admin/roles/:id */
+router.put('/roles/:id', requirePermission('staff.write'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+
+    const role = await Role.findById(req.params.id);
+    if (!role) return res.status(404).json({ success: false, message: 'Role not found.' });
+
+    if (Array.isArray(req.body.permissions)) {
+      const unknown = req.body.permissions.filter(
+        (p) => p !== '*' && !ALL_PERMISSIONS.includes(p) && !p.endsWith('.*')
+      );
+      if (unknown.length) {
+        return res.status(400).json({
+          success: false,
+          message: `Unknown permission(s): ${unknown.join(', ')}.`,
+        });
+      }
+      role.permissions = req.body.permissions;
+    }
+    if (typeof req.body.description === 'string') role.description = req.body.description.trim();
+    if (typeof req.body.isActive === 'boolean') role.isActive = req.body.isActive;
+
+    await role.save();
+    res.json({ success: true, message: 'Role updated.', data: { role } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** DELETE /api/admin/roles/:id */
+router.delete('/roles/:id', requirePermission('staff.delete'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+
+    const role = await Role.findById(req.params.id);
+    if (!role) return res.status(404).json({ success: false, message: 'Role not found.' });
+    if (role.isBuiltIn) {
+      return res.status(403).json({ success: false, message: 'A built-in role cannot be deleted.' });
+    }
+
+    await role.deleteOne();
+    res.json({ success: true, message: 'Role deleted.', data: { deletedId: req.params.id } });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -9,7 +9,10 @@
  *
  * Usage:
  *   node scripts/create-admin.js --email=ops@vips.tn --password='...' \
- *        --name='Ops Team' --phone=+21600000000
+ *        --name='Ops Team' --phone=+21600000000 [--role=super_admin]
+ *
+ * Defaults to super_admin: the first account has to be able to grant every
+ * other role, and only a super admin can do that.
  *
  * Re-running with an existing email promotes that account to admin and
  * resets its password, which is also the recovery path for a lost login.
@@ -35,6 +38,13 @@ const parseArgs = () => {
   const password = args.password || '';
   const fullName = args.name || 'VIPs Administrator';
   const phone    = (args.phone || '').trim();
+  const adminRole = args.role || 'super_admin';
+
+  const ROLES = ['super_admin', 'admin', 'manager', 'viewer'];
+  if (!ROLES.includes(adminRole)) {
+    console.error(`--role must be one of: ${ROLES.join(', ')}`);
+    process.exit(1);
+  }
 
   if (!email || !password) {
     console.error('Usage: node scripts/create-admin.js --email=<email> --password=<password> [--name=<name>] [--phone=<phone>]');
@@ -61,12 +71,16 @@ const parseArgs = () => {
       // Assigning through the document (not updateOne) so the pre-save hook
       // hashes the password — a raw update would store it in the clear.
       user.role = 'admin';
+      user.adminRole = adminRole;
+      // A recovery run should restore full reach, not leave the operator
+      // locked out of the very screens they came back to fix.
+      if (adminRole === 'super_admin') user.permissions = ['*'];
       user.password = password;
       user.isActive = true;
       user.isVerified = true;
       if (phone) user.phone = phone;
       await user.save();
-      console.log(`Promoted existing account to admin: ${user.email} (${user._id})`);
+      console.log(`Promoted existing account to ${adminRole}: ${user.email} (${user._id})`);
     } else {
       if (!phone) {
         console.error('A new account needs --phone as well (User.phone is required and unique).');
@@ -78,9 +92,11 @@ const parseArgs = () => {
         phone,
         password,
         role: 'admin',
+        adminRole,
+        permissions: adminRole === 'super_admin' ? ['*'] : [],
         isVerified: true,
       });
-      console.log(`Created admin: ${user.email} (${user._id})`);
+      console.log(`Created ${adminRole}: ${user.email} (${user._id})`);
     }
 
     const total = await User.countDocuments({ role: 'admin' });

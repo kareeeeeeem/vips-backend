@@ -30,6 +30,22 @@ const userSchema = new mongoose.Schema(
       enum: ['customer', 'merchant', 'agent', 'admin'],
       default: 'customer',
     },
+
+    // ── Admin console access (only meaningful when role === 'admin') ──
+    // Kept on User rather than a separate Admin collection: 42 refs across
+    // 29 models point at 'User', and five of them attribute an action to the
+    // admin who took it (PosSession.cashierId, PosInvoice.cashierId and
+    // refundedBy, StockMovement.performedBy). Moving admins to their own
+    // collection would break every one of those populates, so the stock
+    // ledger would read "System" and receipts would lose the cashier's name.
+    adminRole: {
+      type: String,
+      enum: ['super_admin', 'admin', 'manager', 'viewer'],
+      default: 'admin',
+    },
+    // Grants beyond the role's defaults. '*' means everything, which is what
+    // the bootstrap super admin gets.
+    permissions: { type: [String], default: [] },
     // Merchant-specific fields
     storeName: { type: String, default: null },
     storeAddress: { type: String, default: null },
@@ -40,6 +56,9 @@ const userSchema = new mongoose.Schema(
     brandColor: { type: String, default: null }, // e.g., '0xFFDC2626'
     isTrending: { type: Boolean, default: false },
     discountPercentage: { type: Number, default: 0 },
+    // Platform cut on this merchant's sales, as a percentage. Read by the
+    // commission report; 0 means the platform takes nothing from them.
+    commissionRate: { type: Number, default: 0, min: 0, max: 100 },
     
     // Wallet
     walletBalance: { type: Number, default: 0 },

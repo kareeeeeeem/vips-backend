@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node tests/integration.test.js",
+    "create-admin": "node scripts/create-admin.js"
   },
   "keywords": [],
   "author": "",
