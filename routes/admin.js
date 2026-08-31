@@ -604,6 +604,95 @@ router.delete('/users/:id', requirePermission('users.delete'), async (req, res) 
  * shown: they take it over with the normal forgot-password flow, so nobody
  * ends up sharing a password over a counter.
  */
+/**
+ * PUT /api/admin/users/:id — edit a customer's own details.
+ *
+ * `users.update` is labelled "Edit a customer, including their role", but
+ * until now only the role route used it: the console could ban, delete and
+ * promote an account without being able to correct a typo in the name it
+ * shows everywhere. Role changes stay on their own route, which enforces the
+ * last-admin and self-demotion rules this one has no business repeating.
+ */
+router.put('/users/:id', requirePermission('users.update'), async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id.' });
+    }
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    if (user.role === 'admin') {
+      // Console operators are edited on the Staff screen, which also carries
+      // the role and permission rules this route deliberately does not.
+      return res.status(403).json({
+        success: false,
+        message: 'Console operators are edited from the Staff screen.',
+      });
+    }
+
+    const changes = {};
+    if (typeof req.body.fullName === 'string') {
+      const name = req.body.fullName.trim();
+      if (!name) {
+        return res.status(400).json({ success: false, message: 'A name is required.' });
+      }
+      changes.fullName = name;
+    }
+    if (typeof req.body.city === 'string') changes.city = req.body.city.trim() || null;
+
+    // Email and phone are the two sign-in identifiers, so a change to either
+    // has to stay unique or the owner is locked out of their own account by
+    // someone else's edit.
+    if (typeof req.body.email === 'string') {
+      const email = req.body.email.toLowerCase().trim();
+      if (!email) {
+        return res.status(400).json({ success: false, message: 'An email is required.' });
+      }
+      if (email !== user.email) {
+        const taken = await User.findOne({ email, _id: { $ne: user._id } });
+        if (taken) {
+          return res.status(409).json({
+            success: false,
+            message: 'Another account already uses that email.',
+          });
+        }
+        changes.email = email;
+      }
+    }
+    if (typeof req.body.phone === 'string') {
+      const phone = req.body.phone.trim();
+      if (!phone) {
+        return res.status(400).json({ success: false, message: 'A phone number is required.' });
+      }
+      if (phone !== user.phone) {
+        const taken = await User.findOne({ phone, _id: { $ne: user._id } });
+        if (taken) {
+          return res.status(409).json({
+            success: false,
+            message: 'Another account already uses that phone number.',
+          });
+        }
+        changes.phone = phone;
+      }
+    }
+
+    if (!Object.keys(changes).length) {
+      return res.status(400).json({ success: false, message: 'Nothing to change.' });
+    }
+
+    Object.assign(user, changes);
+    await user.save();
+
+    res.json({
+      success: true,
+      message: `${user.fullName} updated.`,
+      data: { user: user.toJSON(), changed: Object.keys(changes) },
+    });
+  } catch (error) {
+    const status = error.name === 'ValidationError' ? 400 : 500;
+    res.status(status).json({ success: false, message: error.message });
+  }
+});
+
 router.post('/users', requirePermission('users.create'), async (req, res) => {
   try {
     const { fullName, phone } = req.body;
@@ -1621,7 +1710,8 @@ router.get('/notifications', requirePermission('dashboard.read'), async (req, re
         title: 'Merchant payout requests pending',
         count: pendingPayouts,
         severity: 'info',
-        route: null,
+        // Was a dead end until the finance dashboard gave payouts a screen.
+        route: '/dashboards/finance',
         args: {},
       },
       {
@@ -1742,9 +1832,16 @@ router.use('/products', require('./admin_products'));
  */
 router.get('/settings', requirePermission('settings.read'), async (req, res) => {
   try {
+    // Capped, unlike the rest of this payload, which is a handful of
+    // booleans: the roster grows without limit and this endpoint has no
+    // paging, so an installation with hundreds of operators would ship the
+    // whole list on every visit to the Settings screen. `adminCount` is the
+    // real total, and the full list lives on the paginated Staff screen.
+    const ROSTER_LIMIT = 50;
     const [admins, adminCount] = await Promise.all([
       User.find({ role: 'admin' })
         .sort({ createdAt: 1 })
+        .limit(ROSTER_LIMIT)
         .select('fullName email phone isActive createdAt lastLogin').lean(),
       User.countDocuments({ role: 'admin' }),
     ]);
@@ -1755,6 +1852,9 @@ router.get('/settings', requirePermission('settings.read'), async (req, res) => 
       data: {
         admins,
         adminCount,
+        // Said explicitly so the screen can show "50 of 89" rather than
+        // letting a truncated list read as the whole roster.
+        adminsTruncated: adminCount > admins.length,
         integrations: {
           firebaseAdmin: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT),
           sendgrid:      Boolean(process.env.SENDGRID_API_KEY),

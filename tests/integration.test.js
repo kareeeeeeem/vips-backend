@@ -1452,6 +1452,112 @@ async function testDashboards() {
     'the script keeps its own copy of the role list');
 }
 
+// ─── FLOW 13: Client/server wiring ──────────────────────────
+// Both directions, from the real Express stack rather than a hand-kept list.
+// A call with no route is a dead button; a route with no caller is a feature
+// that was built and then never reached from the console.
+function testWiring() {
+  console.log('\n🔌 FLOW 13: Console ↔ backend wiring');
+  const fs = require('fs');
+  const pathMod = require('path');
+  const adminRouter = require('../routes/admin');
+
+  const routes = [];
+  (function walk(stack, prefix) {
+    for (const layer of stack) {
+      if (layer.route) {
+        for (const m of Object.keys(layer.route.methods)) {
+          routes.push({
+            method: m.toUpperCase(),
+            path: '/admin' + prefix + (layer.route.path === '/' ? '' : layer.route.path),
+          });
+        }
+      } else if (layer.name === 'router' && layer.handle.stack) {
+        const m = layer.regexp.toString().match(/\\\/([^\\\/\?]+)/);
+        walk(layer.handle.stack, prefix + (m ? '/' + m[1] : ''));
+      }
+    }
+  })(adminRouter.stack, '');
+
+  const dart = fs.readFileSync(
+    pathMod.join(__dirname, '../../admin/services/admin_api_service.dart'), 'utf8');
+  const calls = [];
+  const re = /_api\.(get|post|put|delete)\(\s*'([^']+)'/g;
+  let m;
+  while ((m = re.exec(dart))) {
+    const raw = m[2].replace(/\$\{[^}]+\}/g, ':p').replace(/\$\w+/g, ':p').split('?')[0];
+    if (raw.startsWith('/admin')) calls.push({ method: m[1].toUpperCase(), raw });
+  }
+  assert('the console calls the admin API', calls.length > 50, `${calls.length} calls found`);
+
+  // Only the segment under /reports or /dashboards is an enum the client
+  // interpolates; collapsing every "products" would hide /admin/products
+  // behind /admin/reports/products.
+  const norm = (p) =>
+    p.replace(/:[^/]+/g, ':p')
+     .replace(/^\/admin\/(reports|dashboards)\/[^/]+/, '/admin/$1/:p');
+
+  const routeKeys = new Set(routes.map((r) => `${r.method} ${norm(r.path)}`));
+  const callKeys = new Set(calls.map((c) => `${c.method} ${norm(c.raw)}`));
+
+  const unrouted = [...callKeys].filter((k) => !routeKeys.has(k));
+  assert('every call the console makes has a backend route',
+    unrouted.length === 0, unrouted.join('; '));
+
+  const uncalled = [...routeKeys].filter((k) => !callKeys.has(k) && k !== 'POST /admin/logout');
+  assert('every admin endpoint is reachable from the console',
+    uncalled.length === 0,
+    uncalled.length ? `built but never called: ${uncalled.join('; ')}` : '');
+
+  console.log(`    ${routes.length} endpoints, ${calls.length} client calls`);
+}
+
+// ─── FLOW 14: Editing a customer ────────────────────────────
+async function testUserEditing() {
+  console.log('\n✏️  FLOW 14: Customer editing');
+  if (!adminToken || !userId) return assert('prerequisites for user editing', false);
+
+  const renamed = await req('PUT', `/admin/users/${userId}`,
+    { fullName: 'QA Renamed User' }, adminToken);
+  assert('an admin can correct a customer\'s name',
+    renamed.success === true && renamed.data?.user?.fullName === 'QA Renamed User',
+    renamed.message);
+  assert('only the fields sent are reported as changed',
+    Array.isArray(renamed.data?.changed) && renamed.data.changed.join() === 'fullName',
+    JSON.stringify(renamed.data?.changed));
+
+  const noop = await req('PUT', `/admin/users/${userId}`, {}, adminToken);
+  assert('an empty edit is rejected rather than silently succeeding', noop.status === 400);
+
+  const blank = await req('PUT', `/admin/users/${userId}`, { fullName: '   ' }, adminToken);
+  assert('a blank name is rejected', blank.status === 400);
+
+  // Email and phone are sign-in identifiers, so a collision would lock the
+  // other account's owner out through somebody else's edit.
+  const taken = await req('PUT', `/admin/users/${userId}`,
+    { email: TEST_MERCHANT.email }, adminToken);
+  assert('an email already in use is refused', taken.status === 409, `status ${taken.status}`);
+
+  const takenPhone = await req('PUT', `/admin/users/${userId}`,
+    { phone: TEST_MERCHANT.phone }, adminToken);
+  assert('a phone already in use is refused', takenPhone.status === 409);
+
+  const sameEmail = await req('PUT', `/admin/users/${userId}`,
+    { email: TEST_USER.email, fullName: 'QA Test User' }, adminToken);
+  assert('re-sending an account\'s own email is not a collision',
+    sameEmail.success === true, sameEmail.message);
+
+  // Console operators carry role and permission rules this route does not
+  // repeat, so it refuses them outright rather than half-applying them.
+  const onAdmin = await req('PUT', `/admin/users/${adminId}`,
+    { fullName: 'Nope' }, adminToken);
+  assert('a console operator cannot be edited through the customer route',
+    onAdmin.status === 403, `status ${onAdmin.status}`);
+
+  const badId = await req('PUT', '/admin/users/not-an-id', { fullName: 'X' }, adminToken);
+  assert('an invalid user id is rejected', badId.status === 400);
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -1471,6 +1577,8 @@ async function runAll() {
     await testGiftSend();
     await testAdmin();
     await testDashboards();
+    testWiring();
+    await testUserEditing();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }
