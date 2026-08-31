@@ -602,6 +602,22 @@ async function testAdmin() {
     inventory.success === true && Array.isArray(inventory.data?.items) &&
     typeof inventory.data?.totalValue === 'number');
 
+  // The type chips exist to say how many of each kind there are. Counting
+  // them over a filter that includes the type itself zeroed every other chip
+  // the moment one was picked — and zeroed "All" too, so the counts claimed
+  // the ledger was empty while the list below them showed rows.
+  const allMovements = await req('GET', '/admin/inventory/movements?limit=1',
+    null, adminToken);
+  const typedMovements = await req('GET',
+    '/admin/inventory/movements?limit=1&type=adjustment', null, adminToken);
+  assert('filtering the ledger by type does not zero the type counts',
+    Object.keys(typedMovements.data?.byType || {}).length ===
+    Object.keys(allMovements.data?.byType || {}).length,
+    `${Object.keys(typedMovements.data?.byType || {}).length} vs ` +
+    `${Object.keys(allMovements.data?.byType || {}).length} types`);
+  assert('the filtered list itself is still narrowed to that type',
+    (typedMovements.data?.items || []).every((m) => m.type === 'adjustment'));
+
   const alerts = await req('GET', '/admin/inventory/alerts', null, adminToken);
   assert('low-stock alerts cover both stock lines and products',
     alerts.success === true && Array.isArray(alerts.data?.stock) &&

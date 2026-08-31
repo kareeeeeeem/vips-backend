@@ -1301,6 +1301,11 @@ router.get('/inventory/movements', requirePermission('inventory.read'), async (r
     const range = dateRangeFilter(req.query);
     if (range) Object.assign(filter, range);
 
+    // The same scope the list is under — search, merchant, stock line, dates —
+    // but without the type constraint, so the chips keep their counts.
+    const typeAgnosticFilter = { ...filter };
+    delete typeAgnosticFilter.type;
+
     const [items, total, byType] = await Promise.all([
       StockMovement.find(filter)
         .sort({ createdAt: -1 }).skip(skip).limit(limit)
@@ -1308,8 +1313,13 @@ router.get('/inventory/movements', requirePermission('inventory.read'), async (r
         .populate('performedBy', 'fullName role')
         .lean(),
       StockMovement.countDocuments(filter),
+      // Counted over everything except the type filter itself. Including it
+      // zeroed every other chip the moment one was picked — and zeroed the
+      // "All" chip too, so the counts said the ledger was empty while the
+      // list beneath them was showing rows. The chips exist to say what is
+      // there, which they cannot do if choosing one erases the answer.
       StockMovement.aggregate([
-        { $match: filter },
+        { $match: typeAgnosticFilter },
         { $group: { _id: '$type', count: { $sum: 1 }, units: { $sum: '$quantity' } } },
       ]),
     ]);
