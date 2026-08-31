@@ -1140,6 +1140,7 @@ router.get('/merchants', canAnalyse, async (req, res) => {
       orderPerformance, posPerformance,
       ratings,
       newMerchants, prevNewMerchants,
+      unattributedOrderRows, unattributedPosRows,
     ] = await Promise.all([
       User.aggregate([
         { $match: { role: 'merchant' } },
@@ -1191,6 +1192,21 @@ router.get('/merchants', canAnalyse, async (req, res) => {
 
       User.countDocuments(inWindow(win, { role: 'merchant' })),
       User.countDocuments(inPrevious(win, { role: 'merchant' })),
+
+      // The exact complement of the `merchantId: { $ne: null }` match above —
+      // in Mongo, `{ field: null }` matches both an explicit null and a
+      // missing field, so between them the two cover every order in the
+      // window. Revenue that belongs to no merchant cannot appear in a
+      // per-merchant ranking, but dropping it silently is what makes this
+      // board's total disagree with the sales board's for the same window.
+      Order.aggregate([
+        { $match: orderRevenue(win, { merchantId: null }) },
+        { $group: { _id: null, revenue: { $sum: '$totalAmount' }, orders: { $sum: 1 } } },
+      ]),
+      PosInvoice.aggregate([
+        { $match: posRevenue(win, { merchantId: null }) },
+        { $group: { _id: null, revenue: { $sum: '$total' }, orders: { $sum: 1 } } },
+      ]),
     ]);
 
     const combined = new Map();
@@ -1244,6 +1260,14 @@ router.get('/merchants', canAnalyse, async (req, res) => {
     const r = roster[0] || { total: 0, active: 0 };
     const revenueTotal = round(performance.reduce((sum, m) => sum + m.revenue, 0));
 
+    const unattributed = [...unattributedOrderRows, ...unattributedPosRows].reduce(
+      (acc, row) => ({
+        revenue: acc.revenue + (row.revenue || 0),
+        orders: acc.orders + (row.orders || 0),
+      }),
+      { revenue: 0, orders: 0 }
+    );
+
     res.json({
       success: true,
       message: 'Merchants dashboard',
@@ -1259,7 +1283,13 @@ router.get('/merchants', canAnalyse, async (req, res) => {
         // Merchants on the books who sold nothing in the window — invisible in
         // any top-N ranking, and the more actionable half of the roster.
         idleMerchants: Math.max(r.total - performance.filter((m) => m.revenue > 0).length, 0),
+        // Revenue attributable to a merchant. This is deliberately not the
+        // same figure as the sales dashboard's totalRevenue, which counts
+        // every sale; the difference is `unattributedRevenue` below, so the
+        // two boards reconcile exactly instead of quietly disagreeing.
         totalRevenue: revenueTotal,
+        unattributedRevenue: round(unattributed.revenue),
+        unattributedOrders: unattributed.orders,
 
         previous: { newMerchants: prevNewMerchants },
         change: { newMerchants: changeVs(newMerchants, prevNewMerchants) },

@@ -1152,13 +1152,15 @@ router.delete('/orders/:id', requirePermission('orders.cancel'), async (req, res
       });
     }
 
-    order.$locals.statusBy = { id: req.user.id, role: 'admin', note: reason || '' };
-    order.status = 'cancelled';
-    order.canceledAt = new Date();
     // Accept the reason from either place: the app's shared ApiService.delete
     // sends no request body, so it passes ?reason= instead. Reading only
     // req.body here would silently drop every reason the console sends.
-    order.cancellationReason = String(req.body.reason || req.query.reason || 'Cancelled by administrator');
+    const reason = String(req.body.reason || req.query.reason || 'Cancelled by administrator');
+
+    order.$locals.statusBy = { id: req.user.id, role: 'admin', note: reason };
+    order.status = 'cancelled';
+    order.canceledAt = new Date();
+    order.cancellationReason = reason;
     await order.save();
 
     res.json({ success: true, message: 'Order cancelled.', data: { order: order.toJSON() } });

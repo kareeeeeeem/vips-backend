@@ -2026,6 +2026,73 @@ async function testChat() {
 }
 
 // ─── FLOW 19: Order tracking ────────────────────────────────
+// ─── FLOW 22: Admin order cancellation and board reconciliation ──────
+//
+// Both assertions here are regressions for bugs this suite did not catch:
+// the cancel route referenced `reason` above the line that defined it (a
+// clean 500 on every cancellation), and the merchants dashboard silently
+// dropped revenue belonging to no merchant, so it disagreed with the sales
+// dashboard about the same window.
+async function testAdminOrderCancel() {
+  console.log('\n🚫 FLOW 22: Admin cancellation & board reconciliation');
+  if (!adminToken || !userId) return assert('cancellation prerequisites', false);
+
+  if (!dbConnected) {
+    await mongoose.connect(process.env.MONGODB_URI);
+    dbConnected = true;
+  }
+  const Order = require('../models/Order');
+  const seeded = new Order({
+    userId,
+    merchantId: merchantId || null,
+    totalAmount: 42,
+    status: 'pending',
+    items: [{ item_name: 'Cancellable', quantity: 1, price: 42 }],
+  });
+  await seeded.save();
+
+  const REASON = 'Cancelled during the QA sweep';
+  const cancelled = await req(
+    'DELETE', `/admin/orders/${seeded._id}?reason=${encodeURIComponent(REASON)}`,
+    null, adminToken
+  );
+  assert('an admin can cancel an order', cancelled.status === 200 && cancelled.success === true,
+    `${cancelled.status} ${cancelled.message}`);
+  assert('cancelling does not 500 on an undefined reason', cancelled.status !== 500,
+    cancelled.message);
+
+  const after = await Order.findById(seeded._id).lean();
+  assert('the cancellation is recorded as cancelled', after.status === 'cancelled', after.status);
+  assert('the reason given is the reason stored', after.cancellationReason === REASON,
+    after.cancellationReason);
+  const last = (after.statusHistory || [])[(after.statusHistory || []).length - 1];
+  assert('the timeline records who cancelled it and why',
+    last && last.status === 'cancelled' && last.byRole === 'admin' && last.note === REASON,
+    JSON.stringify(last));
+
+  // Already cancelled — the guard, not a second history entry.
+  const again = await req('DELETE', `/admin/orders/${seeded._id}`, null, adminToken);
+  assert('an order cannot be cancelled twice', again.status === 409, `${again.status}`);
+
+  await Order.deleteOne({ _id: seeded._id });
+
+  // The two boards answer the same question over the same window and must
+  // not produce two numbers for it.
+  const win = 'startDate=2026-08-01&endDate=2026-08-31';
+  const sales = await req('GET', `/admin/dashboards/sales?${win}`, null, adminToken);
+  const merch = await req('GET', `/admin/dashboards/merchants?${win}`, null, adminToken);
+  assert('both boards answer', sales.success === true && merch.success === true);
+  const attributed = merch.data?.totalRevenue ?? 0;
+  const unattributed = merch.data?.unattributedRevenue ?? 0;
+  assert('the merchants board states revenue belonging to no merchant',
+    typeof merch.data?.unattributedRevenue === 'number');
+  assert('the merchants board reconciles with the sales board',
+    Math.abs((attributed + unattributed) - (sales.data?.totalRevenue ?? 0)) < 0.01,
+    `${attributed} + ${unattributed} vs ${sales.data?.totalRevenue}`);
+  assert('a deleted merchant keeps its revenue rather than losing it',
+    (merch.data?.merchantPerformance || []).every((m) => typeof m.revenue === 'number'));
+}
+
 async function testOrderTracking() {
   console.log('\n📍 FLOW 19: Order tracking');
   if (!userToken || !merchantToken || !orderId) {
@@ -2142,6 +2209,7 @@ async function runAll() {
     await testUserEditing();
     await testAuditLog();
     await testAnalytics();
+    await testAdminOrderCancel();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }
