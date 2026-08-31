@@ -1492,6 +1492,10 @@ const stockLedgerHooks = {
   }),
 };
 
+// Bulk product import. Mounted inside this router so it inherits the
+// merchant auth gate above rather than re-declaring it.
+router.use('/products/import', require('./merchant_import'));
+
 router.use('/stock',     crudRouter(Stock, 'createdAt', stockLedgerHooks));
 router.use('/assets',    crudRouter(Asset));
 router.use('/tax-rates', crudRouter(TaxRate));

@@ -1796,6 +1796,136 @@ async function testAnalytics() {
     PERMISSION_CATALOGUE.some((p) => p.key === 'analytics.read' && p.enforced));
 }
 
+// ─── FLOW 17: Bulk product import ───────────────────────────
+async function testBulkImport() {
+  console.log('\n📥 FLOW 17: Bulk product import');
+  if (!merchantToken) return assert('prerequisites for bulk import', false);
+
+  const send = async (csv, { name = 'products.csv', dryRun = false } = {}) => {
+    const form = new FormData();
+    form.append('file', new Blob([csv], { type: 'text/csv' }), name);
+    const r = await fetch(
+      `${BASE_URL}/merchant/products/import/csv?dryRun=${dryRun}`,
+      { method: 'POST', headers: { Authorization: `Bearer ${merchantToken}` }, body: form });
+    return { status: r.status, ...(await r.json()) };
+  };
+
+  // ── Template ──
+  const tmplRes = await fetch(`${BASE_URL}/merchant/products/import/template`,
+    { headers: { Authorization: `Bearer ${merchantToken}` } });
+  const tmplBuf = Buffer.from(await tmplRes.arrayBuffer());
+  assert('the template downloads as CSV',
+    tmplRes.status === 200 && (tmplRes.headers.get('content-type') || '').includes('text/csv'));
+  // Excel reads a file without one as the current codepage, so an Arabic
+  // product name comes back as mojibake — the first thing a merchant sees.
+  assert('the template carries a byte-order mark for Excel',
+    tmplBuf[0] === 0xef && tmplBuf[1] === 0xbb && tmplBuf[2] === 0xbf);
+
+  // ── A check writes nothing ──
+  const good = 'name,category,price,costPrice,stock,code\n' +
+    `Imported A ${ts},Drinks,4.5,1.8,50,IMP-A-${ts}\n` +
+    `Imported B ${ts},Bakery,3,1.2,30,IMP-B-${ts}\n`;
+  const dry = await send(good, { dryRun: true });
+  assert('a check reports what would happen without writing',
+    dry.success === true && dry.data.dryRun === true &&
+    dry.data.wouldCreate === 2 && dry.data.created === 0, dry.message);
+
+  // Filtered by name here rather than by a query param: /merchant/products
+  // returns the whole catalogue, which already holds products from the
+  // merchant flow above.
+  const afterDry = await req('GET', '/merchant/products', null, merchantToken);
+  const dryMatches = (afterDry.data?.items || afterDry.data || [])
+    .filter((p) => (p.name || '').includes(`Imported A ${ts}`));
+  assert('a check writes nothing to the catalogue',
+    dryMatches.length === 0, `${dryMatches.length} found after a dry run`);
+
+  // ── The real import ──
+  const real = await send(good);
+  assert('the import creates the products',
+    real.data.created === 2 && real.data.skipped === 0, JSON.stringify(real.data));
+
+  // ── Duplicates ──
+  const again = await send(good);
+  assert('re-uploading the same file creates nothing',
+    again.data.created === 0 && again.data.skipped === 2);
+  assert('a skipped row says which rule matched',
+    (again.data.issues || []).some((i) => /already exists/i.test(i.message || '')));
+
+  // A file that repeats a row is not caught by checking the database: both
+  // rows are new when the upload starts.
+  const selfDupe = `name,category,price\nSelf ${ts},X,1\nSelf ${ts},X,1\n`;
+  const sd = await send(selfDupe);
+  assert('a file that repeats a row imports it once',
+    sd.data.created === 1 && sd.data.skipped === 1, JSON.stringify(sd.data));
+
+  // ── Bad rows ──
+  const bad = 'name,category,price,discountPrice\n' +
+    ',Drinks,5,\n' +
+    `NoPrice ${ts},Drinks,,\n` +
+    `NotANumber ${ts},Drinks,abc,\n` +
+    `Negative ${ts},Drinks,-5,\n` +
+    `BadDiscount ${ts},Drinks,10,99\n` +
+    `Fine ${ts},Drinks,7,\n`;
+  const b = await send(bad);
+  assert('good rows import while bad ones are reported',
+    b.data.created === 1 && b.data.failed === 5, JSON.stringify(b.data));
+  assert('every problem names the line in the file',
+    (b.data.issues || []).every((i) => typeof i.line === 'number' && i.line >= 2));
+  assert('a discount above the price is refused',
+    (b.data.issues || []).some((i) => i.field === 'discountPrice'));
+
+  // ── Quoting and locale ──
+  const tricky = 'name,category,price\n' +
+    `"Cafe ""Special"", large ${ts}",Drinks,"12,50"\n`;
+  const tr = await send(tricky);
+  assert('a quoted comma does not split the row, and a decimal comma parses',
+    tr.data.created === 1, JSON.stringify(tr.data));
+  const madeRes = await req('GET', '/merchant/products', null, merchantToken);
+  const made = (madeRes.data?.items || madeRes.data || [])
+    .find((p) => (p.name || '').includes(`${ts}`));
+  assert('the quoted field is stored whole, with its price',
+    !!made && made.name.includes('"Special", large') && made.price === 12.5,
+    made ? `${made.name} @ ${made.price}` : 'not found');
+
+  // ── Refusals ──
+  const xlsx = await send('binary', { name: 'products.xlsx' });
+  assert('an Excel file is refused with instructions, not a parse error',
+    xlsx.status === 400 && /save as/i.test(xlsx.message || ''), xlsx.message);
+
+  const headerOnly = await send('name,category,price\n');
+  assert('a file with only a header is refused', headerOnly.status === 400);
+
+  const huge = 'name,category,price\n' +
+    Array.from({ length: 2100 }, (_, i) => `Bulk${i},X,1`).join('\n');
+  const h = await send(huge);
+  assert('a file over the row limit is refused', h.status === 400 && /2000/.test(h.message));
+
+  const noToken = await fetch(`${BASE_URL}/merchant/products/import/csv`,
+    { method: 'POST', body: new FormData() });
+  assert('importing needs a merchant token', noToken.status === 401);
+
+  // ── History ──
+  const history = await req('GET', '/merchant/products/import/history',
+    null, merchantToken);
+  assert('the import history is real, not an empty stub',
+    history.success === true && (history.data?.items || []).length > 0,
+    `${(history.data?.items || []).length} entries`);
+  assert('checks are recorded alongside imports',
+    (history.data.items || []).some((i) => i.dryRun === true));
+
+  const first = history.data.items[0];
+  const one = await req('GET', `/merchant/products/import/history/${first._id}`,
+    null, merchantToken);
+  assert('a single import can be opened', one.success === true && !!one.data?.import);
+
+  // Another merchant's import id must not read back their file name.
+  const other = await req('GET', `/merchant/products/import/history/${first._id}`,
+    null, userToken);
+  assert('an import belongs to the merchant who ran it',
+    other.status === 401 || other.status === 403 || other.status === 404,
+    `status ${other.status}`);
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -1811,6 +1941,7 @@ async function runAll() {
     await testNotifications();
     await testContent();
     await testMerchant();
+    await testBulkImport();
     await testReferral();
     await testGiftSend();
     await testAdmin();
