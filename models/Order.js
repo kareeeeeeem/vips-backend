@@ -98,6 +98,45 @@ const orderSchema = new mongoose.Schema(
     pickedUpAt:         { type: Date, default: null },
     deliveredAt:        { type: Date, default: null },
     canceledAt:         { type: Date, default: null },
+
+    /// Every status this order has been through, in order.
+    ///
+    /// Written by the pre-save hook below rather than by the routes. Eight
+    /// different places change `status` — the admin console, the merchant
+    /// app, a customer cancelling, a refund request and three payment
+    /// confirmations — and a history each of them had to remember to append
+    /// would have holes in exactly the ones somebody forgot.
+    statusHistory: {
+      type: [
+        {
+          status: { type: String, required: true },
+          at:     { type: Date, default: Date.now },
+          /// Why, when the change carried a reason.
+          note:   { type: String, default: '' },
+          /// Who made it. Null for a change nothing was able to attribute —
+          /// a gateway webhook has no operator behind it.
+          byId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+          byRole: { type: String, default: '' },
+          _id: false,
+        },
+      ],
+      default: [],
+    },
+
+    /// Where the delivery is right now, when somebody is reporting it.
+    ///
+    /// Null until something sends a coordinate. The customer's tracking
+    /// screen shows this section only when it is set — an empty map is worse
+    /// than no map, because it implies tracking that is not happening.
+    deliveryLocation: {
+      lat:       { type: Number, default: null },
+      lng:       { type: Number, default: null },
+      updatedAt: { type: Date, default: null },
+      _id: false,
+    },
+
+    /// When the merchant expects to hand it over. Set by them, not guessed.
+    estimatedDeliveryAt: { type: Date, default: null },
     refundRequestedAt:  { type: Date, default: null },
     refundedAt:         { type: Date, default: null },
   },
@@ -202,5 +241,37 @@ orderSchema.methods.toMerchantJSON = function (merchantUser) {
     bring_change_amount:  0,
   };
 };
+
+/**
+ * Record every status change, once, wherever it came from.
+ *
+ * A route that knows who is making the change sets `order.$locals.statusBy`
+ * before saving; one that does not — a payment webhook — leaves it, and the
+ * entry is stored unattributed rather than guessed at.
+ */
+orderSchema.pre('save', function recordStatusChange(next) {
+  // `isNew` as well as `isModified`: a brand-new order takes its status from
+  // the schema default, which does not count as modified — so without this
+  // the timeline would silently start at the *second* status the order ever
+  // had, and "Order placed" would be missing from every one of them.
+  if (!this.isNew && !this.isModified('status')) return next();
+
+  const by = this.$locals.statusBy || {};
+  this.statusHistory.push({
+    status: this.status,
+    at: new Date(),
+    note: String(by.note || '').slice(0, 300),
+    byId: by.id || null,
+    byRole: by.role || '',
+  });
+
+  // Cleared immediately. `$locals` survives on the document, so leaving it
+  // would attribute the *next* status change to whoever made this one — a
+  // gateway webhook would come back signed by the merchant who touched the
+  // order before it, which is worse than no attribution at all.
+  delete this.$locals.statusBy;
+
+  next();
+});
 
 module.exports = mongoose.model('Order', orderSchema);

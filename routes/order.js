@@ -281,6 +281,75 @@ router.get('/:id', authMiddleware, async (req, res) => {
 });
 
 // ─── PUT /api/order/:id/cancel ────────────────────────────
+/**
+ * GET /api/order/:id/tracking
+ *
+ * The order's journey, for the customer who placed it. Scoped to them: an
+ * order id from somebody else must not read back where their delivery is.
+ *
+ * Registered before ':id/cancel' and after ':id' — Express matches in order
+ * and '/:id' would not capture this two-segment path anyway.
+ */
+router.get('/:id/tracking', authMiddleware, async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, userId: req.user.id })
+      .select('orderNumber status statusHistory deliveryLocation estimatedDeliveryAt '
+        + 'createdAt deliveredAt canceledAt merchantId')
+      .populate('merchantId', 'storeName fullName phone')
+      .lean();
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found.' });
+    }
+
+    // Ordered oldest first, the way a journey reads. The hook appends, so
+    // they are already in order, but a sort makes that independent of it.
+    const history = (order.statusHistory || [])
+      .slice()
+      .sort((a, b) => new Date(a.at) - new Date(b.at))
+      .map((h) => ({
+        status: h.status,
+        at: h.at,
+        note: h.note || '',
+        // Who, by role only. A customer does not need the operator's name,
+        // and it would be the one piece of staff data leaking outward.
+        by: h.byRole || '',
+      }));
+
+    const location = order.deliveryLocation || {};
+    const hasLocation = typeof location.lat === 'number' && typeof location.lng === 'number';
+
+    res.json({
+      success: true,
+      message: 'Order tracking',
+      data: {
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        status: order.status,
+        history,
+        // Older orders predate this history, so the screen can say the
+        // journey was not recorded rather than showing an empty timeline
+        // that reads as nothing having happened.
+        historyRecorded: history.length > 0,
+        placedAt: order.createdAt,
+        estimatedDeliveryAt: order.estimatedDeliveryAt,
+        deliveredAt: order.deliveredAt,
+        merchantName: order.merchantId
+          ? (order.merchantId.storeName || order.merchantId.fullName || '')
+          : '',
+        merchantPhone: order.merchantId ? order.merchantId.phone || '' : '',
+        // Null unless somebody is actually reporting a position. An empty
+        // map implies tracking that is not happening.
+        liveLocation: hasLocation
+          ? { lat: location.lat, lng: location.lng, updatedAt: location.updatedAt }
+          : null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.put('/:id/cancel', authMiddleware, async (req, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
@@ -288,6 +357,7 @@ router.put('/:id/cancel', authMiddleware, async (req, res) => {
     if (['delivered', 'cancelled'].includes(order.status)) {
       return res.status(400).json({ success: false, message: 'Cannot cancel this order' });
     }
+    order.$locals.statusBy = { id: req.user.id, role: 'customer', note: req.body.reason || '' };
     order.status = 'cancelled';
     order.canceledAt = new Date();
     await order.save();
@@ -305,6 +375,7 @@ router.put('/:id/request-refund', authMiddleware, async (req, res) => {
     if (order.status !== 'delivered') {
       return res.status(400).json({ success: false, message: 'Only delivered orders can be refunded' });
     }
+    order.$locals.statusBy = { id: req.user.id, role: 'customer', note: req.body.reason || '' };
     order.status = 'refund_requested';
     order.refundRequestedAt = new Date();
     order.cancellationReason = (req.body?.reason || '').toString().slice(0, 500);

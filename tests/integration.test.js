@@ -2025,6 +2025,94 @@ async function testChat() {
   merchant2.socket.disconnect();
 }
 
+// ─── FLOW 19: Order tracking ────────────────────────────────
+async function testOrderTracking() {
+  console.log('\n📍 FLOW 19: Order tracking');
+  if (!userToken || !merchantToken || !orderId) {
+    return assert('order tracking prerequisites', false);
+  }
+
+  // The status history is written by a pre-save hook, not by the routes.
+  // Eight places change order.status — the admin console, the merchant app, a
+  // customer cancelling, a refund request and three payment confirmations —
+  // and a history each of them had to append would have holes in exactly the
+  // ones somebody forgot.
+  let t = await req('GET', `/order/${orderId}/tracking`, null, userToken);
+  assert('a customer can track their own order',
+    t.success === true && typeof t.data?.status === 'string', t.message);
+  assert('the timeline starts at the moment the order was placed',
+    (t.data.history || []).length > 0 && t.data.history[0].status === 'pending',
+    JSON.stringify((t.data.history || []).map((h) => h.status)));
+  assert('an order with a recorded journey says so',
+    t.data.historyRecorded === true);
+  // An empty map implies tracking that is not happening.
+  assert('no live location until something reports one',
+    t.data.liveLocation === null);
+
+  const before = (t.data.history || []).length;
+  await req('PUT', `/merchant/orders/${orderId}/status`,
+    { status: 'processing', reason: 'Started preparing' }, merchantToken);
+  t = await req('GET', `/order/${orderId}/tracking`, null, userToken);
+  assert('a status change is appended to the journey',
+    (t.data.history || []).length === before + 1);
+  const last = t.data.history[t.data.history.length - 1];
+  assert('the entry records the reason the merchant gave',
+    last.status === 'processing' && last.note === 'Started preparing',
+    JSON.stringify(last));
+  assert('the entry names the role that made the change, not the person',
+    last.by === 'merchant',
+    'a customer must not be handed staff names through their own order');
+
+  // ── Location ──
+  const loc = await req('PUT', `/merchant/orders/${orderId}/location`,
+    { lat: 36.8065, lng: 10.1815 }, merchantToken);
+  assert('a merchant can report where the delivery is', loc.success === true, loc.message);
+
+  // Out of range is a bug in the caller; storing it would put the customer's
+  // delivery in the middle of the ocean.
+  const badLat = await req('PUT', `/merchant/orders/${orderId}/location`,
+    { lat: 999, lng: 0 }, merchantToken);
+  assert('a latitude outside -90..90 is refused', badLat.status === 400);
+  const notNumber = await req('PUT', `/merchant/orders/${orderId}/location`,
+    { lat: 'north', lng: 0 }, merchantToken);
+  assert('a non-numeric coordinate is refused', notNumber.status === 400);
+
+  t = await req('GET', `/order/${orderId}/tracking`, null, userToken);
+  assert('the reported position reaches the customer',
+    t.data.liveLocation && t.data.liveLocation.lat === 36.8065);
+
+  // ── Estimate ──
+  const eta = await req('PUT', `/merchant/orders/${orderId}/eta`,
+    { estimatedDeliveryAt: new Date(Date.now() + 3600e3).toISOString() }, merchantToken);
+  assert('a merchant can give an estimated time', eta.success === true, eta.message);
+  const badEta = await req('PUT', `/merchant/orders/${orderId}/eta`,
+    { estimatedDeliveryAt: 'soon' }, merchantToken);
+  assert('an unparseable estimate is refused', badEta.status === 400);
+  // A merchant who no longer knows should be able to say so rather than
+  // leave a promise standing on the customer's screen.
+  const cleared = await req('PUT', `/merchant/orders/${orderId}/eta`,
+    { estimatedDeliveryAt: null }, merchantToken);
+  assert('an estimate can be cleared',
+    cleared.success === true && cleared.data.estimatedDeliveryAt === null);
+
+  // ── Privacy ──
+  const noToken = await req('GET', `/order/${orderId}/tracking`, null, null);
+  assert('tracking needs a token', noToken.status === 401);
+  const otherPerson = await req('GET', `/order/${orderId}/tracking`, null, merchantToken);
+  assert('an order can only be tracked by the customer who placed it',
+    otherPerson.status === 404, `status ${otherPerson.status}`);
+
+  // ── The platform still agrees with itself ──
+  // The tracker reads Order.status, the same field every report and dashboard
+  // reads. A second status field would have let the customer's screen and the
+  // admin console disagree about the same order.
+  const adminView = await req('GET', `/admin/orders/${orderId}`, null, adminToken);
+  const adminStatus = adminView.data?.order?.status || adminView.data?.status;
+  t = await req('GET', `/order/${orderId}/tracking`, null, userToken);
+  assert('the customer and the console report the same status',
+    adminStatus === t.data.status, `admin=${adminStatus} customer=${t.data.status}`);
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -2045,6 +2133,10 @@ async function runAll() {
     await testReferral();
     await testGiftSend();
     await testAdmin();
+    // After testAdmin: the cross-check below needs an admin token, and the
+    // whole point of it is that the customer's tracker and the console read
+    // the same status field.
+    await testOrderTracking();
     await testDashboards();
     testWiring();
     await testUserEditing();

@@ -1105,6 +1105,7 @@ router.put('/orders/:id/status', requirePermission('orders.update'), async (req,
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
 
+    order.$locals.statusBy = { id: req.user.id, role: 'admin', note: '' };
     order.status = status;
 
     const stamps = {
@@ -1151,6 +1152,7 @@ router.delete('/orders/:id', requirePermission('orders.cancel'), async (req, res
       });
     }
 
+    order.$locals.statusBy = { id: req.user.id, role: 'admin', note: reason || '' };
     order.status = 'cancelled';
     order.canceledAt = new Date();
     // Accept the reason from either place: the app's shared ApiService.delete

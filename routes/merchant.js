@@ -19,6 +19,35 @@ const express  = require('express');
 const mongoose = require('mongoose');
 const { authMiddleware } = require('../middleware/auth');
 
+/**
+ * Push an order update to the customer who placed it, over the chat socket.
+ *
+ * Reuses that connection rather than opening a second one: the customer app
+ * already holds it open, and a second socket would double the connections
+ * for one more kind of message. Delivered to the customer's own room, so an
+ * order update reaches them and nobody else.
+ *
+ * Never throws — a missed live update is a screen that refreshes a moment
+ * later, while a thrown error would fail the status change itself.
+ */
+function emitOrderUpdate(req, order, event, payload) {
+  try {
+    const io = req.app.get('io');
+    if (!io || !order.userId) return;
+    // `findMerchantOrder` populates userId, so this is a document, not an id.
+    // Stringifying it directly produced a room name nothing was listening on,
+    // and the push silently went nowhere.
+    const customerId = String(order.userId._id || order.userId);
+    io.to(customerId).emit(event, {
+      orderId: String(order._id),
+      status: order.status,
+      ...payload,
+    });
+  } catch (error) {
+    console.error('[ORDER] could not push live update:', error.message);
+  }
+}
+
 const User        = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Order       = require('../models/Order');
@@ -938,6 +967,9 @@ router.put('/orders/:id/status', async (req, res) => {
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
     const tsField = STATUS_TIMESTAMP[status];
+    // Read by the pre-save hook that writes the status history, so the
+    // customer's tracker can say who moved the order and why.
+    order.$locals.statusBy = { id: req.user.id, role: 'merchant', note: reason || '' };
     order.status = status;
     if (tsField) order[tsField] = new Date();
     if ((status === 'canceled' || status === 'cancelled') && typeof reason === 'string' && reason.trim()) {
@@ -972,6 +1004,12 @@ router.put('/orders/:id/status', async (req, res) => {
       order.paymentStatus = 'refunded';
     }
     await order.save();
+
+    // The customer's tracking screen updates without waiting for a refresh.
+    emitOrderUpdate(req, order, 'order-status', {
+      note: (reason || '').trim(),
+      at: new Date(),
+    });
 
     if (refundedPoints > 0) {
       await Transaction.create({
@@ -1494,6 +1532,84 @@ const stockLedgerHooks = {
 
 // Bulk product import. Mounted inside this router so it inherits the
 // merchant auth gate above rather than re-declaring it.
+/**
+ * PUT /api/merchant/orders/:id/location  { lat, lng }
+ *
+ * Where the delivery is right now. There is no driver app and no courier
+ * integration, so this is the merchant reporting their own position while
+ * they are out with an order — which is why it is not set automatically and
+ * why the customer's screen hides the section until it is.
+ */
+router.put('/orders/:id/location', async (req, res) => {
+  try {
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ success: false, message: 'lat and lng must be numbers.' });
+    }
+    // Rejected rather than stored: a coordinate outside these ranges is a
+    // bug in the caller, and putting it on a map would send the customer to
+    // the middle of the ocean.
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({
+        success: false,
+        message: 'lat must be between -90 and 90, lng between -180 and 180.',
+      });
+    }
+
+    const order = await findMerchantOrder(req.params.id, req.user.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    order.deliveryLocation = { lat, lng, updatedAt: new Date() };
+    await order.save();
+
+    emitOrderUpdate(req, order, 'order-location', {
+      liveLocation: { lat, lng, updatedAt: order.deliveryLocation.updatedAt },
+    });
+
+    res.json({
+      success: true,
+      message: 'Location updated.',
+      data: { liveLocation: order.deliveryLocation },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** PUT /api/merchant/orders/:id/eta  { estimatedDeliveryAt } */
+router.put('/orders/:id/eta', async (req, res) => {
+  try {
+    const raw = req.body.estimatedDeliveryAt;
+    // An explicit null clears it — a merchant who no longer knows should be
+    // able to say so rather than leave a promise on the customer's screen.
+    if (raw === null) {
+      const cleared = await findMerchantOrder(req.params.id, req.user.id);
+      if (!cleared) return res.status(404).json({ success: false, message: 'Order not found' });
+      cleared.estimatedDeliveryAt = null;
+      await cleared.save();
+      emitOrderUpdate(req, cleared, 'order-eta', { estimatedDeliveryAt: null });
+      return res.json({ success: true, message: 'Estimate cleared.', data: { estimatedDeliveryAt: null } });
+    }
+
+    const at = new Date(raw);
+    if (isNaN(at)) {
+      return res.status(400).json({ success: false, message: 'estimatedDeliveryAt must be a date.' });
+    }
+
+    const order = await findMerchantOrder(req.params.id, req.user.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    order.estimatedDeliveryAt = at;
+    await order.save();
+    emitOrderUpdate(req, order, 'order-eta', { estimatedDeliveryAt: at });
+
+    res.json({ success: true, message: 'Estimate set.', data: { estimatedDeliveryAt: at } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.use('/products/import', require('./merchant_import'));
 
 router.use('/stock',     crudRouter(Stock, 'createdAt', stockLedgerHooks));

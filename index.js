@@ -198,7 +198,10 @@ mongoose
     // extra service. Identity comes from the JWT on the handshake.
     // Same origin policy as the REST API above, so the socket is not a
     // looser door into the same data than the endpoints beside it.
-    setupChatServer(server);
+    const io = setupChatServer(server);
+    // Reachable from any route via req.app.get('io') — an order status change
+    // pushes to the customer over the same connection the chat already uses.
+    app.set('io', io);
     console.log('💬 Chat socket ready on /socket.io');
   })
   .catch(err => {
