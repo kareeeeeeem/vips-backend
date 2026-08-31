@@ -2033,6 +2033,56 @@ async function testChat() {
 // clean 500 on every cancellation), and the merchants dashboard silently
 // dropped revenue belonging to no merchant, so it disagreed with the sales
 // dashboard about the same window.
+// ─── FLOW 23: The merchant's delivery estimate ───────────────────────
+//
+// The endpoint existed and was tested before the merchant app could reach
+// it. What was untested is the round trip: toMerchantJSON did not carry
+// estimatedDeliveryAt, so the screen that sets the value could not read it
+// back and every order looked like it had no estimate.
+async function testDeliveryEstimate() {
+  console.log('\n⏱  FLOW 23: Delivery estimate');
+  if (!merchantToken || !orderId) return assert('estimate prerequisites', false);
+
+  const before = await req('GET', `/merchant/orders/${orderId}`, null, merchantToken);
+  assert('an order with no estimate says so rather than omitting the field',
+    before.estimated_delivery_at === null,
+    JSON.stringify(before.estimated_delivery_at));
+
+  const at = new Date(Date.now() + 45 * 60 * 1000);
+  const set = await req('PUT', `/merchant/orders/${orderId}/eta`,
+    { estimatedDeliveryAt: at.toISOString() }, merchantToken);
+  assert('a merchant can set an estimate', set.success === true, set.message);
+
+  const after = await req('GET', `/merchant/orders/${orderId}`, null, merchantToken);
+  assert('the estimate survives the round trip to the merchant screen',
+    after.estimated_delivery_at === at.toISOString(),
+    `${after.estimated_delivery_at} vs ${at.toISOString()}`);
+
+  // The whole point of the field: the customer sees the promise.
+  const tracking = await req('GET', `/order/${orderId}/tracking`, null, userToken);
+  assert('the customer is shown the same estimate',
+    new Date(tracking.data.estimatedDeliveryAt).toISOString() === at.toISOString(),
+    JSON.stringify(tracking.data.estimatedDeliveryAt));
+
+  const bad = await req('PUT', `/merchant/orders/${orderId}/eta`,
+    { estimatedDeliveryAt: 'not a date' }, merchantToken);
+  assert('a value that is not a date is refused', bad.status === 400, `${bad.status}`);
+
+  const cleared = await req('PUT', `/merchant/orders/${orderId}/eta`,
+    { estimatedDeliveryAt: null }, merchantToken);
+  assert('an estimate can be cleared', cleared.success === true, cleared.message);
+
+  const gone = await req('GET', `/merchant/orders/${orderId}`, null, merchantToken);
+  assert('clearing it really clears it', gone.estimated_delivery_at === null,
+    JSON.stringify(gone.estimated_delivery_at));
+
+  // Another merchant's order is not this merchant's to promise about.
+  const foreign = await req('PUT', '/merchant/orders/999999999/eta',
+    { estimatedDeliveryAt: at.toISOString() }, merchantToken);
+  assert('an order that is not yours cannot be given an estimate',
+    foreign.status === 404 || foreign.status === 400, `${foreign.status}`);
+}
+
 async function testAdminOrderCancel() {
   console.log('\n🚫 FLOW 22: Admin cancellation & board reconciliation');
   if (!adminToken || !userId) return assert('cancellation prerequisites', false);
@@ -2209,6 +2259,7 @@ async function runAll() {
     await testUserEditing();
     await testAuditLog();
     await testAnalytics();
+    await testDeliveryEstimate();
     await testAdminOrderCancel();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);

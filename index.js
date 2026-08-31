@@ -6,6 +6,21 @@ const mongoose = require('mongoose');
 
 dotenv.config();
 
+// ─── Required configuration ───────────────────────────────
+// Booting without these does not fail here — it fails later, per request, as
+// a 500 that looks like a bug in whatever endpoint happened to be called
+// first. JWT_SECRET missing is the worst of them: jwt.sign throws on every
+// login, so the platform looks broken rather than misconfigured.
+const REQUIRED_ENV = ['MONGODB_URI', 'JWT_SECRET'];
+const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missingEnv.length) {
+  console.error(`❌ Missing required environment variable(s): ${missingEnv.join(', ')}`);
+  console.error('   Set them in .env (local) or the service environment (Render), then restart.');
+  process.exit(1);
+}
+
+const STARTED_AT = new Date().toISOString();
+
 const app = express();
 
 // ─── Middleware ────────────────────────────────────────────
@@ -37,8 +52,68 @@ const rateLimit = (maxRequests, windowMs) => (req, res, next) => {
   next();
 };
 
+// Entries are pruned when their key is hit again, but a key that is never hit
+// again is never pruned — one map entry per IP that ever touched a limited
+// route, held for the life of the process. On a long-running dyno that only
+// grows. Sweep hourly for anything with no request in the last hour.
+const RATE_LIMIT_TTL = 60 * 60 * 1000;
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_TTL;
+  for (const [key, times] of rateLimitMap) {
+    if (!times.length || times[times.length - 1] < cutoff) rateLimitMap.delete(key);
+  }
+}, RATE_LIMIT_TTL).unref();
+
 // Apply rate limiting to auth endpoints (10 requests per minute)
 app.use('/api/auth', rateLimit(10, 60000));
+
+// The admin console signs in at /api/admin/login, which is NOT under
+// /api/auth and so was not covered by the limiter above — the one endpoint
+// on the platform that hands out a super_admin token accepted unlimited
+// password guesses.
+//
+// Keyed on the account being attacked, not just the source address. Brute
+// force targets one account, so that is what has to be capped; keying on IP
+// alone would also mean a shop with several admins behind one connection, or
+// a CI run, locks its own people out after eight sign-ins between them. The
+// looser per-IP cap on top is what stops one address spraying one password
+// across many accounts.
+const adminLoginLimits = { perAccount: [6, 5 * 60 * 1000], perAddress: [40, 5 * 60 * 1000] };
+const adminLoginAttempts = new Map();
+
+app.use('/api/admin/login', (req, res, next) => {
+  const now = Date.now();
+  const email = String(req.body?.email || '').toLowerCase().trim();
+  const buckets = [
+    ['ip:' + req.ip, ...adminLoginLimits.perAddress],
+    ...(email ? [[`acct:${req.ip}:${email}`, ...adminLoginLimits.perAccount]] : []),
+  ];
+
+  for (const [key, max, windowMs] of buckets) {
+    const hits = (adminLoginAttempts.get(key) || []).filter((t) => t > now - windowMs);
+    if (hits.length >= max) {
+      return res.status(429).json({
+        success: false,
+        message: 'Too many sign-in attempts. Please wait a few minutes and try again.',
+      });
+    }
+  }
+  // Only recorded once the caller is known to be under every cap, so a
+  // blocked attempt does not extend its own lockout indefinitely.
+  for (const [key, , windowMs] of buckets) {
+    const hits = (adminLoginAttempts.get(key) || []).filter((t) => t > now - windowMs);
+    hits.push(now);
+    adminLoginAttempts.set(key, hits);
+  }
+  next();
+});
+
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_TTL;
+  for (const [key, times] of adminLoginAttempts) {
+    if (!times.length || times[times.length - 1] < cutoff) adminLoginAttempts.delete(key);
+  }
+}, RATE_LIMIT_TTL).unref();
 
 // ═══════════════════════════════════════════════════════════
 // USER-SIDE ROUTES
@@ -153,6 +228,18 @@ app.get('/api/health', (req, res) => {
     status:    'ok',
     message:   'VIPs Backend is running',
     timestamp: new Date().toISOString(),
+    // Which build is actually serving. Without this there is no way to tell a
+    // deployed change from an unchanged one short of holding an admin
+    // credential: every path under /api/admin answers 401 before routing, so
+    // probing for a new endpoint proves nothing. Render sets RENDER_GIT_COMMIT
+    // itself; locally this falls back to the package version.
+    build: {
+      commit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'local',
+      branch: process.env.RENDER_GIT_BRANCH || null,
+      version: require('./package.json').version,
+      startedAt: STARTED_AT,
+      env: process.env.NODE_ENV || 'development',
+    },
     db: {
       readyState: dbReadyState,
       status:     dbStates[dbReadyState] || 'unknown',
@@ -169,11 +256,21 @@ app.get('/api/health', (req, res) => {
 
 // ─── Global Error Handler ─────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error('❌ Error:', err.message);
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || 'Internal Server Error',
-  });
+  const status = err.status || 500;
+  // Always log the real thing.
+  console.error(`❌ Error: ${req.method} ${req.originalUrl} →`, err.message);
+
+  // A 4xx message describes what the caller did wrong and is safe to return.
+  // A 5xx message is whatever threw — a Mongoose validation dump, a driver
+  // error carrying the connection string, an internal path — and none of that
+  // belongs in a response to the public. Generic in production only, so local
+  // debugging still shows the cause.
+  const safe =
+    status < 500 || process.env.NODE_ENV !== 'production'
+      ? err.message || 'Internal Server Error'
+      : 'Internal Server Error';
+
+  res.status(status).json({ success: false, message: safe });
 });
 
 // ─── Database & Server ────────────────────────────────────

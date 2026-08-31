@@ -186,6 +186,10 @@ orderSchema.methods.toMerchantJSON = function (merchantUser) {
     updated_at:           o.updatedAt?.toISOString()  || null,
     delivery_charge:      o.deliveryCharge || 0,
     schedule_at:          o.scheduleAt?.toISOString() || null,
+    // The merchant's own promise, set from the order detail screen. Without
+    // it here the screen that writes this value cannot read it back, and
+    // every order looks like it has no estimate.
+    estimated_delivery_at: o.estimatedDeliveryAt?.toISOString() || null,
     otp:                  o.otp           || '',
     pending:              o.pendingAt?.toISOString()         || null,
     accepted:             o.confirmedAt?.toISOString()       || null,
