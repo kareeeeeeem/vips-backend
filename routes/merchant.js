@@ -1560,7 +1560,7 @@ router.post('/products', async (req, res) => {
 // `merchantId` (handing their product to another account) or overwrite the
 // `comments` array wholesale.
 const PRODUCT_UPDATABLE = [
-  'name', 'code', 'description', 'price', 'discountPrice', 'image',
+  'name', 'code', 'description', 'price', 'discountPrice', 'costPrice', 'image',
   'category', 'inStock', 'isActive', 'isFeature', 'hasVariants', 'stock',
   'vat', 'taxMethod', 'productType', 'alertQty',
 ];

@@ -608,11 +608,82 @@ async function testAdmin() {
     Array.isArray(alerts.data?.products));
 
   // ── Reports ──
-  for (const name of ['sales', 'users', 'merchants', 'orders']) {
+  for (const name of ['sales', 'profit', 'products', 'customers', 'merchants', 'orders', 'commission']) {
     const report = await req('GET', `/admin/reports/${name}`, null, adminToken);
     assert(`${name} report returns a summary`,
-      report.success === true && typeof report.data?.summary === 'object');
+      report.success === true && typeof report.data?.summary === 'object',
+      report.message);
   }
+
+  // Sales must count till takings as well as online orders, or POS revenue
+  // is invisible in every money figure.
+  const salesReport = await req('GET', '/admin/reports/sales', null, adminToken);
+  assert('the sales report separates online and POS revenue',
+    typeof salesReport.data?.summary?.onlineRevenue === 'number' &&
+    typeof salesReport.data?.summary?.posRevenue === 'number' &&
+    salesReport.data.summary.revenue ===
+      Number((salesReport.data.summary.onlineRevenue +
+              salesReport.data.summary.posRevenue).toFixed(3)),
+    JSON.stringify(salesReport.data?.summary));
+
+  for (const groupBy of ['day', 'week', 'month', 'year']) {
+    const grouped = await req('GET', `/admin/reports/sales?groupBy=${groupBy}`, null, adminToken);
+    assert(`sales can be grouped by ${groupBy}`,
+      grouped.success === true && grouped.data?.groupBy === groupBy);
+  }
+
+  const badGroup = await req('GET', '/admin/reports/sales?groupBy=fortnight', null, adminToken);
+  assert('an unknown groupBy falls back to day rather than erroring',
+    badGroup.success === true && badGroup.data?.groupBy === 'day');
+
+  // The profit report must never present a margin it cannot back up.
+  const profit = await req('GET', '/admin/reports/profit', null, adminToken);
+  const ps = profit.data?.summary || {};
+  assert('profit reports how much of revenue has a known cost',
+    typeof ps.costCoverage === 'number' && ps.costCoverage >= 0 && ps.costCoverage <= 100,
+    `coverage ${ps.costCoverage}`);
+  assert('the margin is computed over costed revenue, not all revenue',
+    ps.costedRevenue <= ps.revenue &&
+    (ps.costedRevenue === 0
+      ? ps.margin === 0
+      : Math.abs(ps.margin - (ps.grossProfit / ps.costedRevenue) * 100) < 0.01),
+    JSON.stringify(ps));
+
+  // Commission explains a small total instead of letting it read as bad sales.
+  const commission = await req('GET', '/admin/reports/commission', null, adminToken);
+  const cs = commission.data?.summary || {};
+  assert('commission reports how many merchants are on a zero rate',
+    typeof cs.merchantsOnZeroRate === 'number' &&
+    typeof cs.merchantsWithRateSet === 'number');
+  assert('commission never exceeds the revenue it is taken from',
+    cs.commission <= cs.revenue &&
+    Math.abs((cs.commission + cs.merchantEarnings) - cs.revenue) < 0.01,
+    JSON.stringify(cs));
+
+  // Export
+  const csv = await (async () => {
+    const { default: fetch } = await import('node-fetch').catch(() => ({ default: globalThis.fetch }));
+    const r = await fetch(`${BASE_URL}/admin/reports/export?type=commission&format=csv`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    return { status: r.status, type: r.headers.get('content-type'),
+             disposition: r.headers.get('content-disposition'), body: await r.text() };
+  })();
+  assert('CSV export returns a downloadable file',
+    csv.status === 200 &&
+    (csv.type || '').includes('text/csv') &&
+    (csv.disposition || '').includes('attachment'),
+    `${csv.status} ${csv.type}`);
+  assert('the CSV has a header row and quoted fields',
+    csv.body.includes('"Merchant"') && csv.body.includes('"Commission (TND)"'),
+    csv.body.slice(0, 120));
+
+  const badExport = await req('GET', '/admin/reports/export?type=nonsense', null, adminToken);
+  assert('an unknown export type is rejected', badExport.status === 400);
+
+  const pdfExport = await req('GET', '/admin/reports/export?type=sales&format=pdf', null, adminToken);
+  assert('PDF export says so plainly rather than returning a mislabelled CSV',
+    pdfExport.status === 400 && /csv/i.test(pdfExport.message || ''));
 
   // ── Top bar: notifications and global search ──
   const notifications = await req('GET', '/admin/notifications', null, adminToken);
