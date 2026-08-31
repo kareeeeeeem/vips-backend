@@ -1165,6 +1165,293 @@ async function testAdmin() {
   }
 }
 
+// ─── FLOW 12: Analytical dashboards ──────────────────────────
+async function testDashboards() {
+  console.log('\n📊 FLOW 12: Analytical Dashboards');
+  if (!adminToken) return assert('admin token available for dashboards', false);
+
+  const BOARDS = ['sales', 'operations', 'finance', 'marketing', 'merchants'];
+
+  for (const name of BOARDS) {
+    const board = await req('GET', `/admin/dashboards/${name}`, null, adminToken);
+    assert(`the ${name} dashboard returns figures and its window`,
+      board.success === true && board.data && typeof board.data.window === 'object' &&
+      typeof board.data.window.groupBy === 'string',
+      board.message);
+  }
+
+  // ── The window ──
+  for (const [period, groupBy] of [
+    ['today', 'hour'], ['day', 'hour'], ['week', 'day'],
+    ['month', 'day'], ['year', 'month'],
+  ]) {
+    const r = await req('GET', `/admin/dashboards/sales?period=${period}`, null, adminToken);
+    assert(`period=${period} groups by ${groupBy}`,
+      r.data?.window?.groupBy === groupBy,
+      `got ${r.data?.window?.groupBy}`);
+  }
+
+  const unknownPeriod = await req('GET', '/admin/dashboards/sales?period=fortnight',
+    null, adminToken);
+  assert('an unknown period falls back rather than erroring',
+    unknownPeriod.success === true && unknownPeriod.data?.window?.period === 'month');
+
+  // An unparseable custom range must not become { $gte: Invalid Date }, which
+  // matches nothing and would show an empty board as if there were no sales.
+  const badRange = await req('GET',
+    '/admin/dashboards/sales?period=custom&startDate=banana', null, adminToken);
+  assert('an unparseable custom range falls back to the default window',
+    badRange.success === true && badRange.data?.window?.period === 'month',
+    JSON.stringify(badRange.data?.window));
+
+  const custom = await req('GET',
+    '/admin/dashboards/sales?startDate=2026-08-01&endDate=2026-08-15', null, adminToken);
+  assert('a custom range is honoured and reported back',
+    custom.data?.window?.period === 'custom' &&
+    custom.data.window.startDate.startsWith('2026-08-01') &&
+    // Inclusive end date: 2026-08-15 must cover all of that day.
+    new Date(custom.data.window.endDate).getTime() >
+      new Date('2026-08-15T00:00:00.000Z').getTime(),
+    JSON.stringify(custom.data?.window));
+
+  assert('the window names the baseline it compares against',
+    typeof custom.data?.window?.comparedWith?.startDate === 'string' &&
+    new Date(custom.data.window.comparedWith.endDate) <=
+      new Date(custom.data.window.startDate));
+
+  // ── Charts are continuous and reconcile with their headline ──
+  const chartChecks = [
+    ['sales', 'salesChart', 'totalRevenue'],
+    ['sales', 'dailyTrend', 'totalRevenue'],
+    ['finance', 'revenueChart', 'totalRevenue'],
+  ];
+  for (const [board, series, total] of chartChecks) {
+    const r = await req('GET', `/admin/dashboards/${board}?period=month`, null, adminToken);
+    const points = r.data?.[series] || [];
+    const labels = points.map((p) => p.date);
+    const sum = Number(points.reduce((acc, p) => acc + p.value, 0).toFixed(3));
+    assert(`${board}.${series} has no duplicate buckets`,
+      labels.length === new Set(labels).size);
+    // A $group omits empty periods, so a line chart would join 19 August to
+    // 25 August as if consecutive. Zero-filling is what makes the axis honest.
+    assert(`${board}.${series} fills quiet periods rather than skipping them`,
+      points.length >= 28, `${points.length} buckets for a 30-day window`);
+    assert(`${board}.${series} sums to ${total}`,
+      Math.abs(sum - r.data[total]) < 0.01, `${sum} vs ${r.data[total]}`);
+  }
+
+  const weekly = await req('GET',
+    '/admin/dashboards/sales?startDate=2026-03-05&endDate=2026-08-31', null, adminToken);
+  const weekLabels = (weekly.data?.salesChart || []).map((p) => p.date);
+  assert('ISO week buckets are generated the way Mongo labels them',
+    weekly.data?.window?.groupBy === 'week' &&
+    weekLabels.length === new Set(weekLabels).size &&
+    weekLabels.every((l) => /^\d{4}-W\d{2}$/.test(l)) &&
+    Math.abs(
+      Number((weekly.data.salesChart.reduce((a, p) => a + p.value, 0)).toFixed(3)) -
+      weekly.data.totalRevenue
+    ) < 0.01,
+    weekLabels.slice(0, 3).join(','));
+
+  // ── Figures the platform cannot back up ──
+  const sales = await req('GET', '/admin/dashboards/sales', null, adminToken);
+  assert('conversion rate is reported as untracked, not invented',
+    sales.data?.conversionRate === null &&
+    typeof sales.data?.conversionRateNote === 'string' &&
+    sales.data.conversionRateNote.length > 0);
+
+  assert('revenue splits into online and counter takings that add up',
+    Math.abs((sales.data.onlineRevenue + sales.data.posRevenue) -
+             sales.data.totalRevenue) < 0.01,
+    JSON.stringify({ o: sales.data.onlineRevenue, p: sales.data.posRevenue,
+                     t: sales.data.totalRevenue }));
+
+  // Order lines with no product id must not collapse into one fictional
+  // product holding the summed revenue of several real ones.
+  assert('the product ranking never invents a merged product',
+    Array.isArray(sales.data.topProducts) &&
+    sales.data.topProducts.every((p) => p.name && p.name !== 'name:') &&
+    typeof sales.data.unattributedRevenue === 'number');
+
+  // A ranking that read online orders alone would leave a merchant who sells
+  // mostly over the counter absent from a list sitting directly beneath a
+  // total that counted them.
+  const tillOnly = await req('GET', '/admin/dashboards/sales?period=today', null, adminToken);
+  assert('the merchant ranking counts counter sales as well as online orders',
+    tillOnly.data.posRevenue === 0 ||
+    (tillOnly.data.topMerchants || []).length > 0,
+    `pos ${tillOnly.data.posRevenue} but ${(tillOnly.data.topMerchants || []).length} merchants ranked`);
+  assert('no merchant is ranked above the revenue the window recorded',
+    (sales.data.topMerchants || [])
+      .every((m) => m.revenue <= sales.data.totalRevenue + 0.01));
+
+  assert('every change is a number or an explicit null, never a fake zero',
+    Object.values(sales.data.change || {})
+      .every((v) => v === null || typeof v === 'number'));
+
+  const operations = await req('GET', '/admin/dashboards/operations', null, adminToken);
+  const od = operations.data || {};
+  const statusTotal = (od.orderStatusDistribution || [])
+    .reduce((sum, s) => sum + s.count, 0);
+  assert('the status breakdown accounts for every order in the window',
+    statusTotal === od.totalOrders, `${statusTotal} vs ${od.totalOrders}`);
+  assert('the queue stages never exceed the order count',
+    od.pendingOrders + od.inProgressOrders + od.completedOrders + od.cancelledOrders
+      <= od.totalOrders);
+  assert('fulfilment time is null when nothing was delivered, never zero',
+    od.fulfillmentSampleSize > 0
+      ? typeof od.averageFulfillmentTime === 'number'
+      : od.averageFulfillmentTime === null,
+    `sample ${od.fulfillmentSampleSize}, value ${od.averageFulfillmentTime}`);
+
+  const finance = await req('GET', '/admin/dashboards/finance', null, adminToken);
+  const fd = finance.data || {};
+  assert('the margin is computed over costed revenue, not all revenue',
+    fd.costedRevenue <= fd.totalRevenue &&
+    (fd.costedRevenue === 0
+      ? fd.margin === 0
+      : Math.abs(fd.margin - (fd.totalProfit / fd.costedRevenue) * 100) < 0.01),
+    JSON.stringify({ c: fd.costedRevenue, r: fd.totalRevenue, m: fd.margin }));
+  assert('cost coverage says how much of revenue the margin describes',
+    typeof fd.costCoverage === 'number' &&
+    fd.costCoverage >= 0 && fd.costCoverage <= 100);
+  assert('commission never exceeds the revenue it is taken from',
+    fd.totalCommissions <= fd.totalRevenue + 0.01);
+  assert('commission by category adds up to the commission total',
+    Math.abs((fd.commissionBreakdown || []).reduce((s, c) => s + c.amount, 0) -
+             fd.totalCommissions) < 0.01);
+
+  const marketing = await req('GET', '/admin/dashboards/marketing', null, adminToken);
+  const md = marketing.data || {};
+  assert('churn is null out of an empty cohort rather than 0%',
+    md.churnBaseline > 0
+      ? typeof md.churnRate === 'number'
+      : md.churnRate === null,
+    `baseline ${md.churnBaseline}, rate ${md.churnRate}`);
+  assert('churn states what it counted',
+    typeof md.churnDefinition === 'string' && md.churnDefinition.length > 0);
+  // Every customer lands in exactly one segment, so the pie cannot
+  // double-count anyone or leave anyone out.
+  const segmentTotal = (md.customerSegments || []).reduce((s, x) => s + x.count, 0);
+  assert('the customer segments partition the customer base exactly once',
+    segmentTotal === md.totalCustomers, `${segmentTotal} vs ${md.totalCustomers}`);
+
+  const merchants = await req('GET', '/admin/dashboards/merchants', null, adminToken);
+  const rd = merchants.data || {};
+  assert('an unrated merchant carries null, not a zero rating',
+    (rd.merchantPerformance || []).every((m) =>
+      m.rating === null ? m.ratedOrders === 0 : m.rating > 0));
+  assert('cancellation rates are real percentages',
+    (rd.merchantPerformance || []).every((m) =>
+      m.cancellationRate >= 0 && m.cancellationRate <= 100));
+  assert('merchants who sold nothing are counted rather than hidden',
+    typeof rd.idleMerchants === 'number' &&
+    rd.sellingMerchants + rd.idleMerchants === rd.totalMerchants,
+    JSON.stringify({ s: rd.sellingMerchants, i: rd.idleMerchants, t: rd.totalMerchants }));
+
+  // ── Permissions ──
+  const roleToken = async (role) => {
+    const email = `dash_${role}_${ts}@vips.test`;
+    await req('POST', '/admin/staff', {
+      fullName: `Dash ${role}`,
+      email,
+      phone: `9${String(ts + role.length).slice(-10)}`.slice(0, 12),
+      password: 'DashPass1234',
+      adminRole: role,
+    }, adminToken);
+    const login = await req('POST', '/admin/login', { email, password: 'DashPass1234' });
+    return login.data?.token;
+  };
+
+  const dashCashier = await roleToken('cashier');
+  const dashViewer = await roleToken('viewer');
+  assert('dashboard test roles can sign in', !!dashCashier && !!dashViewer);
+
+  // A till operator must not be able to read the platform's margin,
+  // commission or customer base off a dashboard.
+  for (const board of ['sales', 'finance', 'marketing', 'merchants']) {
+    const r = await req('GET', `/admin/dashboards/${board}`, null, dashCashier);
+    assert(`a cashier cannot open the ${board} dashboard`, r.status === 403,
+      `status ${r.status}`);
+  }
+  const cashierOps = await req('GET', '/admin/dashboards/operations', null, dashCashier);
+  assert('a cashier can open the operations dashboard', cashierOps.success === true,
+    cashierOps.message);
+
+  for (const board of BOARDS) {
+    const r = await req('GET', `/admin/dashboards/${board}`, null, dashViewer);
+    assert(`a viewer can read the ${board} dashboard`, r.success === true, r.message);
+  }
+  const viewerDashExport = await req('GET',
+    '/admin/dashboards/sales/export?format=csv', null, dashViewer);
+  assert('a viewer cannot export a dashboard', viewerDashExport.status === 403,
+    `status ${viewerDashExport.status}`);
+
+  // ── Export ──
+  const fetchCsv = async (path, token) => {
+    const { default: f } = await import('node-fetch').catch(
+      () => ({ default: globalThis.fetch }));
+    const r = await f(`${BASE_URL}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+    return { status: r.status, type: r.headers.get('content-type'),
+             disposition: r.headers.get('content-disposition'), body: await r.text() };
+  };
+
+  const EXPECTED_HEADER = {
+    sales: '"Product"',
+    operations: '"Status"',
+    finance: '"Category"',
+    marketing: '"Customer"',
+    merchants: '"Merchant"',
+  };
+  for (const board of BOARDS) {
+    const csv = await fetchCsv(`/admin/dashboards/${board}/export?format=csv`, adminToken);
+    assert(`the ${board} dashboard exports a downloadable CSV`,
+      csv.status === 200 && (csv.type || '').includes('text/csv') &&
+      (csv.disposition || '').includes('attachment') &&
+      csv.body.includes(EXPECTED_HEADER[board]),
+      `${csv.status} ${csv.type} ${csv.body.slice(0, 60)}`);
+  }
+
+  const dashPdf = await req('GET', '/admin/dashboards/sales/export?format=pdf',
+    null, adminToken);
+  assert('dashboard PDF export says so plainly rather than mislabelling a CSV',
+    dashPdf.status === 400 && /csv/i.test(dashPdf.message || ''));
+
+  // Login must answer with the same role and permissions /me does. Without
+  // them the console cannot tell what the operator may do, and hides every
+  // gated control for the whole session after signing in.
+  const cashierLogin = await req('POST', '/admin/login',
+    { email: `dash_cashier_${ts}@vips.test`, password: 'DashPass1234' });
+  assert('login returns the caller\'s role and effective permissions',
+    cashierLogin.data?.adminRole === 'cashier' &&
+    Array.isArray(cashierLogin.data?.permissions) &&
+    cashierLogin.data.permissions.includes('dashboard.read') &&
+    cashierLogin.data.permissions.includes('pos.open_session') &&
+    !cashierLogin.data.permissions.includes('reports.read'),
+    JSON.stringify({ role: cashierLogin.data?.adminRole,
+                     count: (cashierLogin.data?.permissions || []).length }));
+
+  const meEnvelope = await req('GET', '/admin/me', null, dashCashier);
+  assert('login and /me agree on the permission set',
+    JSON.stringify((cashierLogin.data?.permissions || []).slice().sort()) ===
+    JSON.stringify((meEnvelope.data?.permissions || []).slice().sort()));
+
+  const dashUnknown = await req('GET', '/admin/dashboards/nonsense/export',
+    null, adminToken);
+  assert('an unknown dashboard export is rejected', dashUnknown.status === 400);
+
+  // The bootstrap script and the permissions module must agree on the role
+  // list, or a role the console fully understands cannot be created at all.
+  const { ROLES } = require('../middleware/permissions');
+  const createAdminSource = require('fs')
+    .readFileSync(require('path').join(__dirname, '../scripts/create-admin.js'), 'utf8');
+  assert('create-admin.js accepts every role the permissions module defines',
+    !/const ROLES = \[/.test(createAdminSource) &&
+    createAdminSource.includes("require('../middleware/permissions')") &&
+    ROLES.includes('cashier'),
+    'the script keeps its own copy of the role list');
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -1183,6 +1470,7 @@ async function runAll() {
     await testReferral();
     await testGiftSend();
     await testAdmin();
+    await testDashboards();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }

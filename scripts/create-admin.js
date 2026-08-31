@@ -40,7 +40,10 @@ const parseArgs = () => {
   const phone    = (args.phone || '').trim();
   const adminRole = args.role || 'super_admin';
 
-  const ROLES = ['super_admin', 'admin', 'manager', 'viewer'];
+  // Read from the permissions module rather than repeated here: a hardcoded
+  // copy is how `cashier` came to exist as a role the console understood but
+  // this script refused to create.
+  const { ROLES } = require('../middleware/permissions');
   if (!ROLES.includes(adminRole)) {
     console.error(`--role must be one of: ${ROLES.join(', ')}`);
     process.exit(1);

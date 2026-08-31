@@ -132,7 +132,16 @@ router.post('/login', async (req, res) => {
     res.json({
       success: true,
       message: 'Login successful!',
-      data: { user: user.toJSON(), token },
+      // The same envelope /me returns. Without the role and the effective
+      // permissions here, the console has no idea what the operator may do
+      // until something happens to call /me — so every permission-gated
+      // control stays hidden for the whole first session after signing in.
+      data: {
+        user: user.toJSON(),
+        token,
+        adminRole: user.adminRole,
+        permissions: permissionsFor(user),
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -1532,6 +1541,16 @@ router.get('/inventory/alerts', requirePermission('inventory.read'), async (req,
 // share a set of revenue/date helpers now lifted into utils/adminHelpers.js
 // so both files answer "what counts as revenue" the same way.
 router.use('/reports', require('./admin_reports'));
+
+// ═══════════════════════════════════════════════════════════
+// ANALYTICAL DASHBOARDS
+// ═══════════════════════════════════════════════════════════
+// Five read models over the same collections the reports read, sharing their
+// revenue rules from utils/adminHelpers so a dashboard can never disagree
+// with the report behind it. Each dashboard carries its own permission gate:
+// the operations board is shift-level and sits behind dashboard.read, the
+// four that aggregate platform money and customers need reports.read.
+router.use('/dashboards', require('./admin_dashboards'));
 
 // ═══════════════════════════════════════════════════════════
 // TOP-BAR: NOTIFICATIONS AND GLOBAL SEARCH
