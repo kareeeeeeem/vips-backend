@@ -1722,6 +1722,37 @@ router.get('/staff', requirePermission('staff.read'), async (req, res) => {
   }
 });
 
+/**
+ * GET /api/admin/staff/:id — one console operator.
+ *
+ * Registered after GET /staff so the literal path is matched first; a bare
+ * `:id` here would otherwise swallow it.
+ */
+router.get('/staff/:id', requirePermission('staff.read'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+
+    const staff = await User.findOne({ _id: req.params.id, role: 'admin' })
+      .select('fullName email phone adminRole permissions isActive isVerified createdAt lastLogin')
+      .lean();
+    if (!staff) return res.status(404).json({ success: false, message: 'Admin not found.' });
+
+    res.json({
+      success: true,
+      message: 'Console operator',
+      data: {
+        staff,
+        // What the role grants plus any extras, so the detail screen shows
+        // what this person can actually do rather than only the extras.
+        effectivePermissions: permissionsFor(staff),
+        rolePermissions: ROLE_PERMISSIONS[staff.adminRole] || [],
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 /** POST /api/admin/staff — create a console operator. */
 router.post('/staff', requirePermission('staff.write'), async (req, res) => {
   try {
