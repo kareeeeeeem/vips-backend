@@ -909,12 +909,23 @@ async function testAdmin() {
     typeof profile.data?.adminRole === 'string' && Array.isArray(profile.data?.permissions));
 
   const catalogue = await req('GET', '/admin/permissions', null, adminToken);
-  assert('the permission catalogue covers 10 modules and 5 roles',
+  // Asserted against the module itself rather than a number written here: a
+  // hardcoded count fails every time a module is added, which trains whoever
+  // sees it to bump the number instead of checking what changed.
+  const perms = require('../middleware/permissions');
+  assert('the API serves exactly the catalogue the permissions module defines',
     catalogue.success === true &&
-    catalogue.data?.modules?.length === 10 &&
-    catalogue.data?.builtInRoles?.length === 5 &&
-    catalogue.data.permissions.length === 47,
-    `${catalogue.data?.modules?.length} modules, ${catalogue.data?.builtInRoles?.length} roles, ${catalogue.data?.permissions?.length} permissions`);
+    catalogue.data?.modules?.length === perms.MODULES.length &&
+    catalogue.data?.builtInRoles?.length === perms.ROLES.length &&
+    catalogue.data.permissions.length === perms.ALL_PERMISSIONS.length,
+    `${catalogue.data?.modules?.length}/${perms.MODULES.length} modules, ` +
+    `${catalogue.data?.builtInRoles?.length}/${perms.ROLES.length} roles, ` +
+    `${catalogue.data?.permissions?.length}/${perms.ALL_PERMISSIONS.length} permissions`);
+
+  assert('every module contributes at least one permission',
+    perms.MODULES.every((m) =>
+      perms.ALL_PERMISSIONS.some((p) => p.startsWith(`${m}.`))),
+    'a module with no actions would show as an empty column in the matrix');
 
   assert('every permission carries a label and an enforcement flag',
     (catalogue.data?.catalogue || []).every(
@@ -1683,6 +1694,92 @@ async function testAuditLog() {
   }
 }
 
+// ─── FLOW 16: Analytics ─────────────────────────────────────
+async function testAnalytics() {
+  console.log('\n📈 FLOW 16: Visitor analytics');
+  if (!adminToken) return assert('prerequisites for analytics', false);
+
+  const sid = `qa${String(ts).slice(-14)}`;
+  const track = (body) => req('POST', '/analytics/track', body, null);
+
+  // Public on purpose: a visit happens before anyone signs in, and requiring
+  // a token would count only the people who already converted.
+  const anon = await track({
+    sessionId: sid, app: 'consumer', platform: 'android',
+    events: [{ screen: '/home' }, { screen: '/search' }, { screen: '/product/:id' }],
+  });
+  assert('a visit is recorded without any token',
+    anon.success === true && anon.data?.recorded === 3, anon.message);
+
+  // The character filter alone passes an ObjectId — it is 24 hex characters
+  // and entirely [a-z0-9]. Every segment is shape-checked for that reason.
+  const leaky = await track({
+    sessionId: sid, app: 'consumer',
+    events: [{ screen: '/product/6a86187d95bbf4ce88e3144c' }, { screen: '/cart' }],
+  });
+  assert('a route carrying a record id is refused, the rest is kept',
+    leaky.data?.recorded === 1, `recorded ${leaky.data?.recorded}`);
+
+  const shortId = await track({ sessionId: 'x', events: [{ screen: '/home' }] });
+  assert('a session id that short is rejected', shortId.status === 400);
+
+  const noEvents = await track({ sessionId: sid, events: [] });
+  assert('a call with no events is rejected', noEvents.status === 400);
+
+  const flood = await track({
+    sessionId: sid,
+    events: Array.from({ length: 200 }, () => ({ screen: '/home' })),
+  });
+  assert('a batch is capped rather than accepted whole',
+    flood.data?.recorded === 50, `recorded ${flood.data?.recorded}`);
+
+  // ── The console's view ──
+  const overview = await req('GET', '/admin/analytics/overview?days=30', null, adminToken);
+  assert('the analytics overview loads', overview.success === true, overview.message);
+  const d = overview.data || {};
+
+  assert('tracking is reported as on once something is recorded', d.tracking === true);
+  assert('a visitor is a session, not a screen view',
+    d.visitors.screenViews > d.visitors.inWindow,
+    `${d.visitors.screenViews} views over ${d.visitors.inWindow} visitors`);
+
+  // Arithmetically right, completely meaningless: while tracking is younger
+  // than the window it counts orders against a fraction of the visits.
+  assert('the conversion rate is withheld while tracking is younger than the window',
+    d.conversion.measurable === false
+      ? d.conversion.rate === null && d.conversion.reason.length > 0
+      : typeof d.conversion.rate === 'number',
+    JSON.stringify({ m: d.conversion.measurable, r: d.conversion.rate }));
+
+  assert('the daily series is zero-filled across the whole window',
+    Array.isArray(d.visitorsByDay) && d.visitorsByDay.length === 30);
+
+  assert('no recorded screen name contains a record id',
+    (d.topScreens || []).every((s) => !/[0-9a-f]{24}/i.test(s.screen)),
+    (d.topScreens || []).map((s) => s.screen).join(','));
+
+  assert('sessions are split by app and platform',
+    Array.isArray(d.byApp) && Array.isArray(d.byPlatform) &&
+    d.byApp.some((a) => a.app === 'consumer'));
+
+  // analytics.read is granted wherever reports.read is; a cashier has neither.
+  const anaCashEmail = `ana_cashier_${ts}@vips.test`;
+  await req('POST', '/admin/staff', {
+    fullName: 'Ana Cashier', email: anaCashEmail,
+    phone: `74${String(ts).slice(-9)}`.slice(0, 12),
+    password: 'AnaCash1234', adminRole: 'cashier',
+  }, adminToken);
+  const anaCashTok = (await req('POST', '/admin/login',
+    { email: anaCashEmail, password: 'AnaCash1234' })).data?.token;
+  const denied = await req('GET', '/admin/analytics/overview', null, anaCashTok);
+  assert('a cashier cannot read analytics', denied.status === 403,
+    `status ${denied.status}`);
+
+  const { PERMISSION_CATALOGUE } = require('../middleware/permissions');
+  assert('analytics is a declared permission module',
+    PERMISSION_CATALOGUE.some((p) => p.key === 'analytics.read' && p.enforced));
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -1705,6 +1802,7 @@ async function runAll() {
     testWiring();
     await testUserEditing();
     await testAuditLog();
+    await testAnalytics();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }

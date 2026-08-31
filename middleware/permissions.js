@@ -79,6 +79,9 @@ const MODULE_ACTIONS = {
     read: 'View reports',
     export: 'Download a report as a file',
   },
+  analytics: {
+    read: 'View visitor and conversion analytics',
+  },
   staff: {
     create: 'Add a console operator',
     read: 'View console operators',
@@ -171,6 +174,7 @@ const ROLE_PERMISSIONS = {
     ...only('products', 'read'),
     ...only('inventory', 'read'),
     ...only('reports', 'read'),
+    ...only('analytics', 'read'),
   ],
 };
 

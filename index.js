@@ -101,6 +101,11 @@ app.use('/api/merchant/dues',               duesRoutes);
 // ═══════════════════════════════════════════════════════════
 const uploadRoutes = require('./routes/upload');
 app.use('/api/upload', uploadRoutes);
+
+// Anonymous screen-view tracking. Public: a visit happens before anyone signs
+// in, and a conversion rate measured only over people who already signed in
+// is measured over the one population it must not be.
+app.use('/api/analytics', require('./routes/analytics'));
 app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 
 // ─── Config: conversion rates ─────────────────────────────

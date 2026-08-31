@@ -30,6 +30,7 @@ const PosInvoice           = require('../models/PosInvoice');
 const PosSession           = require('../models/PosSession');
 const Role                 = require('../models/Role');
 const AdminAuditLog        = require('../models/AdminAuditLog');
+const VisitEvent           = require('../models/VisitEvent');
 
 const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
 
@@ -85,6 +86,9 @@ const requireValidId = (req, res) => {
   }
   return true;
 };
+
+/** Three decimals, matching every other money and percentage figure here. */
+const round = (n) => Number((Number(n) || 0).toFixed(3));
 
 /** Start-of-day N days ago, for the chart/report windows. */
 const daysAgo = (n) => {
@@ -1640,6 +1644,188 @@ router.get('/inventory/alerts', requirePermission('inventory.read'), async (req,
 // share a set of revenue/date helpers now lifted into utils/adminHelpers.js
 // so both files answer "what counts as revenue" the same way.
 router.use('/reports', require('./admin_reports'));
+
+// ═══════════════════════════════════════════════════════════
+// ANALYTICS
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * GET /api/admin/analytics/overview?days=30
+ *
+ * Visitors, and the conversion rate they finally give a denominator to.
+ *
+ * A "visitor" is a distinct session, not a screen view — one person opening
+ * the app and looking at nine screens is one visitor, and counting rows
+ * instead would report nine.
+ */
+router.get('/analytics/overview', requirePermission('analytics.read'), async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+    const since = daysAgo(days - 1);
+    const startOfToday = daysAgo(0);
+    const startOfWeek = daysAgo(6);
+
+    const distinctSessions = (match) => VisitEvent.distinct('sessionId', match);
+
+    const [
+      allSessions, todaySessions, weekSessions, windowSessions,
+      screens, byApp, byPlatform, dailySeries,
+      signedInSessions, totalEvents,
+      ordersInWindow, buyersInWindow,
+      customers, newCustomers,
+      merchants, activeMerchants, pendingMerchants,
+    ] = await Promise.all([
+      distinctSessions({}),
+      distinctSessions({ createdAt: { $gte: startOfToday } }),
+      distinctSessions({ createdAt: { $gte: startOfWeek } }),
+      distinctSessions({ createdAt: { $gte: since } }),
+
+      VisitEvent.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        { $group: { _id: '$screen', views: { $sum: 1 }, sessions: { $addToSet: '$sessionId' } } },
+        { $project: { screen: '$_id', views: 1, sessions: { $size: '$sessions' } } },
+        { $sort: { views: -1 } },
+        { $limit: 15 },
+      ]),
+      VisitEvent.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        { $group: { _id: '$app', sessions: { $addToSet: '$sessionId' } } },
+        { $project: { app: '$_id', sessions: { $size: '$sessions' } } },
+        { $sort: { sessions: -1 } },
+      ]),
+      VisitEvent.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        { $group: { _id: '$platform', sessions: { $addToSet: '$sessionId' } } },
+        { $project: { platform: '$_id', sessions: { $size: '$sessions' } } },
+        { $sort: { sessions: -1 } },
+      ]),
+      VisitEvent.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            sessions: { $addToSet: '$sessionId' },
+          },
+        },
+        { $project: { date: '$_id', value: { $size: '$sessions' } } },
+        { $sort: { date: 1 } },
+      ]),
+      distinctSessions({ createdAt: { $gte: since }, userId: { $ne: null } }),
+      VisitEvent.countDocuments({ createdAt: { $gte: since } }),
+
+      Order.countDocuments({ createdAt: { $gte: since } }),
+      Order.distinct('userId', { createdAt: { $gte: since } }),
+
+      User.countDocuments({ role: 'customer' }),
+      User.countDocuments({ role: 'customer', createdAt: { $gte: since } }),
+
+      User.countDocuments({ role: 'merchant' }),
+      User.countDocuments({ role: 'merchant', isActive: true }),
+      BusinessRegistration.countDocuments({ status: { $in: ['pending', 'under_review'] } }),
+    ]);
+
+    const visitors = windowSessions.length;
+    // Null, not zero, until something has been tracked: a conversion rate of
+    // 0% claims nobody who visited bought, which is a different statement
+    // from "nobody has visited yet".
+    const tracking = allSessions.length > 0;
+
+    // Tracking was added after these orders existed, so for a while the window
+    // holds more orders than sessions and the ratio comes out above 100%.
+    // That is arithmetically right and completely meaningless, so it is
+    // withheld and the reason is given instead of printing "1520%".
+    const firstEvent = tracking
+      ? await VisitEvent.findOne({}).sort({ createdAt: 1 }).select('createdAt').lean()
+      : null;
+    const trackingStartedAt = firstEvent ? firstEvent.createdAt : null;
+    const coversWholeWindow = trackingStartedAt
+      ? new Date(trackingStartedAt) <= since
+      : false;
+    const conversionMeasurable = tracking && coversWholeWindow && visitors > 0;
+
+    // Zero-filled so a quiet day is a gap in the line rather than a missing
+    // point the chart joins straight over.
+    const byDay = new Map(dailySeries.map((d) => [d.date, d.value]));
+    const series = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const key = daysAgo(i).toISOString().slice(0, 10);
+      series.push({ date: key, value: byDay.get(key) || 0 });
+    }
+
+    res.json({
+      success: true,
+      message: 'Analytics overview',
+      data: {
+        days,
+        tracking,
+        // What the figures cannot say, said once rather than implied by a zero.
+        trackingNote: tracking
+          ? 'A visitor is one app session. Sessions are anonymous — no device '
+            + 'id, no IP address, and a screen name never carries a record id.'
+          : 'Nothing has been recorded yet. The apps report an anonymous '
+            + 'session when they open; figures appear once they do.',
+
+        visitors: {
+          total: allSessions.length,
+          today: todaySessions.length,
+          thisWeek: weekSessions.length,
+          inWindow: visitors,
+          screenViews: totalEvents,
+          // Sessions where somebody was signed in, which is the honest way to
+          // say how much of the traffic is from people with an account.
+          signedIn: signedInSessions.length,
+        },
+
+        conversion: {
+          // Orders over sessions, at last measurable — but only once tracking
+          // covers the whole window it is being measured over.
+          rate: conversionMeasurable ? round((ordersInWindow / visitors) * 100) : null,
+          orders: ordersInWindow,
+          visitors,
+          buyers: buyersInWindow.length,
+          buyerRate: conversionMeasurable
+            ? round((buyersInWindow.length / visitors) * 100)
+            : null,
+          measurable: conversionMeasurable,
+          trackingStartedAt,
+          reason: conversionMeasurable
+            ? ''
+            : !tracking
+              ? 'Nothing has been tracked yet.'
+              : 'Tracking started inside this window, so it counted only part '
+                + 'of the visits these orders came from. The rate becomes '
+                + 'meaningful once the window starts after tracking did.',
+        },
+
+        customers: {
+          total: customers,
+          newInWindow: newCustomers,
+          buyersInWindow: buyersInWindow.length,
+        },
+
+        merchants: {
+          total: merchants,
+          active: activeMerchants,
+          pendingApproval: pendingMerchants,
+        },
+
+        visitorsByDay: series,
+        topScreens: screens.map((s) => ({
+          screen: s.screen || 'unknown',
+          views: s.views,
+          sessions: s.sessions,
+        })),
+        byApp: byApp.map((a) => ({ app: a.app || 'unknown', sessions: a.sessions })),
+        byPlatform: byPlatform.map((p) => ({
+          platform: p.platform || 'unknown',
+          sessions: p.sessions,
+        })),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // AUDIT LOG
