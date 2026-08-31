@@ -1926,6 +1926,105 @@ async function testBulkImport() {
     `status ${other.status}`);
 }
 
+// ─── FLOW 18: Live chat ─────────────────────────────────────
+async function testChat() {
+  console.log('\n💬 FLOW 18: Live chat');
+  const { io: ioClient } = require('socket.io-client');
+  const ORIGIN = BASE_URL.replace(/\/api\/?$/, '');
+
+  const connect = (token) => new Promise((resolve, reject) => {
+    const s = ioClient(ORIGIN, { auth: { token }, transports: ['websocket'], reconnection: false });
+    s.on('ready', (d) => resolve({ socket: s, ready: d }));
+    s.on('connect_error', (e) => reject(new Error(e.message)));
+    setTimeout(() => reject(new Error('timed out')), 8000);
+  });
+
+  // Identity must come from the token. A client-supplied user id would let
+  // anyone claim any account and read that account's conversations.
+  let refusedBadToken = false;
+  try { await connect('not-a-real-token'); } catch { refusedBadToken = true; }
+  assert('a socket with an invalid token is refused', refusedBadToken);
+
+  let refusedNoToken = false;
+  try { await connect(''); } catch { refusedNoToken = true; }
+  assert('a socket with no token is refused', refusedNoToken);
+
+  if (!userToken || !merchantToken) return assert('chat prerequisites', false);
+
+  const customer = await connect(userToken);
+  const merchant = await connect(merchantToken);
+  assert('the socket resolves the sender from the token',
+    customer.ready.userId === String(userId), customer.ready.userId);
+
+  const delivered = new Promise((r) => merchant.socket.once('new-message', r));
+  const ack = await new Promise((r) =>
+    customer.socket.emit('send-message',
+      { toUserId: merchantId, body: `QA hello ${ts}` }, r));
+  assert('a customer can message a merchant', ack.ok === true, ack.error);
+  const got = await delivered;
+  assert('the merchant receives it live', got.body === `QA hello ${ts}`);
+
+  const back = new Promise((r) => customer.socket.once('new-message', r));
+  const replyAck = await new Promise((r) =>
+    merchant.socket.emit('send-message',
+      { toUserId: userId, body: `QA reply ${ts}` }, r));
+  assert('the merchant can reply', replyAck.ok === true, replyAck.error);
+  assert('the customer receives the reply', (await back).body === `QA reply ${ts}`);
+
+  // The pairing rule: this must not become a way to message any account.
+  const toSelf = await new Promise((r) =>
+    customer.socket.emit('send-message', { toUserId: String(userId), body: 'x' }, r));
+  assert('a customer cannot message themselves', toSelf.ok === false);
+
+  const empty = await new Promise((r) =>
+    customer.socket.emit('send-message', { toUserId: merchantId, body: '   ' }, r));
+  assert('an empty message is refused', empty.ok === false);
+
+  const long = await new Promise((r) =>
+    customer.socket.emit('send-message',
+      { toUserId: merchantId, body: 'x'.repeat(3000) }, r));
+  assert('an over-long message is refused', long.ok === false);
+
+  // A chat that only delivers to whoever is connected loses everything sent
+  // while the other side is closed, which for a merchant is most of the day.
+  merchant.socket.disconnect();
+  await new Promise((r) => setTimeout(r, 300));
+  await new Promise((r) =>
+    customer.socket.emit('send-message',
+      { toUserId: merchantId, body: `QA offline ${ts}` }, r));
+  await new Promise((r) => setTimeout(r, 300));
+
+  const history = await req('GET', `/chat/messages/${userId}`, null, merchantToken);
+  assert('a message sent while the recipient was offline is not lost',
+    (history.data?.items || []).some((m) => m.body === `QA offline ${ts}`));
+  assert('history is ordered oldest first, the way a conversation reads',
+    (history.data?.items || []).length >= 2 &&
+    new Date(history.data.items[0].createdAt) <=
+      new Date(history.data.items[history.data.items.length - 1].createdAt));
+
+  const convos = await req('GET', '/chat/conversations', null, merchantToken);
+  assert('the conversation list names the other party and counts unread',
+    (convos.data?.items || []).some((c) =>
+      c.withUserId === String(userId) && c.unread > 0), JSON.stringify(convos.data?.items));
+
+  const unread = await req('GET', '/chat/unread', null, merchantToken);
+  assert('an unread total is available for a badge', unread.data?.unread > 0);
+
+  const merchant2 = await connect(merchantToken);
+  const readAck = await new Promise((r) =>
+    merchant2.socket.emit('mark-read', { withUserId: String(userId) }, r));
+  assert('marking read clears the unread count',
+    readAck.ok === true && readAck.updated > 0, JSON.stringify(readAck));
+  const after = await req('GET', '/chat/unread', null, merchantToken);
+  assert('the badge is zero afterwards', after.data?.unread === 0);
+
+  const noAuth = await req('GET', `/chat/messages/${merchantId}`, null, null);
+  assert('chat history needs a token', noAuth.status === 401);
+
+  customer.socket.disconnect();
+  merchant2.socket.disconnect();
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -1942,6 +2041,7 @@ async function runAll() {
     await testContent();
     await testMerchant();
     await testBulkImport();
+    await testChat();
     await testReferral();
     await testGiftSend();
     await testAdmin();

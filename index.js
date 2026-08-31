@@ -1,5 +1,6 @@
 const express  = require('express');
 const cors     = require('cors');
+const { setupChatServer } = require('./websocket/chatServer');
 const dotenv   = require('dotenv');
 const mongoose = require('mongoose');
 
@@ -106,6 +107,10 @@ app.use('/api/upload', uploadRoutes);
 // in, and a conversion rate measured only over people who already signed in
 // is measured over the one population it must not be.
 app.use('/api/analytics', require('./routes/analytics'));
+
+// Chat history. The socket below carries what happens live; this is what was
+// said before you opened the screen.
+app.use('/api/chat', require('./routes/chat'));
 app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 
 // ─── Config: conversion rates ─────────────────────────────
@@ -185,15 +190,23 @@ mongoose
     } else {
       await runAutoSeeder();
     }
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`🚀 Server running on http://localhost:${PORT}`);
       console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
     });
+    // Attached to the same server, so it shares the port and Render needs no
+    // extra service. Identity comes from the JWT on the handshake.
+    // Same origin policy as the REST API above, so the socket is not a
+    // looser door into the same data than the endpoints beside it.
+    setupChatServer(server);
+    console.log('💬 Chat socket ready on /socket.io');
   })
   .catch(err => {
     console.error('❌ MongoDB connection error:', err.message);
     console.log('⚠️  Starting server WITHOUT database...');
+    // No socket without a database: every message is persisted, so a chat
+    // running against no DB would accept messages and silently lose them.
     app.listen(PORT, () => {
-      console.log(`🚀 Server running on http://localhost:${PORT} (No DB)`);
+      console.log(`🚀 Server running on http://localhost:${PORT} (No DB — chat disabled)`);
     });
   });
