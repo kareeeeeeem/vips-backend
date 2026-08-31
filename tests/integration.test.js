@@ -1581,6 +1581,108 @@ async function testUserEditing() {
   assert('an invalid user id is rejected', badId.status === 400);
 }
 
+// ─── FLOW 15: Audit log ─────────────────────────────────────
+async function testAuditLog() {
+  console.log('\n🔎 FLOW 15: Audit log');
+  if (!adminToken || !userId) return assert('prerequisites for the audit log', false);
+
+  const before = await req('GET', '/admin/audit/logs?limit=1', null, adminToken);
+  assert('the audit log is readable', before.success === true &&
+    Array.isArray(before.data?.items), before.message);
+  const countBefore = before.data?.total || 0;
+
+  // One change that goes through, and one that is refused.
+  await req('PUT', `/admin/users/${userId}/ban`, { banned: true }, adminToken);
+  await req('PUT', `/admin/users/${userId}/ban`, { banned: false }, adminToken);
+  const readsBefore = await req('GET', '/admin/users?limit=1', null, adminToken);
+  assert('a read still works while auditing is on', readsBefore.success === true);
+
+  await new Promise((r) => setTimeout(r, 400));
+
+  const after = await req('GET', '/admin/audit/logs?limit=20', null, adminToken);
+  assert('a change is recorded', after.data.total > countBefore,
+    `${countBefore} → ${after.data.total}`);
+
+  // Reads would bury the writes: a hundred page loads between two bans makes
+  // the bans harder to find, not easier.
+  const anyRead = (after.data.items || []).some((e) => e.method === 'GET');
+  assert('reads are not recorded', anyRead === false);
+
+  const ban = (after.data.items || []).find((e) => /suspend/i.test(e.action || ''));
+  assert('the entry says what was done in words, not just the endpoint',
+    !!ban && ban.action && !ban.action.startsWith('PUT '),
+    ban ? ban.action : 'no ban entry found');
+  assert('the entry names the operator and survives their deletion',
+    !!ban && typeof ban.actorName === 'string' && ban.actorName.length > 0 &&
+    typeof ban.actorEmail === 'string');
+  assert('the entry records which direction was asked for',
+    !!ban && ban.changes && ban.changes.banned === true,
+    JSON.stringify(ban && ban.changes));
+
+  // A refused attempt is the line an audit log exists for.
+  const viewerEmail = `audit_viewer_${ts}@vips.test`;
+  await req('POST', '/admin/staff', {
+    fullName: 'Audit Viewer', email: viewerEmail,
+    phone: `71${String(ts).slice(-9)}`.slice(0, 12),
+    password: 'AuditViewer1', adminRole: 'viewer',
+  }, adminToken);
+  const viewerTok = (await req('POST', '/admin/login',
+    { email: viewerEmail, password: 'AuditViewer1' })).data?.token;
+  const refused = await req('DELETE', `/admin/users/${userId}`, null, viewerTok);
+  assert('the refusal itself returns 403', refused.status === 403);
+
+  await new Promise((r) => setTimeout(r, 400));
+  const denied = await req('GET', '/admin/audit/logs?outcome=denied&limit=10',
+    null, adminToken);
+  assert('a refused attempt is recorded, not just the successes',
+    (denied.data?.items || []).some((e) => e.statusCode === 403),
+    'nothing with a 403 in the denied filter');
+  assert('every entry under the denied filter really failed',
+    (denied.data?.items || []).every((e) => e.success === false));
+
+  // A password reaching this collection would be a password stored in clear.
+  const withSecret = await req('POST', '/admin/staff', {
+    fullName: 'Secret Probe', email: `secret_${ts}@vips.test`,
+    phone: `72${String(ts).slice(-9)}`.slice(0, 12),
+    password: 'PlainTextSecret9', adminRole: 'viewer',
+  }, adminToken);
+  await new Promise((r) => setTimeout(r, 400));
+  const staffEntries = await req('GET', '/admin/audit/logs?search=operator&limit=20',
+    null, adminToken);
+  const leaked = (staffEntries.data?.items || []).some((e) =>
+    JSON.stringify(e.changes || {}).includes('PlainTextSecret9'));
+  assert('a password never reaches the audit collection', leaked === false);
+  const redacted = (staffEntries.data?.items || []).some((e) =>
+    e.changes && e.changes.password === '[redacted]');
+  assert('the password field is recorded as redacted rather than dropped',
+    redacted === true, 'a missing key reads as "they left it blank"');
+
+  // A viewer can read the log (settings.read); a cashier cannot.
+  const cashierEmail = `audit_cashier_${ts}@vips.test`;
+  await req('POST', '/admin/staff', {
+    fullName: 'Audit Cashier', email: cashierEmail,
+    phone: `73${String(ts).slice(-9)}`.slice(0, 12),
+    password: 'AuditCash123', adminRole: 'cashier',
+  }, adminToken);
+  const cashTok = (await req('POST', '/admin/login',
+    { email: cashierEmail, password: 'AuditCash123' })).data?.token;
+  const cashRead = await req('GET', '/admin/audit/logs', null, cashTok);
+  assert('a cashier cannot read the audit log', cashRead.status === 403,
+    `status ${cashRead.status}`);
+
+  const entryId = (after.data.items || [])[0]?._id;
+  if (entryId) {
+    const one = await req('GET', `/admin/audit/logs/${entryId}`, null, adminToken);
+    assert('a single entry can be opened', one.success === true && !!one.data?.entry);
+  }
+  const badEntry = await req('GET', '/admin/audit/logs/not-an-id', null, adminToken);
+  assert('an invalid audit id is rejected', badEntry.status === 400);
+
+  if (withSecret.data?.staff?._id) {
+    await req('DELETE', `/admin/staff/${withSecret.data.staff._id}`, null, adminToken);
+  }
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -1602,6 +1704,7 @@ async function runAll() {
     await testDashboards();
     testWiring();
     await testUserEditing();
+    await testAuditLog();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }

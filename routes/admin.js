@@ -15,6 +15,7 @@ const {
   requirePermission,
   requireAnyPermission,
 } = require('../middleware/permissions');
+const { auditLog } = require('../middleware/auditLog');
 
 const User                 = require('../models/User');
 const Order                = require('../models/Order');
@@ -28,6 +29,7 @@ const StockMovement        = require('../models/StockMovement');
 const PosInvoice           = require('../models/PosInvoice');
 const PosSession           = require('../models/PosSession');
 const Role                 = require('../models/Role');
+const AdminAuditLog        = require('../models/AdminAuditLog');
 
 const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
 
@@ -155,6 +157,12 @@ router.post('/login', async (req, res) => {
 // token's claims, so a demotion or a disabled account takes effect at once
 // instead of when the token finally expires.
 router.use(adminAuth);
+
+// Every change an operator makes, recorded once here rather than by each
+// handler — a log each route has to remember to write is a log with holes in
+// exactly the routes somebody forgot. Reads are not recorded; a hundred page
+// loads between two bans makes the bans harder to find, not easier.
+router.use(auditLog);
 
 /**
  * GET /api/admin/me — the signed-in admin's profile and effective permissions.
@@ -1632,6 +1640,87 @@ router.get('/inventory/alerts', requirePermission('inventory.read'), async (req,
 // share a set of revenue/date helpers now lifted into utils/adminHelpers.js
 // so both files answer "what counts as revenue" the same way.
 router.use('/reports', require('./admin_reports'));
+
+// ═══════════════════════════════════════════════════════════
+// AUDIT LOG
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * GET /api/admin/audit/logs
+ * ?search= &actorId= &targetType= &outcome=success|denied &from= &to=
+ *
+ * Gated on settings.read rather than a permission of its own: the log names
+ * every operator and what they touched, so whoever can already see the admin
+ * roster is the right audience for it.
+ */
+router.get('/audit/logs', requirePermission('settings.read'), async (req, res) => {
+  try {
+    const { page, limit, skip } = paginate(req.query);
+    const filter = {};
+
+    if (req.query.actorId && isValidId(req.query.actorId)) {
+      filter.actorId = req.query.actorId;
+    }
+    if (req.query.targetType) filter.targetType = req.query.targetType;
+    // A refused attempt is the line an audit log exists for, so it is
+    // directly filterable rather than buried among the successes.
+    if (req.query.outcome === 'success') filter.success = true;
+    if (req.query.outcome === 'denied') filter.success = false;
+
+    const range = dateRangeFilter(req.query);
+    if (range) Object.assign(filter, range);
+
+    if (req.query.search) {
+      const rx = new RegExp(escapeRegex(req.query.search.trim()), 'i');
+      filter.$or = [
+        { action: rx }, { actorName: rx }, { actorEmail: rx },
+        { path: rx }, { targetId: rx },
+      ];
+    }
+
+    const [items, total, actors] = await Promise.all([
+      AdminAuditLog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      AdminAuditLog.countDocuments(filter),
+      // Who appears in the log at all, so the filter cannot offer an operator
+      // with nothing to show.
+      AdminAuditLog.aggregate([
+        { $group: { _id: '$actorId', name: { $last: '$actorName' }, entries: { $sum: 1 } } },
+        { $sort: { entries: -1 } },
+        { $limit: 50 },
+      ]),
+    ]);
+
+    res.json({
+      success: true,
+      message: 'Audit log',
+      data: {
+        items,
+        total, page, limit,
+        pages: Math.ceil(total / limit),
+        actors: actors
+          .filter((a) => a._id)
+          .map((a) => ({ actorId: String(a._id), name: a.name || 'Unknown', entries: a.entries })),
+        targetTypes: ['user', 'merchant', 'order', 'product', 'stock', 'pos', 'staff', 'role'],
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/** GET /api/admin/audit/logs/:id — one entry, with what was sent. */
+router.get('/audit/logs/:id', requirePermission('settings.read'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+    const entry = await AdminAuditLog.findById(req.params.id).lean();
+    if (!entry) {
+      return res.status(404).json({ success: false, message: 'Audit entry not found.' });
+    }
+    res.json({ success: true, message: 'Audit entry', data: { entry } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // ANALYTICAL DASHBOARDS
