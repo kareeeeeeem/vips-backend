@@ -1153,6 +1153,29 @@ async function testAdmin() {
   }, adminToken);
   assert('a too-short admin password is rejected', shortPassword.status === 400);
 
+  // An operator's name signs every receipt, till session and stock movement
+  // they touched. Deleting the account does not remove those rows, it blanks
+  // who is on them — so an account with history has to be disabled instead.
+  const signedStaff = await req('DELETE', `/admin/staff/${adminId}`, null, adminToken);
+  assert('an operator with till or ledger history cannot be deleted',
+    signedStaff.status === 400 || signedStaff.status === 409,
+    `status ${signedStaff.status}: ${signedStaff.message}`);
+
+  const cleanEmail = `disposable_${ts}@vips.test`;
+  const cleanStaff = await req('POST', '/admin/staff', {
+    fullName: 'Disposable Operator',
+    email: cleanEmail,
+    phone: `88${String(ts).slice(-9)}`.slice(0, 12),
+    password: 'Disposable123',
+    adminRole: 'viewer',
+  }, adminToken);
+  const cleanId = cleanStaff.data?.staff?._id;
+  if (cleanId) {
+    const removed = await req('DELETE', `/admin/staff/${cleanId}`, null, adminToken);
+    assert('an operator who has signed nothing can still be deleted',
+      removed.success === true, removed.message);
+  }
+
   const removeSelf = await req(
     'DELETE', `/admin/settings/admins/${adminId}`, null, adminToken);
   assert('an admin cannot remove their own account', removeSelf.status === 400);

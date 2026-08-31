@@ -25,6 +25,8 @@ const BusinessRegistration = require('../models/BusinessRegistration');
 const Payout               = require('../models/Payout');
 const MerchantAd           = require('../models/MerchantAd');
 const StockMovement        = require('../models/StockMovement');
+const PosInvoice           = require('../models/PosInvoice');
+const PosSession           = require('../models/PosSession');
 const Role                 = require('../models/Role');
 
 const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
@@ -1996,11 +1998,41 @@ router.get('/staff', requirePermission('staff.read'), async (req, res) => {
       User.countDocuments(filter),
     ]);
 
+    // How many records each operator's name is on. The delete control is
+    // disabled with a reason when this is above zero, rather than being live
+    // and then answering 409 — the server refuses either way, and a button
+    // that only ever errors is worse than one that says why it is off.
+    // Counted for the page's rows only, in four grouped passes rather than
+    // four queries per row.
+    const ids = items.map((a) => a._id);
+    const tally = new Map(ids.map((id) => [String(id), 0]));
+    const absorb = (rows) => {
+      for (const row of rows) {
+        const key = String(row._id);
+        if (tally.has(key)) tally.set(key, tally.get(key) + row.count);
+      }
+    };
+    const countBy = (Model, field) =>
+      Model.aggregate([
+        { $match: { [field]: { $in: ids } } },
+        { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+      ]);
+    (await Promise.all([
+      countBy(PosInvoice, 'cashierId'),
+      countBy(PosInvoice, 'refundedBy'),
+      countBy(PosSession, 'cashierId'),
+      countBy(StockMovement, 'performedBy'),
+    ])).forEach(absorb);
+
     res.json({
       success: true,
       message: 'Console staff',
       data: {
-        items: items.map((a) => ({ ...a, effectivePermissions: permissionsFor(a) })),
+        items: items.map((a) => ({
+          ...a,
+          effectivePermissions: permissionsFor(a),
+          signedRecords: tally.get(String(a._id)) || 0,
+        })),
         total, page, limit,
         pages: Math.ceil(total / limit),
       },
@@ -2212,6 +2244,34 @@ router.delete('/staff/:id', requirePermission('staff.delete'), async (req, res) 
     const remaining = await User.countDocuments({ role: 'admin' });
     if (remaining <= 1) {
       return res.status(409).json({ success: false, message: 'The last admin cannot be removed.' });
+    }
+
+    // An operator's name is what the till receipts, the session history and
+    // the stock ledger are signed with. Deleting the account does not remove
+    // those rows — it blanks their attribution, so a receipt that was rung up
+    // by a named cashier silently becomes one rung up by nobody. Disabling
+    // ends their access and keeps the trail readable, which is the whole
+    // point of recording who did what.
+    const [invoices, refunds, sessions, movements] = await Promise.all([
+      PosInvoice.countDocuments({ cashierId: staff._id }),
+      PosInvoice.countDocuments({ refundedBy: staff._id }),
+      PosSession.countDocuments({ cashierId: staff._id }),
+      StockMovement.countDocuments({ performedBy: staff._id }),
+    ]);
+    const signed = invoices + refunds + sessions + movements;
+    if (signed > 0) {
+      const parts = [];
+      if (invoices) parts.push(`${invoices} receipt(s)`);
+      if (refunds) parts.push(`${refunds} refund(s)`);
+      if (sessions) parts.push(`${sessions} till session(s)`);
+      if (movements) parts.push(`${movements} stock movement(s)`);
+      return res.status(409).json({
+        success: false,
+        message: `${staff.fullName} is recorded on ${parts.join(', ')}. ` +
+          'Disable the account instead — deleting it would leave those ' +
+          'records with no one attached to them.',
+        data: { signedRecords: signed, invoices, refunds, sessions, movements },
+      });
     }
 
     await staff.deleteOne();
