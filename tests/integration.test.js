@@ -36,6 +36,24 @@ async function seedWalletPoints(uid, amount) {
  * one the same way seedWalletPoints writes points. Uses .save() rather than
  * an update so the password pre-save hook hashes it.
  */
+/**
+ * Create a throwaway account of any role, straight in Mongo.
+ *
+ * seedAdmin below forces role:'admin' — passing it a merchant silently
+ * produced an admin, and every lookup for that merchant then missed.
+ * Returns the saved document so callers have the real _id without a
+ * round-trip through /auth/me.
+ */
+async function seedUser(user) {
+  if (!dbConnected) {
+    await mongoose.connect(process.env.MONGODB_URI);
+    dbConnected = true;
+  }
+  const doc = new User({ isVerified: true, ...user });
+  await doc.save();
+  return doc;
+}
+
 async function seedAdmin(admin) {
   if (!dbConnected) {
     await mongoose.connect(process.env.MONGODB_URI);
@@ -80,6 +98,15 @@ function assert(label, condition, detail = '') {
 }
 
 // ─── State shared between tests ──────────────────────────────
+let _phoneSeq = 0;
+/** A phone number no other test row holds. The unique index makes a
+ *  same-millisecond collision a real failure, so this counts rather than
+ *  trusting the clock. */
+function _uniquePhone(prefix = '3') {
+  _phoneSeq += 1;
+  return (prefix + String(Date.now() + _phoneSeq).slice(-8)).slice(0, 9);
+}
+
 let userToken, merchantToken, userId, merchantId, orderId, couponId;
 let adminToken, adminId;
 
@@ -175,10 +202,13 @@ async function testRewards() {
   assert('coupons returns array', Array.isArray(coupons.data));
 
   // Expense to reward
+  // §4.1 puts the merchant at the till. This endpoint let a customer type
+  // their own spend and be credited points for it — points nothing backed.
   const exp2rew = await req('POST', '/rewards/expense-to-reward', { amount: 1000, merchantId }, userToken);
-  assert('POST /rewards/expense-to-reward success', exp2rew.success === true, `msg=${exp2rew.message}`);
-  assert('expense-to-reward returns pointsEarned', exp2rew.data?.pointsEarned !== undefined);
-  assert('expense-to-reward returns newBalance', exp2rew.data?.newBalance !== undefined);
+  assert('a customer can no longer credit their own spending',
+    exp2rew.status === 410, `${exp2rew.status}`);
+  assert('and is told where the flow moved to',
+    exp2rew.code === 'FLOW_MOVED_TO_MERCHANT', String(exp2rew.code));
 
   // Gift voucher brands
   const vouchers = await req('GET', '/rewards/gift-vouchers', null, userToken);
@@ -416,22 +446,63 @@ async function testGiftSend() {
   const txsBefore = await req('GET', '/user/transactions', null, userToken);
   const countBefore = txsBefore.data?.transactions?.length ?? 0;
 
+  // §4.3 forbids moving value between accounts, and §7 rests the platform's
+  // central-bank exemption on that. This used to transfer walletBalance —
+  // dinars topped up through a payment gateway — between customers.
   const send = await req('POST', '/rewards/send-gift', {
     recipientPhone: TEST_MERCHANT.phone,
     amount: 5,
     message: 'Happy testing!',
   }, userToken);
+  assert('balance can no longer be sent between accounts',
+    send.status === 410, `${send.status}`);
+  assert('and the caller is pointed at gifting an offer',
+    send.code === 'USE_GIFT_OFFER', String(send.code));
 
-  assert('POST /rewards/send-gift success', send.success === true, `msg=${send.message} status=${send.status}`);
-  assert('send-gift returns newBalance', send.data?.newBalance !== undefined, `data=${JSON.stringify(send.data)}`);
+  // The sanctioned alternative: buy an offer in a friend's name. Points
+  // leave the buyer and the friend receives a voucher — no balance moves.
+  // The recipient has to be a consumer account: a gifted offer is something
+  // a customer redeems, and a merchant account has nothing to redeem it in.
+  const friendPhone = _uniquePhone('4');
+  await seedUser({
+    fullName: 'Gift Recipient',
+    email: `gift_friend_${Date.now()}@vips.test`,
+    phone: friendPhone,
+    password: 'FriendPass123',
+    role: 'customer',
+  });
 
-  // Verify transaction record was created
-  const txsAfter = await req('GET', '/user/transactions', null, userToken);
-  const countAfter = txsAfter.data?.transactions?.length ?? 0;
-  assert('send-gift created transaction record', countAfter > countBefore, `before=${countBefore} after=${countAfter}`);
-  assert('send-gift transaction has GIFT reference',
-    txsAfter.data?.transactions?.some?.((t) => t.reference?.startsWith('GIFT-')),
-    `refs=${txsAfter.data?.transactions?.map?.((t) => t.reference).join(',')}`);
+  const balBefore = (await req('GET', '/user/wallet', null, userToken)).data?.points ?? 0;
+  const gift = await req('POST', '/rewards/gift-offer', {
+    recipientPhone: friendPhone,
+    points: 200,
+    message: 'Happy testing!',
+  }, userToken);
+
+  if (balBefore >= 200) {
+    assert('an offer can be gifted to a friend', gift.success === true, gift.message);
+    assert('the gift costs the buyer their own points',
+      gift.data?.newBalance === balBefore - 200,
+      `${balBefore} - 200 vs ${gift.data?.newBalance}`);
+    assert('the friend receives a redeemable code',
+      typeof gift.data?.code === 'string' && gift.data.code.startsWith('GIFT-'),
+      String(gift.data?.code));
+    assert('200 points is stated as 2 TND of value',
+      gift.data?.valueTnd === 2, String(gift.data?.valueTnd));
+
+    const txsAfter = await req('GET', '/user/transactions', null, userToken);
+    const countAfter = txsAfter.data?.transactions?.length ?? 0;
+    assert('gifting an offer is recorded', countAfter > countBefore,
+      `before=${countBefore} after=${countAfter}`);
+  } else {
+    assert('gifting more points than you hold is refused',
+      gift.success === false, gift.message);
+  }
+
+  const self = await req('POST', '/rewards/gift-offer', {
+    recipientPhone: TEST_USER.phone, points: 10,
+  }, userToken);
+  assert('a gift cannot be sent to yourself', self.status === 400, `${self.status}`);
 }
 
 // ─── Runner ──────────────────────────────────────────────────
@@ -2039,6 +2110,149 @@ async function testChat() {
 // it. What was untested is the round trip: toMerchantJSON did not carry
 // estimatedDeliveryAt, so the screen that sets the value could not read it
 // back and every order looked like it had no estimate.
+// ─── FLOW 24: The documented business model ──────────────────────────
+//
+// Every figure asserted here is quoted from "وثيقة منصة فيبس التفصيلية".
+// The platform previously ran a redemption rate ten times the documented
+// one, two different earn rates at once, no guarantee at all, and a
+// Giftback that shared only its name with the one in §4.2.
+async function testBusinessModel() {
+  console.log('\n📜 FLOW 24: The documented business model');
+  const economics = require('../config/economics');
+
+  // ── §5.1 exchange rate ──
+  const rates = await req('GET', '/config/rates');
+  assert('100 points is 1 dinar, everywhere it is quoted',
+    rates.data?.pointsPerTnd === 100 && rates.data?.vipsToTnd === 0.01,
+    JSON.stringify(rates.data));
+  assert('the rate is the same in both directions',
+    economics.pointsToTnd(economics.tndToPoints(37)) === 37);
+
+  if (!adminToken) return assert('business-model prerequisites', false);
+
+  // A merchant and customer of our own, so the assertions below are exact.
+  const stamp = Date.now();
+  const merchant = {
+    fullName: 'Model Store', email: `model_m_${stamp}@vips.test`,
+    phone: _uniquePhone(), password: 'ModelPass123', role: 'merchant',
+    storeName: 'Model Store', earnRate: 6,
+  };
+  const customer = {
+    fullName: 'Model Customer', email: `model_c_${stamp}@vips.test`,
+    phone: _uniquePhone(), password: 'ModelPass123', role: 'customer',
+  };
+  const mDoc = await seedUser(merchant);
+  const cDoc = await seedUser(customer);
+  const merchantId = String(mDoc._id);
+  const cId = String(cDoc._id);
+
+  const mTok = (await req('POST', '/auth/login', { email: merchant.email, password: merchant.password })).data?.token;
+  const cTok = (await req('POST', '/auth/login', { email: customer.email, password: customer.password })).data?.token;
+  if (!mTok || !cTok) return assert('business-model logins', false);
+
+  // ── §5.1 guarantee ──
+  const before = await req('POST', '/merchant/earn',
+    { userId: cId, invoiceAmount: 50 }, mTok);
+  assert('a merchant with no guarantee cannot award points',
+    before.status === 409, `${before.status}`);
+
+  const dep = await req('POST', `/admin/merchants/${merchantId}/guarantee/deposit`,
+    { amount: 1000 }, adminToken);
+  assert('1,000 TND of guarantee becomes 100,000 points',
+    dep.data?.unallocatedPoints === 100000, JSON.stringify(dep.data?.unallocatedPoints || dep.message));
+  assert('a deposit lands unallocated for the merchant to split',
+    dep.data?.budgets?.discount === 0);
+
+  const alloc = await req('POST', '/merchant/guarantee/allocate',
+    { budget: 'discount', points: 60000 }, mTok);
+  assert('the merchant splits it across the three budgets',
+    alloc.data?.budgets?.discount === 60000 && alloc.data?.unallocatedPoints === 40000,
+    JSON.stringify(alloc.data?.budgets));
+  const over = await req('POST', '/merchant/guarantee/allocate',
+    { budget: 'packages', points: 999999 }, mTok);
+  assert('a merchant cannot allocate points they do not hold', over.status === 409, `${over.status}`);
+
+  // ── §4.1 earning ──
+  const earn = await req('POST', '/merchant/earn',
+    { qr: `VIPS_USER_${cId}`, invoiceAmount: 50 }, mTok);
+  assert('a scanned QR resolves to the customer it belongs to',
+    earn.success === true, earn.message);
+  assert('50 TND at 6 points/TND earns 300 points',
+    earn.data?.pointsAwarded === 300, String(earn.data?.pointsAwarded));
+  assert('300 points is 3 TND — the documented 6% return',
+    earn.data?.pointsValueTnd === 3, String(earn.data?.pointsValueTnd));
+  assert('the points come out of the merchant guarantee, not thin air',
+    earn.data?.guarantee?.budgets?.discount === 59700,
+    String(earn.data?.guarantee?.budgets?.discount));
+
+  // ── §4.2 Giftback ──
+  const gb = await req('POST', '/merchant/gift-back',
+    { userId: cId, changeTnd: 0.8, invoiceTnd: 10.8, consent: true }, mTok);
+  assert('0.800 TND of change becomes 80 Giftback points',
+    gb.data?.points === 80, String(gb.data?.points || gb.message));
+  const activatesIn = new Date(gb.data.activatesAt).getTime() - Date.now();
+  assert('Giftback points are deferred by twelve hours',
+    activatesIn > 11.5 * 3600e3 && activatesIn < 12.5 * 3600e3,
+    `${Math.round(activatesIn / 3600e3)}h`);
+
+  const wallet = await req('GET', '/user/wallet', null, cTok);
+  assert('deferred points are not spendable yet',
+    wallet.data?.points === 300, String(wallet.data?.points));
+  assert('but the customer is shown they are coming',
+    wallet.data?.pendingGiftbackPoints === 80, String(wallet.data?.pendingGiftbackPoints));
+
+  const noConsent = await req('POST', '/merchant/gift-back',
+    { userId: cId, changeTnd: 0.5, consent: false }, mTok);
+  assert('Giftback without the customer agreeing is refused',
+    noConsent.status === 403, `${noConsent.status}`);
+  const tooBig = await req('POST', '/merchant/gift-back',
+    { userId: cId, changeTnd: 6, consent: true }, mTok);
+  assert('change of 5 TND or more is not change and is refused',
+    tooBig.status === 400, `${tooBig.status}`);
+
+  const limits = await req('GET', `/merchant/gift-back/limits?userId=${cId}`, null, mTok);
+  assert('the monthly cap is 50 TND and belongs to the customer',
+    limits.data?.monthlyCapTnd === 50 && limits.data?.allowance?.usedTnd === 0.8,
+    JSON.stringify(limits.data?.allowance));
+
+  const log = await req('GET', '/merchant/gift-back/history', null, mTok);
+  assert('the merchant keeps a Giftback approval log',
+    (log.data?.items || []).length >= 1 && log.data.items[0].consentedAt);
+
+  // ── §5.2 refunds ──
+  const refund = await req('GET', '/merchant/guarantee/refund', null, mTok);
+  assert('refunds run on a 60-day cycle with a 100 TND floor',
+    refund.data?.cycleDays === 60 && refund.data?.minimumTnd === 100,
+    JSON.stringify(refund.data));
+  assert('and are reviewed within five working days',
+    refund.data?.reviewWorkingDays === 5);
+  const tooSmall = await req('POST', '/merchant/guarantee/refund', { amount: 50 }, mTok);
+  assert('a refund below the floor is refused',
+    tooSmall.status === 400 || tooSmall.status === 409, `${tooSmall.status}`);
+
+  const ledger = await req('GET', '/merchant/guarantee/ledger', null, mTok);
+  const kinds = (ledger.data?.items || []).map((i) => i.type);
+  assert('every guarantee movement is on the ledger',
+    kinds.includes('deposit') && kinds.includes('allocate') && kinds.includes('fund'),
+    kinds.join(','));
+
+  // ── §8 plans ──
+  for (const [plan, commission] of [['basic', 3], ['professional', 2], ['advanced', 1]]) {
+    const r = await req('PUT', `/admin/merchants/${merchantId}/plan`, { plan }, adminToken);
+    assert(`the ${plan} plan carries ${commission}% commission`,
+      r.data?.commissionRate === commission, String(r.data?.commissionRate));
+  }
+  const badPlan = await req('PUT', `/admin/merchants/${merchantId}/plan`, { plan: 'platinum' }, adminToken);
+  assert('an unknown plan is refused', badPlan.status === 400, `${badPlan.status}`);
+
+  // ── platform exposure ──
+  const held = await req('GET', '/admin/guarantees', null, adminToken);
+  assert('the console reports guarantee held across the platform',
+    typeof held.data?.totalHeldTnd === 'number', JSON.stringify(held.data?.totalHeldTnd));
+
+  await User.deleteMany({ email: { $in: [merchant.email, customer.email] } });
+}
+
 async function testDeliveryEstimate() {
   console.log('\n⏱  FLOW 23: Delivery estimate');
   if (!merchantToken || !orderId) return assert('estimate prerequisites', false);
@@ -2261,6 +2475,7 @@ async function runAll() {
     await testAnalytics();
     await testDeliveryEstimate();
     await testAdminOrderCancel();
+    await testBusinessModel();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }

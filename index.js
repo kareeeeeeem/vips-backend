@@ -78,8 +78,11 @@ app.use('/api/auth', rateLimit(10, 60000));
 // a CI run, locks its own people out after eight sign-ins between them. The
 // looser per-IP cap on top is what stops one address spraying one password
 // across many accounts.
+// Only *failed* sign-ins count. Brute force is a stream of wrong passwords;
+// a burst of correct ones is a shop opening for the day or a test suite, and
+// counting those locked out exactly the people who were allowed in.
 const adminLoginLimits = { perAccount: [6, 5 * 60 * 1000], perAddress: [40, 5 * 60 * 1000] };
-const adminLoginAttempts = new Map();
+const adminLoginFailures = new Map();
 
 app.use('/api/admin/login', (req, res, next) => {
   const now = Date.now();
@@ -90,7 +93,7 @@ app.use('/api/admin/login', (req, res, next) => {
   ];
 
   for (const [key, max, windowMs] of buckets) {
-    const hits = (adminLoginAttempts.get(key) || []).filter((t) => t > now - windowMs);
+    const hits = (adminLoginFailures.get(key) || []).filter((t) => t > now - windowMs);
     if (hits.length >= max) {
       return res.status(429).json({
         success: false,
@@ -98,20 +101,30 @@ app.use('/api/admin/login', (req, res, next) => {
       });
     }
   }
-  // Only recorded once the caller is known to be under every cap, so a
-  // blocked attempt does not extend its own lockout indefinitely.
-  for (const [key, , windowMs] of buckets) {
-    const hits = (adminLoginAttempts.get(key) || []).filter((t) => t > now - windowMs);
-    hits.push(now);
-    adminLoginAttempts.set(key, hits);
-  }
+
+  // Record after the fact, so the counter tracks failures rather than
+  // traffic. A correct password also clears the account's own streak —
+  // whoever just proved they own it is not the attacker.
+  const send = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode === 401 || res.statusCode === 403) {
+      for (const [key, , windowMs] of buckets) {
+        const hits = (adminLoginFailures.get(key) || []).filter((t) => t > now - windowMs);
+        hits.push(now);
+        adminLoginFailures.set(key, hits);
+      }
+    } else if (res.statusCode < 400 && email) {
+      adminLoginFailures.delete(`acct:${req.ip}:${email}`);
+    }
+    return send(body);
+  };
   next();
 });
 
 setInterval(() => {
   const cutoff = Date.now() - RATE_LIMIT_TTL;
-  for (const [key, times] of adminLoginAttempts) {
-    if (!times.length || times[times.length - 1] < cutoff) adminLoginAttempts.delete(key);
+  for (const [key, times] of adminLoginFailures) {
+    if (!times.length || times[times.length - 1] < cutoff) adminLoginFailures.delete(key);
   }
 }, RATE_LIMIT_TTL).unref();
 
@@ -190,7 +203,15 @@ app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 
 // ─── Config: conversion rates ─────────────────────────────
 app.get('/api/config/rates', (req, res) => {
-  res.json({ success: true, data: { vipsToTnd: 0.1, conversionRate: 0.1 } });
+  const { TND_PER_POINT, POINTS_PER_TND } = require('./config/economics');
+  res.json({
+    success: true,
+    data: {
+      vipsToTnd: TND_PER_POINT,
+      conversionRate: TND_PER_POINT,
+      pointsPerTnd: POINTS_PER_TND,
+    },
+  });
 });
 
 // ─── Admin: update employee ────────────────────────────────

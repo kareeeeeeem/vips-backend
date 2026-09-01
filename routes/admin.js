@@ -34,6 +34,9 @@ const VisitEvent           = require('../models/VisitEvent');
 
 const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
 
+const guarantee = require('../utils/guarantee');
+const { BUDGET_LABELS, PLANS, PLAN_KEYS, pointsToTnd } = require('../config/economics');
+
 const router = express.Router();
 
 // ═══════════════════════════════════════════════════════════
@@ -965,6 +968,144 @@ router.put('/merchants/:id/activate', requireAnyPermission('merchants.activate',
  * Refuses while the merchant still has live orders — deleting then would
  * strand customers holding an order nobody owns.
  */
+// ═══════════════════════════════════════════════════════════
+// §5.1 / §5.2 — MERCHANT GUARANTEES
+// ═══════════════════════════════════════════════════════════
+
+// ─── GET /admin/merchants/:id/guarantee ───────────────────
+router.get('/merchants/:id/guarantee', requirePermission('merchants.read'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+    const merchant = await User.findOne({ _id: req.params.id, role: 'merchant' });
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found.' });
+
+    const GuaranteeLedger = require('../models/GuaranteeLedger');
+    const ledger = await GuaranteeLedger.find({ merchantId: merchant._id })
+      .sort({ createdAt: -1 }).limit(50).lean();
+
+    res.json({
+      success: true,
+      data: {
+        merchant: { id: String(merchant._id), name: merchant.storeName || merchant.fullName },
+        ...guarantee.summarise(merchant),
+        budgetLabels: BUDGET_LABELS,
+        ledger,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /admin/merchants/:id/guarantee/deposit ──────────
+/**
+ * Records cash received from a merchant as an operating guarantee (§5.1).
+ *
+ * Admin-only on purpose: the deposit stands for money that actually arrived,
+ * so a merchant cannot credit their own. It converts at 100 points = 1 TND
+ * and lands unallocated for the merchant to split across their budgets.
+ */
+router.post('/merchants/:id/guarantee/deposit', requirePermission('merchants.update'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+    const { amount, note } = req.body;
+    const data = await guarantee.deposit(req.params.id, amount, {
+      byId: req.user.id,
+      note: note || 'Guarantee deposit recorded by an administrator',
+    });
+    res.status(201).json({ success: true, message: 'Guarantee recorded.', data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── PUT /admin/merchants/:id/plan ────────────────────────
+// §8: moving a merchant between plans is what changes their commission.
+router.put('/merchants/:id/plan', requirePermission('merchants.update'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+    const { plan, earnRate } = req.body;
+    const merchant = await User.findOne({ _id: req.params.id, role: 'merchant' });
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found.' });
+
+    if (plan !== undefined) {
+      if (!PLAN_KEYS.includes(plan)) {
+        return res.status(400).json({
+          success: false,
+          message: `Plan must be one of: ${PLAN_KEYS.join(', ')}.`,
+        });
+      }
+      merchant.merchantPlan = plan; // the pre-save hook resets commissionRate
+    }
+    if (earnRate !== undefined) {
+      const rate = Number(earnRate);
+      if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+        return res.status(400).json({ success: false, message: 'The earn rate must be between 0 and 100 points per dinar.' });
+      }
+      merchant.earnRate = rate;
+    }
+    await merchant.save();
+
+    res.json({
+      success: true,
+      message: 'Merchant plan updated.',
+      data: {
+        merchantPlan: merchant.merchantPlan,
+        commissionRate: merchant.commissionRate,
+        earnRate: merchant.earnRate,
+        plans: PLANS,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /admin/guarantees ────────────────────────────────
+// Platform-wide exposure: how much guarantee is held, and who is suspended.
+router.get('/guarantees', requirePermission('merchants.read'), async (req, res) => {
+  try {
+    const merchants = await User.find({ role: 'merchant' })
+      .select('storeName fullName guarantee merchantPlan earnRate')
+      .lean();
+
+    const rows = merchants.map((m) => {
+      const g = m.guarantee || {};
+      const b = g.budgets || {};
+      const held = (g.unallocatedPoints || 0) + (b.discount || 0) + (b.packages || 0) + (b.general || 0);
+      return {
+        merchantId: String(m._id),
+        name: m.storeName || m.fullName,
+        plan: m.merchantPlan || 'basic',
+        earnRate: m.earnRate ?? null,
+        depositedTnd: g.depositedTnd || 0,
+        refundedTnd: g.refundedTnd || 0,
+        heldPoints: held,
+        heldTnd: pointsToTnd(held),
+        budgets: { discount: b.discount || 0, packages: b.packages || 0, general: b.general || 0 },
+        suspended: Boolean(g.suspendedAt),
+      };
+    }).sort((a, b) => b.heldTnd - a.heldTnd);
+
+    res.json({
+      success: true,
+      data: {
+        items: rows,
+        // What the platform is holding on merchants' behalf. It is not
+        // revenue (§5.3) and is refundable in full, so it is reported apart
+        // from anything the platform has earned.
+        totalHeldTnd: Math.round(rows.reduce((s, r) => s + r.heldTnd, 0) * 1000) / 1000,
+        totalDepositedTnd: Math.round(rows.reduce((s, r) => s + r.depositedTnd, 0) * 1000) / 1000,
+        totalRefundedTnd: Math.round(rows.reduce((s, r) => s + r.refundedTnd, 0) * 1000) / 1000,
+        merchantsWithoutGuarantee: rows.filter((r) => r.heldPoints === 0).length,
+        suspendedMerchants: rows.filter((r) => r.suspended).length,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.delete('/merchants/:id', requirePermission('merchants.delete'), async (req, res) => {
   try {
     if (!requireValidId(req, res)) return;

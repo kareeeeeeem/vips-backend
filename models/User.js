@@ -56,9 +56,51 @@ const userSchema = new mongoose.Schema(
     brandColor: { type: String, default: null }, // e.g., '0xFFDC2626'
     isTrending: { type: Boolean, default: false },
     discountPercentage: { type: Number, default: 0 },
-    // Platform cut on this merchant's sales, as a percentage. Read by the
-    // commission report; 0 means the platform takes nothing from them.
+    // Platform cut on this merchant's sales, as a percentage. Derived from
+    // `merchantPlan` (§8) rather than typed in — kept as a stored field so
+    // historical reports still read the rate that applied at the time.
     commissionRate: { type: Number, default: 0, min: 0, max: 100 },
+
+    // ─── §8 Subscription plan ──────────────────────────────
+    // The monthly fee buys a lower commission. Every merchant is on a plan;
+    // `basic` is free and is what an unconfigured merchant gets.
+    merchantPlan: {
+      type: String,
+      enum: ['basic', 'professional', 'advanced'],
+      default: 'basic',
+    },
+
+    // ─── §4.1 Points this merchant awards per 1 TND spent ──
+    // The document's worked example is 6. Null means the merchant has not
+    // set a policy yet and awards nothing — deliberately not a silent
+    // platform-wide fallback, which is how two different rates ended up
+    // running at once.
+    earnRate: { type: Number, default: null, min: 0, max: 100 },
+
+    // ─── §5.1 The collective guarantee ─────────────────────
+    // Cash the merchant deposits, held as an operating guarantee and
+    // converted to points at 100 points = 1 TND. The merchant splits those
+    // points across three budgets; every offer is funded from one of them.
+    // The platform never books this as revenue (§5.3) — it is refundable in
+    // full, so it is tracked separately from `walletBalance` (their earnings).
+    guarantee: {
+      // Lifetime cash deposited, in dinars. Never decreases on spending —
+      // only the budgets do — so the refundable amount can be derived.
+      depositedTnd: { type: Number, default: 0, min: 0 },
+      // Cash already refunded out, in dinars.
+      refundedTnd: { type: Number, default: 0, min: 0 },
+      // Unallocated points, waiting to be split across the budgets below.
+      unallocatedPoints: { type: Number, default: 0, min: 0 },
+      budgets: {
+        discount: { type: Number, default: 0, min: 0 }, // funds Cashback
+        packages: { type: Number, default: 0, min: 0 }, // funds Packages
+        general:  { type: Number, default: 0, min: 0 }, // receives Voucher redemptions
+      },
+      // Set when a budget hits zero: the merchant stops accepting points for
+      // that offer type until they top the guarantee up (§5.1, "النفاد").
+      suspendedAt: { type: Date, default: null },
+      lastRefundAt: { type: Date, default: null },
+    },
     
     // Wallet
     walletBalance: { type: Number, default: 0 },
@@ -231,5 +273,21 @@ userSchema.methods.toJSON = function () {
   delete obj.resetPasswordExpires;
   return obj;
 };
+
+/**
+ * §8: the plan sets the commission. `commissionRate` stays a stored field so
+ * historical reports keep reading the rate that applied when they were run,
+ * but nothing may set it by hand to a value the plan does not carry — that
+ * is how a merchant ends up on the free plan paying nothing.
+ */
+userSchema.pre('save', function syncCommissionToPlan(next) {
+  if (this.role !== 'merchant') return next();
+  if (this.isModified('merchantPlan') || this.isNew || this.commissionRate === undefined) {
+    const { PLANS } = require('../config/economics');
+    const plan = PLANS[this.merchantPlan] || PLANS.basic;
+    this.commissionRate = plan.commissionPercent;
+  }
+  next();
+});
 
 module.exports = mongoose.model('User', userSchema);

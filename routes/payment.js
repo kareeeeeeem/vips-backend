@@ -16,7 +16,7 @@ function backendUrl() {
 
 // Same rate as VIPS_TO_TND in routes/order.js — kept in sync manually
 // (matches that file's existing precedent for this constant).
-const VIPS_TO_TND = 0.1;
+const { TND_PER_POINT: VIPS_TO_TND } = require('../config/economics');
 const MIN_TOPUP_VIPS = 100;
 const MAX_TOPUP_VIPS = 50000;
 

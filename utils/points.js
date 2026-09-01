@@ -1,17 +1,37 @@
-// Shared points-earning logic. Rate: 1 VIPS point per 1 TND spent (matches
-// the redemption side's VIPS_TO_TND = 0.1 in routes/order.js — i.e. points
-// are worth 10% of their earn-value when redeemed, a standard loyalty
-// cashback spread). Guarded by Order.pointsCredited so a webhook retry or a
-// second status-update call never double-credits the same order.
+/**
+ * Awarding loyalty points (§4.1).
+ *
+ * The rate belongs to the merchant, not to this file. It used to be a
+ * literal 1 point per TND here and 0.1 in routes/rewards.js, so what a
+ * customer earned depended on which screen credited it. A merchant with no
+ * rate set awards nothing rather than falling back to a platform-wide
+ * number nobody agreed to.
+ */
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
+const { pointsForInvoice, DEFAULT_EARN_RATE } = require('../config/economics');
 
-const POINTS_PER_CURRENCY_UNIT = 1;
+/** The merchant's own rate, or null when they have not set a policy. */
+async function earnRateFor(merchantId) {
+  if (!merchantId) return null;
+  const merchant = await User.findById(merchantId).select('earnRate role').lean();
+  if (!merchant || merchant.role !== 'merchant') return null;
+  return Number.isFinite(merchant.earnRate) ? merchant.earnRate : null;
+}
 
 async function creditPointsForOrder(order) {
   if (!order || order.pointsCredited) return { credited: false };
 
-  const points = Math.floor((order.totalAmount || 0) * POINTS_PER_CURRENCY_UNIT);
+  const rate = await earnRateFor(order.merchantId);
+  if (rate === null || rate <= 0) {
+    // Nothing to award, but the order is settled either way — leaving the
+    // flag unset would have a retry try again on every webhook.
+    order.pointsCredited = true;
+    await order.save();
+    return { credited: false, reason: 'merchant has no earn rate set' };
+  }
+
+  const points = pointsForInvoice(order.totalAmount || 0, rate);
   if (points <= 0) {
     order.pointsCredited = true;
     await order.save();
@@ -39,7 +59,7 @@ async function creditPointsForOrder(order) {
     }),
   ]);
 
-  return { credited: true, points };
+  return { credited: true, points, rate };
 }
 
-module.exports = { creditPointsForOrder, POINTS_PER_CURRENCY_UNIT };
+module.exports = { creditPointsForOrder, earnRateFor, DEFAULT_EARN_RATE };

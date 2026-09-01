@@ -110,68 +110,18 @@ const MAX_MONTHLY_GIFT_AMOUNT = 10000;
 const MAX_DAILY_SPINS = 3;
 
 router.post('/expense-to-reward', authMiddleware, async (req, res) => {
-  try {
-    const { amount, merchantId: rawMerchantId } = req.body;
-
-    if (!amount || amount <= 0 || amount > MAX_EXPENSE_AMOUNT) {
-      return res.status(400).json({ success: false, message: 'Invalid amount' });
-    }
-
-    // The "Merchant phone / ID" field (reward_page.dart /
-    // expense_to_reward_controller.dart) accepts either a scanned QR's
-    // real ObjectId or a typed phone number — resolve whichever was sent
-    // instead of passing it straight through, which would throw a
-    // CastError (and 500 the whole request) for any typed phone number.
-    let merchantId = null;
-    if (rawMerchantId && /^[a-fA-F0-9]{24}$/.test(rawMerchantId)) {
-      merchantId = rawMerchantId;
-    } else if (rawMerchantId) {
-      const merchantUser = await User.findOne({ phone: String(rawMerchantId).trim() }).select('_id');
-      merchantId = merchantUser?._id || null;
-    }
-
-    // Give 10% of expense as reward points
-    const pointsEarned = Math.floor(amount * 0.1);
-
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
-    const todaysRewards = await Transaction.find({
-      userId: req.user.id,
-      type: 'reward',
-      reference: { $regex: '^EXP-REW-' },
-      createdAt: { $gte: startOfDay },
-    }).select('amount');
-    const totalToday = todaysRewards.reduce((sum, t) => sum + t.amount, 0);
-    if (totalToday + pointsEarned > MAX_DAILY_EXPENSE_REWARD_POINTS) {
-      return res.status(429).json({
-        success: false,
-        message: 'Daily expense-to-reward limit reached. Try again tomorrow.',
-      });
-    }
-
-    const user = await User.findById(req.user.id);
-    user.walletPoints += pointsEarned;
-    await user.save();
-
-    await Transaction.create({
-      userId: user._id,
-      merchantId: merchantId || user._id, // fallback if merchant ID not found
-      type: 'reward',
-      amount: pointsEarned,
-      currency: 'PTS',
-      description: `Reward for expense of ${amount}`,
-      status: 'completed',
-      reference: `EXP-REW-${Date.now()}`
-    });
-
-    res.json({
-      success: true,
-      message: 'Expense successfully converted to rewards!',
-      data: { pointsEarned, newBalance: user.walletPoints }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+  // §4.1 puts the merchant at the till: they scan the customer's QR and
+  // enter the invoice. This endpoint let the customer type their own spend
+  // and credited points for it with no merchant, no invoice and no
+  // verification — points that nothing backed, minted on request.
+  //
+  // Answered rather than deleted so an app still on the old build gets an
+  // explanation instead of a 404 it would show as "something went wrong".
+  res.status(410).json({
+    success: false,
+    code: 'FLOW_MOVED_TO_MERCHANT',
+    message: 'Points are now added by the shop. Show your VIPs QR code at the till and they will scan it.',
+  });
 });
 
 // ─── POST /api/rewards/apply-coupon ───────────────────────
@@ -289,65 +239,97 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
 
 // ─── POST /api/rewards/send-gift ──────────────────────────
 router.post('/send-gift', authMiddleware, async (req, res) => {
-  try {
-    const { recipientPhone, amount, message } = req.body;
+  // This used to move `walletBalance` — dinars topped up through Paymee or
+  // PayPal — from one customer to another, up to 1,000 TND a day.
+  //
+  // §4.3 forbids it outright, and §7 builds the platform's central-bank
+  // exemption on that prohibition: points are not transferable, and the one
+  // sanctioned way to share value is to buy an offer in a friend's name.
+  // POST /rewards/gift-offer below does exactly that.
+  res.status(410).json({
+    success: false,
+    code: 'USE_GIFT_OFFER',
+    message: 'Balance cannot be sent between accounts. Buy an offer as a gift instead — the code goes straight to them.',
+  });
+});
 
-    if (!recipientPhone || !amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'recipientPhone and a valid amount are required' });
-    }
-    if (amount < MIN_GIFT_AMOUNT || amount > MAX_GIFT_AMOUNT_PER_TX) {
-      return res.status(400).json({
-        success: false,
-        message: `Amount must be between ${MIN_GIFT_AMOUNT} and ${MAX_GIFT_AMOUNT_PER_TX} TND per gift.`,
-      });
+// ─── POST /api/rewards/gift-offer ─────────────────────────
+/**
+ * §4.3: "إهداء عرض" — the only sanctioned way to share value.
+ *
+ * The buyer spends their own points on a voucher issued in a friend's name.
+ * No balance moves between accounts: points leave the buyer, and what the
+ * recipient receives is a voucher, redeemable only inside VIPs.
+ */
+router.post('/gift-offer', authMiddleware, async (req, res) => {
+  try {
+    const { recipientPhone, points, message } = req.body;
+    const { pointsToTnd } = require('../config/economics');
+
+    const cost = Math.floor(Number(points));
+    if (!recipientPhone || !Number.isFinite(cost) || cost <= 0) {
+      return res.status(400).json({ success: false, message: "Enter the friend's phone number and how many points to spend." });
     }
 
     const sender = await User.findById(req.user.id);
     if (!sender) return res.status(404).json({ success: false, message: 'User not found' });
-    if (sender.walletBalance < amount) {
-      return res.status(400).json({ success: false, message: 'Insufficient balance' });
+
+    const phone = String(recipientPhone).trim();
+    if (phone === sender.phone) {
+      return res.status(400).json({ success: false, message: 'A gift has to go to someone else.' });
     }
 
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
-    const startOfMonth = new Date();
-    startOfMonth.setDate(1);
-    startOfMonth.setHours(0, 0, 0, 0);
-
-    const [todaysGifts, monthsGifts] = await Promise.all([
-      Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfDay } }).select('amount'),
-      Transaction.find({ userId: req.user.id, type: 'expense', reference: { $regex: '^GIFT-' }, createdAt: { $gte: startOfMonth } }).select('amount'),
-    ]);
-    const spentToday = todaysGifts.reduce((sum, t) => sum + t.amount, 0);
-    const spentThisMonth = monthsGifts.reduce((sum, t) => sum + t.amount, 0);
-
-    if (spentToday + amount > MAX_DAILY_GIFT_AMOUNT) {
-      return res.status(429).json({ success: false, message: 'Daily gift limit reached. Try again tomorrow.' });
-    }
-    if (spentThisMonth + amount > MAX_MONTHLY_GIFT_AMOUNT) {
-      return res.status(429).json({ success: false, message: 'Monthly gift limit reached.' });
+    // Anything pending its twelve hours is not spendable yet, so settle
+    // what is due before reading the balance.
+    await require('../utils/giftback').activateDue(sender._id);
+    const fresh = await User.findById(sender._id);
+    if ((fresh.walletPoints || 0) < cost) {
+      return res.status(400).json({
+        success: false,
+        message: `You have ${fresh.walletPoints || 0} points; this gift costs ${cost}.`,
+      });
     }
 
-    // Deduct from sender
-    sender.walletBalance -= amount;
-    await sender.save();
+    const recipient = await User.findOne({ phone, role: 'customer' }).select('_id fullName');
+    if (!recipient) {
+      return res.status(404).json({ success: false, message: 'No VIPs account uses that number.' });
+    }
 
-    const code = 'GIFT-' + Math.random().toString(36).substr(2, 8).toUpperCase();
+    fresh.walletPoints -= cost;
+    await fresh.save();
 
+    const code = 'GIFT-' + Math.random().toString(36).slice(2, 10).toUpperCase();
     const [gift] = await Promise.all([
-      GiftVoucher.create({ senderId: req.user.id, recipientPhone, amount, message, code }),
+      GiftVoucher.create({
+        senderId: fresh._id,
+        recipientPhone: phone,
+        amount: pointsToTnd(cost),
+        message: message || '',
+        code,
+      }),
       Transaction.create({
-        userId: req.user.id,
+        userId: fresh._id,
+        merchantId: null,
         type: 'expense',
-        amount,
-        currency: 'TND',
-        description: `Gift sent to ${recipientPhone} — code: ${code}`,
+        amount: cost,
+        currency: 'PTS',
+        description: `Offer gifted to ${phone} — code ${code}`,
         status: 'completed',
         reference: code,
       }),
     ]);
 
-    res.status(201).json({ success: true, message: 'Gift sent', data: { gift, newBalance: sender.walletBalance } });
+    res.status(201).json({
+      success: true,
+      message: `Gift sent to ${recipient.fullName}.`,
+      data: {
+        gift,
+        code,
+        pointsSpent: cost,
+        valueTnd: pointsToTnd(cost),
+        newBalance: fresh.walletPoints,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -62,6 +62,11 @@ const Coupon      = require('../models/Coupon');
 const Payout      = require('../models/Payout');
 const BusinessRegistration = require('../models/BusinessRegistration');
 const Product = require('../models/Product');
+const guarantee = require('../utils/guarantee');
+const giftback  = require('../utils/giftback');
+const {
+  pointsForInvoice, pointsToTnd, tndToPoints, DEFAULT_EARN_RATE, GIFTBACK, BUDGET_LABELS,
+} = require('../config/economics');
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -1053,134 +1058,237 @@ router.put('/orders/:id/status', async (req, res) => {
 // inside the /limits handler, so the send endpoint accepted any amount:
 // over the daily cap, over the per-transaction max, or negative — and a
 // negative amount subtracted points from the customer's wallet.
-const GIFT_BACK_LIMITS = {
-  DAILY:   1000,
-  MONTHLY: 10000,
-  TX_MIN:  1,
-  TX_MAX:  1000,
-};
+/**
+ * Resolves a scanned VIPs QR (`VIPS_USER_<id>`, see vips_id_view.dart) or a
+ * typed phone number to the customer it belongs to.
+ *
+ * Deliberately not scoped to this merchant's existing customers: the whole
+ * point of a loyalty network is the customer standing at the till for the
+ * first time.
+ */
+async function resolveCustomer({ userId, phone, qr }) {
+  const scanned = String(qr || '').trim();
+  const fromQr = scanned.startsWith('VIPS_USER_') ? scanned.slice('VIPS_USER_'.length) : null;
+  const id = fromQr || userId;
 
-async function giftBackUsage(merchantId) {
-  const now = new Date();
-  const startOfDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const moid = require('mongoose').Types.ObjectId.createFromHexString(String(merchantId));
-
-  const [dailyUsed, monthlyUsed] = await Promise.all([
-    Transaction.aggregate([
-      { $match: { merchantId: moid, type: 'gift_back', createdAt: { $gte: startOfDay } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]),
-    Transaction.aggregate([
-      { $match: { merchantId: moid, type: 'gift_back', createdAt: { $gte: startOfMonth } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]),
-  ]);
-
-  const daily   = dailyUsed[0]?.total   || 0;
-  const monthly = monthlyUsed[0]?.total || 0;
-  return {
-    dailyUsed:      daily,
-    monthlyUsed:    monthly,
-    remainingDaily:   Math.max(0, GIFT_BACK_LIMITS.DAILY   - daily),
-    remainingMonthly: Math.max(0, GIFT_BACK_LIMITS.MONTHLY - monthly),
-  };
+  if (id && /^[a-fA-F0-9]{24}$/.test(String(id))) {
+    return User.findOne({ _id: id, role: 'customer' });
+  }
+  if (phone) return User.findOne({ phone: String(phone).trim(), role: 'customer' });
+  return null;
 }
 
-// ─── GET /api/merchant/gift-back/lookup ───────────────────
-// Resolves a scanned VIPs QR (VIPS_USER_<id>, see vips_id_view.dart) or a
-// typed phone number to a display name before the merchant confirms the
-// send — deliberately not scoped to /merchant/customers' transaction
-// history, since a gift-back's whole point can be a first-time customer.
-router.get('/gift-back/lookup', async (req, res) => {
+// ─── GET /api/merchant/customers/lookup ───────────────────
+// Name-only preview before the merchant commits to anything, so a mistyped
+// phone number is caught before points move.
+router.get('/customers/lookup', async (req, res) => {
   try {
-    const { userId, phone } = req.query;
-    if (!userId && !phone) {
-      return res.status(400).json({ success: false, message: 'userId or phone is required' });
+    const { userId, phone, qr } = req.query;
+    if (!userId && !phone && !qr) {
+      return res.status(400).json({ success: false, message: 'Scan a QR code or enter a phone number.' });
     }
-    const recipient = userId
-      ? await User.findById(userId).select('fullName phone')
-      : await User.findOne({ phone: String(phone).trim() }).select('fullName phone');
-    if (!recipient) return res.status(404).json({ success: false, message: 'No customer found' });
+    const customer = await resolveCustomer({ userId, phone, qr });
+    if (!customer) return res.status(404).json({ success: false, message: 'No VIPs customer matches that.' });
 
-    res.json({ success: true, data: { userId: recipient._id, fullName: recipient.fullName, phone: recipient.phone } });
+    const allowance = await giftback.monthlyAllowance(customer._id);
+    res.json({
+      success: true,
+      data: {
+        userId: String(customer._id),
+        fullName: customer.fullName,
+        phone: customer.phone,
+        profileImage: customer.profileImage || null,
+        giftbackAllowance: allowance,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// ─── POST /api/merchant/gift-back ─────────────────────────
-router.post('/gift-back', async (req, res) => {
+// ═══════════════════════════════════════════════════════════
+// §4.1 — EARNING POINTS AT THE TILL
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * POST /api/merchant/earn   { userId | phone | qr, invoiceAmount, giftbackChange?, giftbackConsent? }
+ *
+ * The customer pays as normal, shows their QR, and the merchant enters the
+ * invoice. This replaces POST /rewards/expense-to-reward, where the customer
+ * typed their own spend and the merchant was never involved — the document
+ * puts the merchant at the centre of this flow precisely because they are
+ * the one who saw the money.
+ *
+ * The points come out of the merchant's discount budget. §5.1 is explicit
+ * that redeemable points are covered by the guarantee; awarding points that
+ * nothing backs would make the platform, not the merchant, liable for them.
+ */
+router.post('/earn', async (req, res) => {
   try {
-    const { userId, phone, amount, message } = req.body;
-    if ((!userId && !phone) || amount === undefined || amount === null || amount === '') {
-      return res.status(400).json({ success: false, message: 'userId or phone, and amount, are required' });
+    const { userId, phone, qr, invoiceAmount, giftbackChange, giftbackConsent } = req.body;
+
+    const invoice = Number(invoiceAmount);
+    if (!Number.isFinite(invoice) || invoice <= 0) {
+      return res.status(400).json({ success: false, message: 'Enter the invoice total.' });
     }
 
-    // Validate the amount before touching anyone's wallet. A negative amount
-    // used to be accepted and *subtracted* points from the recipient.
-    const amt = parseFloat(amount);
-    if (!Number.isFinite(amt)) {
-      return res.status(400).json({ success: false, message: 'amount must be a number' });
-    }
-    if (amt < GIFT_BACK_LIMITS.TX_MIN) {
-      return res.status(400).json({ success: false, message: `Minimum gift back is ${GIFT_BACK_LIMITS.TX_MIN}` });
-    }
-    if (amt > GIFT_BACK_LIMITS.TX_MAX) {
-      return res.status(400).json({ success: false, message: `Maximum gift back per transaction is ${GIFT_BACK_LIMITS.TX_MAX}` });
-    }
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found.' });
 
-    const usage = await giftBackUsage(req.user.id);
-    if (amt > usage.remainingDaily) {
-      return res.status(400).json({
+    const rate = Number.isFinite(merchant.earnRate) ? merchant.earnRate : null;
+    if (rate === null || rate <= 0) {
+      return res.status(409).json({
         success: false,
-        message: `Daily gift-back limit reached. ${usage.remainingDaily} remaining today.`,
-        data: { remainingDailyLimit: usage.remainingDaily, remainingMonthlyLimit: usage.remainingMonthly },
-      });
-    }
-    if (amt > usage.remainingMonthly) {
-      return res.status(400).json({
-        success: false,
-        message: `Monthly gift-back limit reached. ${usage.remainingMonthly} remaining this month.`,
-        data: { remainingDailyLimit: usage.remainingDaily, remainingMonthlyLimit: usage.remainingMonthly },
+        message: 'Set your points-per-dinar rate in settings before recording a sale.',
+        data: { suggestedRate: DEFAULT_EARN_RATE },
       });
     }
 
-    // The merchant-app flow only ever collects a phone number (there's no
-    // reason a merchant would know a stranger's Mongo _id) — resolving it
-    // here, rather than requiring the app to pre-resolve it via
-    // /merchant/customers, also works for a customer this merchant has
-    // never transacted with before, which that endpoint can't find (it's
-    // scoped to this merchant's existing Transaction history).
-    const recipient = userId
-      ? await User.findById(userId)
-      : await User.findOne({ phone: String(phone).trim() });
-    if (!recipient) return res.status(404).json({ success: false, message: 'No customer found with that phone number' });
+    const customer = await resolveCustomer({ userId, phone, qr });
+    if (!customer) return res.status(404).json({ success: false, message: 'No VIPs customer matches that.' });
 
-    recipient.walletPoints = (recipient.walletPoints || 0) + amt;
-    await recipient.save();
+    const points = pointsForInvoice(invoice, rate);
 
-    const tx = await Transaction.create({
-      userId: recipient._id,
-      merchantId:  req.user.id,
-      type:        'gift_back',
-      amount:      amt,
-      currency:    'PTS',
-      description: message || 'Gift back from merchant',
-      status:      'completed',
-      reference:   `GIFT-${Date.now()}`,
+    // Funded before it is credited: if the budget cannot cover it, the
+    // customer must not walk away believing they earned something.
+    try {
+      await guarantee.fund(merchant._id, 'discount', points, {
+        customerId: customer._id,
+        note: `Earned on a ${invoice} TND invoice at ${rate} pts/TND`,
+      });
+    } catch (err) {
+      if (err.code === 'BUDGET_EXHAUSTED') {
+        return res.status(409).json({
+          success: false,
+          message: 'Your discount budget cannot cover this sale. Top up your guarantee or move points between budgets.',
+          data: { budget: err.budget, available: err.available, required: err.required },
+        });
+      }
+      throw err;
+    }
+
+    customer.walletPoints = (customer.walletPoints || 0) + points;
+    await customer.save();
+
+    await Transaction.create({
+      userId: customer._id,
+      merchantId: merchant._id,
+      type: 'reward',
+      amount: points,
+      currency: 'PTS',
+      description: `${points} points on a ${invoice} TND purchase`,
+      status: 'completed',
+      reference: `EARN-${Date.now()}`,
     });
 
-    const after = await giftBackUsage(req.user.id);
+    // Giftback rides along on the same sale when the customer agrees to it,
+    // which is exactly where the change actually arises.
+    let giftbackResult = null;
+    if (giftbackChange !== undefined && giftbackChange !== null && Number(giftbackChange) > 0) {
+      try {
+        const { grant, allowance } = await giftback.grant({
+          userId: customer._id,
+          merchantId: merchant._id,
+          changeTnd: giftbackChange,
+          invoiceTnd: invoice,
+          consented: giftbackConsent === true,
+        });
+        giftbackResult = {
+          accepted: true,
+          points: grant.points,
+          changeTnd: grant.changeTnd,
+          activatesAt: grant.activatesAt,
+          allowance,
+        };
+      } catch (err) {
+        // The sale and its points stand; only the optional extra failed.
+        giftbackResult = { accepted: false, reason: err.message };
+      }
+    }
+
     res.status(201).json({
       success: true,
-      message: 'Gift back sent!',
+      message: `${points} points added for ${customer.fullName}.`,
       data: {
-        ...tx.toObject(),
-        recipientName:  recipient.fullName,
-        recipientPhone: recipient.phone,
-        remainingDailyLimit:   after.remainingDaily,
-        remainingMonthlyLimit: after.remainingMonthly,
+        customer: { userId: String(customer._id), fullName: customer.fullName },
+        invoiceAmount: invoice,
+        earnRate: rate,
+        pointsAwarded: points,
+        pointsValueTnd: pointsToTnd(points),
+        customerBalance: customer.walletPoints,
+        giftback: giftbackResult,
+        guarantee: guarantee.summarise(await User.findById(merchant._id)),
+      },
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// §4.2 — GIFTBACK
+// ═══════════════════════════════════════════════════════════
+
+// ─── POST /api/merchant/gift-back ─────────────────────────
+// Standalone Giftback, for a sale recorded outside /earn. Every constraint
+// lives in utils/giftback so both paths obey the same rules.
+router.post('/gift-back', async (req, res) => {
+  try {
+    const { userId, phone, qr, changeTnd, invoiceTnd, consent } = req.body;
+    const customer = await resolveCustomer({ userId, phone, qr });
+    if (!customer) return res.status(404).json({ success: false, message: 'No VIPs customer matches that.' });
+
+    const { grant, allowance } = await giftback.grant({
+      userId: customer._id,
+      merchantId: req.user.id,
+      changeTnd,
+      invoiceTnd: invoiceTnd === undefined ? null : Number(invoiceTnd),
+      consented: consent === true,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `${grant.points} Giftback points recorded. They become spendable in ${GIFTBACK.ACTIVATION_DELAY_HOURS} hours.`,
+      data: {
+        id: String(grant._id),
+        recipientName: customer.fullName,
+        changeTnd: grant.changeTnd,
+        points: grant.points,
+        activatesAt: grant.activatesAt,
+        allowance,
+      },
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/merchant/gift-back/limits ───────────────────
+// The customer's remaining allowance — the cap is theirs, not the
+// merchant's, so it can only be answered about a named customer.
+router.get('/gift-back/limits', async (req, res) => {
+  try {
+    const customer = await resolveCustomer(req.query);
+    if (!customer) {
+      return res.json({
+        success: true,
+        data: {
+          maxChangeTnd: GIFTBACK.MAX_CHANGE_TND,
+          monthlyCapTnd: GIFTBACK.MONTHLY_CAP_TND,
+          activationDelayHours: GIFTBACK.ACTIVATION_DELAY_HOURS,
+          customer: null,
+        },
+      });
+    }
+    const allowance = await giftback.monthlyAllowance(customer._id);
+    res.json({
+      success: true,
+      data: {
+        maxChangeTnd: GIFTBACK.MAX_CHANGE_TND,
+        monthlyCapTnd: GIFTBACK.MONTHLY_CAP_TND,
+        activationDelayHours: GIFTBACK.ACTIVATION_DELAY_HOURS,
+        customer: { userId: String(customer._id), fullName: customer.fullName },
+        allowance,
       },
     });
   } catch (error) {
@@ -1189,46 +1297,34 @@ router.post('/gift-back', async (req, res) => {
 });
 
 // ─── GET /api/merchant/gift-back/history ──────────────────
+// §6.2's "سجل الموافقات على Giftback": every grant this merchant took, with
+// the change forgone and whether it has activated yet.
 router.get('/gift-back/history', async (req, res) => {
   try {
-    const { page = 1, limit = 20 } = req.query;
-    const filter = { merchantId: req.user.id, type: 'gift_back', status: 'completed' };
-
-    const [txs, total] = await Promise.all([
-      Transaction.find(filter)
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(parseInt(limit))
-        .populate('userId', 'fullName phone'),
-      Transaction.countDocuments(filter),
-    ]);
-
-    res.json({
-      success: true,
-      data: { transactions: txs, total, pagination: { page: parseInt(page), limit: parseInt(limit), pages: Math.ceil(total / limit) } },
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// ─── GET /api/merchant/gift-back/limits ───────────────────
-router.get('/gift-back/limits', async (req, res) => {
-  try {
-    const usage = await giftBackUsage(req.user.id);
+    const GiftbackGrant = require('../models/GiftbackGrant');
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const grants = await GiftbackGrant.find({ merchantId: req.user.id })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate('userId', 'fullName phone')
+      .lean();
 
     res.json({
       success: true,
       data: {
-        currency: 'D',
-        dailyLimit:            GIFT_BACK_LIMITS.DAILY,
-        remainingDailyLimit:   usage.remainingDaily,
-        monthlyLimit:          GIFT_BACK_LIMITS.MONTHLY,
-        remainingMonthlyLimit: usage.remainingMonthly,
-        dailyUsed:             usage.dailyUsed,
-        monthlyUsed:           usage.monthlyUsed,
-        txMin: GIFT_BACK_LIMITS.TX_MIN,
-        txMax: GIFT_BACK_LIMITS.TX_MAX,
+        items: grants.map((g) => ({
+          id: String(g._id),
+          customerName: g.userId?.fullName || 'Deleted customer',
+          changeTnd: g.changeTnd,
+          invoiceTnd: g.invoiceTnd,
+          points: g.points,
+          status: g.status,
+          consentedAt: g.consentedAt,
+          activatesAt: g.activatesAt,
+          grantedAt: g.createdAt,
+        })),
+        totalChangeTnd: grants.reduce((s, g) => s + g.changeTnd, 0),
+        totalPoints: grants.reduce((s, g) => s + g.points, 0),
       },
     });
   } catch (error) {
@@ -1237,8 +1333,105 @@ router.get('/gift-back/limits', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// CASHIERS
+// §5.1 / §5.2 — THE GUARANTEE
 // ═══════════════════════════════════════════════════════════
+
+// ─── GET /api/merchant/guarantee ──────────────────────────
+router.get('/guarantee', async (req, res) => {
+  try {
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found.' });
+    res.json({
+      success: true,
+      data: { ...guarantee.summarise(merchant), budgetLabels: BUDGET_LABELS },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/merchant/guarantee/allocate ────────────────
+// Split unallocated points across the three budgets (§5.1).
+router.post('/guarantee/allocate', async (req, res) => {
+  try {
+    const { budget, points } = req.body;
+    const data = await guarantee.allocate(req.user.id, budget, points, { byId: req.user.id });
+    res.json({ success: true, message: 'Budget updated.', data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/merchant/guarantee/reallocate ──────────────
+router.post('/guarantee/reallocate', async (req, res) => {
+  try {
+    const { fromBudget, toBudget, points } = req.body;
+    const data = await guarantee.reallocate(req.user.id, fromBudget, toBudget, points, { byId: req.user.id });
+    res.json({ success: true, message: 'Points moved.', data });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/merchant/guarantee/ledger ───────────────────
+router.get('/guarantee/ledger', async (req, res) => {
+  try {
+    const GuaranteeLedger = require('../models/GuaranteeLedger');
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const filter = { merchantId: req.user.id };
+    if (req.query.type) filter.type = req.query.type;
+
+    const [items, total] = await Promise.all([
+      GuaranteeLedger.find(filter).sort({ createdAt: -1 }).limit(limit).lean(),
+      GuaranteeLedger.countDocuments(filter),
+    ]);
+    res.json({ success: true, data: { items, total } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/merchant/guarantee/refund ───────────────────
+// What can be taken out and, when it cannot, exactly why (§5.2).
+router.get('/guarantee/refund', async (req, res) => {
+  try {
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found.' });
+    res.json({ success: true, data: guarantee.refundability(merchant) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── POST /api/merchant/guarantee/refund ──────────────────
+// Files the request and holds the points. Reviewed within five working days
+// (§5.2); the cash rail itself is not wired up, same honest gap as payouts.
+router.post('/guarantee/refund', async (req, res) => {
+  try {
+    const { amount, bankName, accountName, accountNumber, note } = req.body;
+    const data = await guarantee.refund(req.user.id, amount, {
+      byId: req.user.id,
+      note: note || 'Guarantee refund request',
+    });
+
+    const payout = await Payout.create({
+      merchantId: req.user.id,
+      amount: Number(amount),
+      bankName: bankName || '',
+      accountName: accountName || '',
+      accountNumber: accountNumber || '',
+      note: 'Guarantee refund',
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `Refund requested. It is reviewed within ${guarantee.refundability(await User.findById(req.user.id)).reviewWorkingDays} working days.`,
+      data: { payout, guarantee: data },
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
 
 // ─── GET /api/merchant/cashiers ───────────────────────────
 router.get('/cashiers', async (req, res) => {

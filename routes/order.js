@@ -9,9 +9,10 @@ const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Same conversion rate as GET /api/config/rates (index.js) — kept in sync
-// manually since rates aren't stored in the DB yet.
-const VIPS_TO_TND = 0.1;
+// §5.1: 100 points = 1 TND, from the one module that defines it. This was
+// 0.1 — ten times the documented rate — duplicated here, in payment.js and
+// in index.js, which is how the three drifted apart.
+const { TND_PER_POINT: VIPS_TO_TND } = require('../config/economics');
 
 // ─── POST /api/order/create ───────────────────────────────
 router.post('/create', authMiddleware, async (req, res) => {

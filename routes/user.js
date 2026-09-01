@@ -11,11 +11,20 @@ const { seedDemoTransactionsForUser } = require('../utils/autoSeeder');
 const router = express.Router();
 
 // All user routes require authentication
+const giftback = require('../utils/giftback');
+const { pointsToTnd } = require('../config/economics');
+
 router.use(authMiddleware);
 
 // ─── GET /api/user/wallet ─────────────────────────────────
 router.get('/wallet', async (req, res) => {
   try {
+    // Giftback points become spendable twelve hours after they are granted
+    // (§4.2). Settling anything due here, on the way in, means the balance
+    // this endpoint reports is never behind what the customer is owed —
+    // a scheduled job would leave a window where it was.
+    await giftback.activateDue(req.user.id);
+
     const user = await User.findById(req.user.id).select(
       'walletBalance walletPoints'
     );
@@ -27,11 +36,17 @@ router.get('/wallet', async (req, res) => {
       .limit(10)
       .populate('merchantId', 'storeName fullName');
 
+    const pending = await giftback.summaryFor(req.user.id);
+
     res.json({
       success: true,
       data: {
         balance: user.walletBalance,
         points: user.walletPoints,
+        pointsValueTnd: pointsToTnd(user.walletPoints || 0),
+        // Points already earned but not yet spendable, shown separately so
+        // the wallet total is never a number the customer cannot use.
+        pendingGiftbackPoints: pending.pendingPoints,
         recentTransactions,
       },
     });
@@ -758,6 +773,19 @@ router.get('/payment-methods', async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select('paymentMethods');
     res.json({ success: true, data: { cards: user?.paymentMethods || [] } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/user/giftback ───────────────────────────────
+/**
+ * §6.1's "قسم خاص بنقاط Giftback": what was granted, what is still pending
+ * its twelve hours, and how much of this month's 50 TND allowance is left.
+ */
+router.get('/giftback', async (req, res) => {
+  try {
+    res.json({ success: true, data: await giftback.summaryFor(req.user.id) });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
