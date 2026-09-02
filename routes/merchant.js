@@ -304,7 +304,9 @@ router.get('/wallet', async (req, res) => {
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const moid  = new (require('mongoose').Types.ObjectId)(merchantId);
 
-    const [agg, todayAgg, merchant, pendingPointsAgg, pendingPayoutAgg] = await Promise.all([
+    const GiftbackGrant = require('../models/GiftbackGrant');
+
+    const [agg, todayAgg, merchant, pendingPointsAgg, pendingPayoutAgg, pointsAgg] = await Promise.all([
       Transaction.aggregate([
         { $match: { merchantId: moid, status: 'completed' } },
         { $group: { _id: '$type', total: { $sum: '$amount' } } },
@@ -325,12 +327,36 @@ router.get('/wallet', async (req, res) => {
         { $match: { merchantId: moid, status: { $in: ['pending', 'approved'] } } },
         { $group: { _id: null, total: { $sum: '$amount' } } },
       ]),
+      // Points only. The figures below used to add `income` — dinars — to
+      // `reward` and `gift_back` — points — and print the sum under a label
+      // reading PTS. Filtering on the currency is what makes "Vips In" a
+      // number of points rather than two units added together.
+      Transaction.aggregate([
+        { $match: { merchantId: moid, status: 'completed', currency: 'PTS' } },
+        { $group: { _id: '$type', total: { $sum: '$amount' } } },
+      ]),
+    ]);
+
+    // Giftback this merchant granted that is still inside its twelve hours:
+    // promised to a customer, not yet spendable by them.
+    const pendingGiftback = await GiftbackGrant.aggregate([
+      { $match: { merchantId: moid, status: 'pending' } },
+      { $group: { _id: null, points: { $sum: '$points' } } },
     ]);
 
     const byType = {};
     agg.forEach(r => { byType[r._id] = r.total; });
 
-    const totalIn  = (byType['income'] || 0) + (byType['gift_back'] || 0) + (byType['reward'] || 0);
+    const byPoints = {};
+    pointsAgg.forEach(r => { byPoints[r._id] = r.total; });
+
+    // In: points that came back to this merchant (a voucher spent in store).
+    // Out: points handed to customers, earned or gifted.
+    const pointsIn  = (byPoints['income'] || 0) + (byPoints['credit'] || 0);
+    const pointsOut = (byPoints['reward'] || 0) + (byPoints['gift_back'] || 0);
+
+    // Kept for the finance screens, which are about money.
+    const totalIn  = byType['income']  || 0;
     const totalOut = byType['expense'] || 0;
 
     res.json({
@@ -338,10 +364,14 @@ router.get('/wallet', async (req, res) => {
       data: {
         balance:       merchant?.walletBalance || 0,
         points:        merchant?.walletPoints  || 0,
-        pendingPoints: pendingPointsAgg[0]?.total || 0,
+        // Points, on a screen that reports points.
+        pendingPoints: pendingGiftback[0]?.points || pendingPointsAgg[0]?.total || 0,
         pendingPayout: pendingPayoutAgg[0]?.total || 0,
-        totalVipsIn:   totalIn,
-        totalVipsOut:  totalOut,
+        totalVipsIn:   pointsIn,
+        totalVipsOut:  pointsOut,
+        // Dinars, for the money figures on the same screen.
+        totalMoneyIn:  totalIn,
+        totalMoneyOut: totalOut,
         todayEarning:  todayAgg[0]?.total || 0,
         netBalance:    totalIn - totalOut,
       },

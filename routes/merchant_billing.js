@@ -95,6 +95,24 @@ router.get('/stats', async (req, res) => {
 
 // ─── POST /api/merchant/billing ───────────────────────────
 // Create a new POS bill
+/**
+ * A short, unambiguous code for a bill awaiting payment.
+ *
+ * Avoids 0/O and 1/I entirely: the code is read off a screen by a camera in
+ * a restaurant and sometimes typed by hand, and those pairs are where people
+ * and OCR both go wrong.
+ */
+const PAY_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const PAY_CODE_TTL_MS = 60 * 60 * 1000; // an hour at the table is generous
+
+function makePayCode() {
+  let out = '';
+  for (let i = 0; i < 8; i++) {
+    out += PAY_ALPHABET[Math.floor(Math.random() * PAY_ALPHABET.length)];
+  }
+  return `VB-${out}`;
+}
+
 router.post('/', async (req, res) => {
   try {
     const {
@@ -154,6 +172,12 @@ router.post('/', async (req, res) => {
       notes:          notes || '',
       cashierId:      cashierId || null,
       status:         'active',
+      // An unpaid bill gets a code the customer's app can resolve, so the QR
+      // on the merchant's screen refers to something rather than merely
+      // describing it. A bill already settled needs no code.
+      ...(resolvedStatus === 'pending'
+        ? { payCode: makePayCode(), payCodeExpiresAt: new Date(Date.now() + PAY_CODE_TTL_MS) }
+        : {}),
     });
 
     // Record income only for money actually taken. Every bill used to book a

@@ -2120,6 +2120,101 @@ async function testChat() {
 //
 // Each block here is a rule that came off a reviewed screen, kept so the
 // behaviour cannot quietly go back to what it was.
+// ─── FLOW 26: Paying a bill with points ──────────────────────────────
+//
+// §4.3's other half: the customer spends points at the till. The QR used to
+// encode the bill number and amount as plain text — a description of the
+// bill rather than a reference to it, so nothing could look it up and
+// nothing could be paid.
+async function testPayWithPoints() {
+  console.log('\n💳 FLOW 26: Paying a bill with points');
+
+  const stamp = Date.now();
+  const shop = await seedUser({
+    fullName: 'Points Resto', email: `pay_m_${stamp}@vips.test`,
+    phone: _uniquePhone('7'), password: 'PayPass123', role: 'merchant',
+    storeName: 'Points Resto', storeCategory: 'Restaurant', earnRate: 6,
+  });
+  const diner = await seedUser({
+    fullName: 'Points Diner', email: `pay_c_${stamp}@vips.test`,
+    phone: _uniquePhone('8'), password: 'PayPass123', role: 'customer',
+    walletPoints: 5000,
+  });
+  const mTok = (await req('POST', '/auth/login',
+    { email: shop.email, password: 'PayPass123' })).data?.token;
+  const cTok = (await req('POST', '/auth/login',
+    { email: diner.email, password: 'PayPass123' })).data?.token;
+  if (!mTok || !cTok) return assert('pay-with-points logins', false);
+
+  // The shop rings up a meal and leaves it unpaid.
+  const bill = await req('POST', '/merchant/billing', {
+    items: [{ name: 'Meal', price: 12, quantity: 1, total: 12 }],
+    subtotal: 12, grandTotal: 12, paidAmount: 0, paymentStatus: 'pending',
+  }, mTok);
+  const code = bill.data?.payCode;
+  assert('an unpaid bill is issued a code the customer can resolve',
+    typeof code === 'string' && /^VB-[A-Z2-9]{8}$/.test(code), String(code));
+  assert('and it is not booked as paid', bill.data?.paymentStatus === 'pending',
+    String(bill.data?.paymentStatus));
+
+  // What the customer sees before agreeing to anything.
+  const view = await req('GET', `/pay/bill/${code}`, null, cTok);
+  assert('the customer sees the shop, the amount and what it costs',
+    view.data?.merchant?.name === 'Points Resto' &&
+      view.data?.dueTnd === 12 && view.data?.pointsNeeded === 1200,
+    JSON.stringify({ n: view.data?.merchant?.name, d: view.data?.dueTnd, p: view.data?.pointsNeeded }));
+  assert('and whether they can cover it', view.data?.canPay === true);
+
+  // The camera reads the whole payload, not a bare code.
+  const scanned = await req('GET',
+    `/pay/bill/${encodeURIComponent(`vips_bill:${code}`)}`, null, cTok);
+  assert('a scanned QR payload resolves to the same bill',
+    scanned.data?.payCode === code, String(scanned.data?.payCode));
+
+  const paid = await req('POST', `/pay/bill/${code}`, {}, cTok);
+  assert('the bill is settled from the points balance',
+    paid.success === true && paid.data?.pointsSpent === 1200, paid.message);
+  assert('and the balance drops by exactly that',
+    paid.data?.remainingPoints === 3800, String(paid.data?.remainingPoints));
+
+  const again = await req('POST', `/pay/bill/${code}`, {}, cTok);
+  assert('the same bill cannot be paid twice', again.status === 409, `${again.status}`);
+  const reread = await req('GET', `/pay/bill/${code}`, null, cTok);
+  assert('and re-scanning says it is paid rather than "no such bill"',
+    reread.status === 409 && /already been paid/i.test(reread.message || ''),
+    `${reread.status} ${reread.message}`);
+
+  // §4.2: the shop handed over goods for points, so the value returns to the
+  // balance that funds their offers.
+  const guarantee = await req('GET', '/merchant/guarantee', null, mTok);
+  assert('the points return to the shop\'s general balance',
+    guarantee.data?.budgets?.general === 1200,
+    String(guarantee.data?.budgets?.general));
+
+  // Someone who cannot cover it.
+  const broke = await seedUser({
+    fullName: 'No Points', email: `pay_b_${stamp}@vips.test`,
+    phone: _uniquePhone('9'), password: 'PayPass123', role: 'customer',
+  });
+  const bTok = (await req('POST', '/auth/login',
+    { email: broke.email, password: 'PayPass123' })).data?.token;
+  const bill2 = await req('POST', '/merchant/billing', {
+    items: [{ name: 'Feast', price: 900, quantity: 1, total: 900 }],
+    subtotal: 900, grandTotal: 900, paidAmount: 0, paymentStatus: 'pending',
+  }, mTok);
+  const short = await req('POST', `/pay/bill/${bill2.data.payCode}`, {}, bTok);
+  assert('a customer without the points is refused, and told by how much',
+    short.status === 400 && short.data?.pointsNeeded === 90000,
+    `${short.status} ${JSON.stringify(short.data)}`);
+
+  const nonsense = await req('GET', '/pay/bill/NOT-A-CODE', null, cTok);
+  assert('a code that is not a bill code is refused', nonsense.status === 400,
+    `${nonsense.status}`);
+
+  await require('../models/MerchantBill').deleteMany({ merchantId: shop._id });
+  await User.deleteMany({ email: { $in: [shop.email, diner.email, broke.email] } });
+}
+
 async function testScreenshotFixes() {
   console.log('\n🖼  FLOW 25: Reviewed-screen behaviour');
   if (!adminToken) return assert('screenshot-fix prerequisites', false);
@@ -2626,6 +2721,7 @@ async function runAll() {
     await testAdminOrderCancel();
     await testBusinessModel();
     await testScreenshotFixes();
+    await testPayWithPoints();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }

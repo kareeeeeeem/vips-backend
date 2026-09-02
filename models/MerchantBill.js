@@ -31,6 +31,23 @@ const merchantBillSchema = new mongoose.Schema(
     cashierId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Employee', default: null },
     status:         { type: String, enum: ['active', 'voided', 'refunded'], default: 'active' },
     voidReason:     { type: String, default: '' },
+
+    /**
+     * Short code the customer's app resolves to this bill (§4.3, paying with
+     * points). The QR used to encode the bill number and the amount as plain
+     * text, which is a label rather than a reference — nothing on the
+     * customer's side could look it up, so nothing could be paid with it.
+     *
+     * Deliberately not the Mongo id: a bill code is shown on a screen, read
+     * by a stranger's camera, and sometimes typed, and an id that leaks the
+     * shape of the database is not what belongs on a restaurant table.
+     */
+    payCode:        { type: String, default: null, unique: true, sparse: true, index: true },
+    /** Bills are settled at the till, so a code is not open indefinitely. */
+    payCodeExpiresAt: { type: Date, default: null },
+    /** Points actually spent, when the customer paid this way. */
+    pointsSpent:    { type: Number, default: 0 },
+    paidAt:         { type: Date, default: null },
   },
   { timestamps: true }
 );

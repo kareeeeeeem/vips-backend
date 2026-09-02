@@ -150,6 +150,8 @@ app.use('/api/rewards',   rewardsRoutes);
 app.use('/api/favorites', favoritesRoutes);
 app.use('/api/cart',      cartRoutes);
 app.use('/api/payment',   paymentRoutes);
+// §4.3: settling a merchant's bill from a customer's points balance.
+app.use('/api/pay',       require('./routes/pay'));
 
 // ═══════════════════════════════════════════════════════════
 // MERCHANT-SIDE ROUTES
