@@ -1061,6 +1061,114 @@ router.put('/merchants/:id/plan', requirePermission('merchants.update'), async (
   }
 });
 
+// ─── GET /admin/guarantee-requests ────────────────────────
+// Bank transfers merchants say they have sent, waiting to be confirmed.
+router.get('/guarantee-requests', requirePermission('merchants.read'), async (req, res) => {
+  try {
+    const GuaranteeDepositRequest = require('../models/GuaranteeDepositRequest');
+    const status = req.query.status || 'pending';
+    const rows = await GuaranteeDepositRequest.find(
+      status === 'all' ? {} : { status }
+    )
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .populate('merchantId', 'storeName fullName phone')
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        items: rows.map((r) => ({
+          id: String(r._id),
+          merchantId: r.merchantId ? String(r.merchantId._id) : null,
+          merchantName: r.merchantId?.storeName || r.merchantId?.fullName || 'Deleted merchant',
+          amountTnd: r.amountTnd,
+          reference: r.reference,
+          bankName: r.bankName,
+          note: r.note,
+          status: r.status,
+          requestedAt: r.createdAt,
+          reviewedAt: r.reviewedAt,
+        })),
+        pendingTotalTnd: rows
+          .filter((r) => r.status === 'pending')
+          .reduce((sum, r) => sum + r.amountTnd, 0),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── PUT /admin/guarantee-requests/:id ────────────────────
+/**
+ * Confirms or turns down a declared transfer.
+ *
+ * Confirming is what creates the points, and it runs through the same
+ * deposit path as a directly recorded one so the ledger reads identically
+ * either way. Guarded against being confirmed twice: a second confirmation
+ * would mint a second guarantee against one transfer.
+ */
+router.put('/guarantee-requests/:id', requirePermission('merchants.update'), async (req, res) => {
+  try {
+    if (!requireValidId(req, res)) return;
+    const GuaranteeDepositRequest = require('../models/GuaranteeDepositRequest');
+    const { action, note } = req.body;
+    if (!['confirm', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, message: 'action must be confirm or reject.' });
+    }
+
+    const request = await GuaranteeDepositRequest.findById(req.params.id);
+    if (!request) return res.status(404).json({ success: false, message: 'Request not found.' });
+    if (request.status !== 'pending') {
+      return res.status(409).json({
+        success: false,
+        message: `This request was already ${request.status}.`,
+      });
+    }
+
+    if (action === 'reject') {
+      request.status = 'rejected';
+      request.reviewedAt = new Date();
+      request.reviewedBy = req.user.id;
+      request.reviewNote = String(note || '').slice(0, 300);
+      await request.save();
+      return res.json({ success: true, message: 'Request turned down.', data: { status: request.status } });
+    }
+
+    // Claim it before crediting, so two administrators confirming at once
+    // cannot both credit the same transfer.
+    const claimed = await GuaranteeDepositRequest.findOneAndUpdate(
+      { _id: request._id, status: 'pending' },
+      {
+        $set: {
+          status: 'confirmed',
+          reviewedAt: new Date(),
+          reviewedBy: req.user.id,
+          reviewNote: String(note || '').slice(0, 300),
+        },
+      },
+      { new: true }
+    );
+    if (!claimed) {
+      return res.status(409).json({ success: false, message: 'This request was just handled by someone else.' });
+    }
+
+    const data = await guarantee.deposit(request.merchantId, request.amountTnd, {
+      byId: req.user.id,
+      note: `Bank transfer confirmed${request.reference ? ` — ref ${request.reference}` : ''}`,
+    });
+
+    res.json({
+      success: true,
+      message: `${request.amountTnd} TND confirmed and converted to points.`,
+      data: { status: 'confirmed', guarantee: data },
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── GET /admin/guarantees ────────────────────────────────
 // Platform-wide exposure: how much guarantee is held, and who is suspended.
 router.get('/guarantees', requirePermission('merchants.read'), async (req, res) => {

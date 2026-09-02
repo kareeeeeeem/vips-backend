@@ -60,12 +60,15 @@ const Due         = require('../models/Due');
 const Employee    = require('../models/Employee');
 const Coupon      = require('../models/Coupon');
 const Payout      = require('../models/Payout');
+const GuaranteeLedger = require('../models/GuaranteeLedger');
+const PosInvoice  = require('../models/PosInvoice');
 const BusinessRegistration = require('../models/BusinessRegistration');
 const Product = require('../models/Product');
 const guarantee = require('../utils/guarantee');
 const giftback  = require('../utils/giftback');
 const {
   pointsForInvoice, pointsToTnd, tndToPoints, DEFAULT_EARN_RATE, GIFTBACK, BUDGET_LABELS,
+  EDIT_COOLDOWN, cooldownUntil,
 } = require('../config/economics');
 
 const router = express.Router();
@@ -163,7 +166,7 @@ router.get('/dashboard', async (req, res) => {
     const since = startOf();
     const dateFilter = since ? { createdAt: { $gte: since } } : {};
 
-    const [agg, pending, total, dueAgg, stockAgg] = await Promise.all([
+    const [agg, pending, total, dueAgg, stockAgg, recoveryAgg] = await Promise.all([
       Transaction.aggregate([
         { $match: { merchantId: merchantObjectId, status: 'completed', ...dateFilter } },
         { $group: {
@@ -193,6 +196,14 @@ router.get('/dashboard', async (req, res) => {
         { $match: { merchantId: merchantObjectId } },
         { $group: { _id: null, value: { $sum: { $multiply: ['$currentStock', '$unitPrice'] } } } },
       ]),
+
+      // §5.2 "VIPs Recovery": guarantee points the merchant has taken back
+      // out as a bank transfer. Refund entries are signed negative on the
+      // ledger, so the sum is negated to report it as an amount recovered.
+      GuaranteeLedger.aggregate([
+        { $match: { merchantId: merchantObjectId, type: 'refund' } },
+        { $group: { _id: null, points: { $sum: '$points' }, tnd: { $sum: '$tnd' } } },
+      ]),
     ]);
 
     const byType = {};
@@ -215,10 +226,13 @@ router.get('/dashboard', async (req, res) => {
         totalDueCollect:     dueAgg[0]?.totalCollected || 0,
         pendingTransactions: pending,
         netProfit:           totalSales - totalExpenses,
-        // Total VIPs points this merchant has issued to customers in the
-        // period (rewards on spend + gift backs). Both are point outflows
-        // in PTS — netProfit is dinars and must never be shown as a VIPs figure.
-        totalVipsIssued:     totalRewards + totalGiftBack,
+        // "VIPs Recovery" (§5.2): guarantee points the merchant has taken
+        // back out as a bank transfer. This card used to read "VIPs Issued"
+        // and showed rewards + gift-backs added together — two different
+        // outflows summed into a figure that answered no question, and
+        // already shown individually either side of it.
+        vipsRecoveryPoints:  Math.abs(recoveryAgg[0]?.points || 0),
+        vipsRecoveryTnd:     Math.abs(recoveryAgg[0]?.tnd || 0),
         transactionCount:    total,
         period,
       },
@@ -475,6 +489,85 @@ router.get('/profile', async (req, res) => {
 });
 
 // ─── PUT /api/merchant/profile ────────────────────────────
+// ─── GET /api/merchant/storefront-discount ────────────────
+// The shop-wide discount and whether it may be changed yet.
+router.get('/storefront-discount', async (req, res) => {
+  try {
+    const merchant = await User.findById(req.user.id).select('discountPercentage discountChangedAt');
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    const locked = cooldownUntil(merchant.discountChangedAt, EDIT_COOLDOWN.STORE_DISCOUNT_HOURS);
+    res.json({
+      success: true,
+      data: {
+        discountPercentage: merchant.discountPercentage || 0,
+        editable: !locked,
+        editableAt: locked,
+        cooldownHours: EDIT_COOLDOWN.STORE_DISCOUNT_HOURS,
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── PUT /api/merchant/storefront-discount ────────────────
+/**
+ * Changes the discount shown across the shop's storefront.
+ *
+ * Held for a day between changes. The banner is what a customer decides to
+ * visit on; a figure that can be rewritten minute to minute is not an offer,
+ * and the merchant confirming it is the point of the wait rather than a
+ * formality.
+ */
+router.put('/storefront-discount', async (req, res) => {
+  try {
+    const value = parseFloat(req.body.discountPercentage);
+    if (!Number.isFinite(value) || value < 0 || value > 100) {
+      return res.status(400).json({
+        success: false,
+        message: 'The discount has to be between 0 and 100 percent.',
+      });
+    }
+
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    if ((merchant.discountPercentage || 0) === value) {
+      return res.json({
+        success: true,
+        message: 'That is already your discount.',
+        data: { discountPercentage: value, editable: false },
+      });
+    }
+
+    const locked = cooldownUntil(merchant.discountChangedAt, EDIT_COOLDOWN.STORE_DISCOUNT_HOURS);
+    if (locked) {
+      const hoursLeft = Math.ceil((locked - Date.now()) / 3600000);
+      return res.status(409).json({
+        success: false,
+        code: 'EDIT_COOLDOWN',
+        message: `You changed your storefront discount recently. You can change it again in ${hoursLeft} hour(s).`,
+        data: { availableAt: locked, hoursRemaining: hoursLeft },
+      });
+    }
+
+    merchant.discountPercentage = value;
+    merchant.discountChangedAt = new Date();
+    await merchant.save();
+
+    const nextChange = cooldownUntil(merchant.discountChangedAt, EDIT_COOLDOWN.STORE_DISCOUNT_HOURS);
+    res.json({
+      success: true,
+      message: `Your storefront now shows ${value}% off.`,
+      data: {
+        discountPercentage: value,
+        editable: false,
+        editableAt: nextChange,
+        cooldownHours: EDIT_COOLDOWN.STORE_DISCOUNT_HOURS,
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 router.put('/profile', async (req, res) => {
   try {
     const {
@@ -1391,6 +1484,187 @@ router.get('/guarantee/ledger', async (req, res) => {
   }
 });
 
+// ─── GET /api/merchant/report ─────────────────────────────
+/**
+ * The shop's position in one screen: what it sold, what it is owed, what it
+ * owes, and what is sitting on the shelves.
+ *
+ * Every figure is in dinars. Amounts are computed here rather than in the
+ * app so the report and the dashboard cannot answer the same question
+ * differently.
+ */
+router.get('/report', async (req, res) => {
+  try {
+    const merchantObjectId = new mongoose.Types.ObjectId(String(req.user.id));
+    const period = req.query.period || 'all';
+    const since = (() => {
+      const d = new Date(); d.setHours(0, 0, 0, 0);
+      if (period === 'today') return d;
+      if (period === 'week') { const w = new Date(d); w.setDate(d.getDate() - d.getDay()); return w; }
+      if (period === 'month') return new Date(d.getFullYear(), d.getMonth(), 1);
+      return null;
+    })();
+    const dateFilter = since ? { createdAt: { $gte: since } } : {};
+
+    const [txAgg, dueAgg, productAgg, stockAgg, posAgg] = await Promise.all([
+      Transaction.aggregate([
+        { $match: { merchantId: merchantObjectId, currency: { $ne: 'PTS' }, ...dateFilter } },
+        { $group: { _id: '$type', total: { $sum: '$amount' } } },
+      ]),
+      // A party is either a customer who owes the shop or a supplier the
+      // shop owes; they are opposite directions and must not be summed.
+      Due.aggregate([
+        { $match: { merchantId: merchantObjectId } },
+        {
+          $group: {
+            _id: '$isCustomer',
+            outstanding: { $sum: { $subtract: ['$totalAmount', '$paidAmount'] } },
+            parties: { $sum: 1 },
+          },
+        },
+      ]),
+      Product.aggregate([
+        { $match: { merchantId: merchantObjectId } },
+        { $group: { _id: '$category', items: { $sum: 1 } } },
+      ]),
+      Stock.aggregate([
+        { $match: { merchantId: merchantObjectId } },
+        {
+          $group: {
+            _id: null,
+            value: { $sum: { $multiply: ['$currentStock', '$unitPrice'] } },
+            units: { $sum: '$currentStock' },
+            lines: { $sum: 1 },
+          },
+        },
+      ]),
+      PosInvoice.aggregate([
+        { $match: { merchantId: merchantObjectId, status: 'completed', ...dateFilter } },
+        { $group: { _id: null, total: { $sum: '$total' }, count: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const byType = {};
+    txAgg.forEach((r) => { byType[r._id] = r.total; });
+
+    const customerRow = dueAgg.find((r) => r._id === true);
+    const supplierRow = dueAgg.find((r) => r._id === false);
+    const customerDue = Math.max(0, customerRow?.outstanding || 0);
+    const supplierDue = Math.max(0, supplierRow?.outstanding || 0);
+
+    const round = (n) => Math.round((n || 0) * 1000) / 1000;
+
+    res.json({
+      success: true,
+      data: {
+        period,
+        currency: 'TND',
+        sales: {
+          online: round(byType['income'] || 0),
+          counter: round(posAgg[0]?.total || 0),
+          total: round((byType['income'] || 0) + (posAgg[0]?.total || 0)),
+          counterInvoices: posAgg[0]?.count || 0,
+        },
+        purchases: round(byType['expense'] || 0),
+        due: {
+          // Owed to the shop by customers, and owed by the shop to
+          // suppliers. Reported apart because they pull opposite ways.
+          fromCustomers: round(customerDue),
+          toSuppliers: round(supplierDue),
+          net: round(customerDue - supplierDue),
+          customerParties: customerRow?.parties || 0,
+          supplierParties: supplierRow?.parties || 0,
+        },
+        catalogue: {
+          items: productAgg.reduce((sum, r) => sum + r.items, 0),
+          categories: productAgg.filter((r) => r._id).length,
+        },
+        stock: {
+          value: round(stockAgg[0]?.value || 0),
+          units: stockAgg[0]?.units || 0,
+          lines: stockAgg[0]?.lines || 0,
+        },
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── GET /api/merchant/guarantee/topup ────────────────────
+/**
+ * The two ways a merchant can put points behind their offers (§5.1).
+ *
+ * The first costs nothing: points customers spent in this shop have already
+ * come back to the general balance and can be moved to whichever budget
+ * needs them. The second is real money, and has to be received before it
+ * becomes points.
+ */
+router.get('/guarantee/topup', async (req, res) => {
+  try {
+    const GuaranteeDepositRequest = require('../models/GuaranteeDepositRequest');
+    const merchant = await User.findById(req.user.id);
+    if (!merchant) return res.status(404).json({ success: false, message: 'Merchant not found' });
+
+    const summary = guarantee.summarise(merchant);
+    const pending = await GuaranteeDepositRequest.find({
+      merchantId: req.user.id,
+      status: 'pending',
+    }).sort({ createdAt: -1 }).lean();
+
+    res.json({
+      success: true,
+      data: {
+        // Points already back from customers spending vouchers here. Moving
+        // them is what the document calls renewing the points' validity —
+        // they go back to funding offers instead of sitting idle.
+        recoverable: {
+          points: summary.budgets.general,
+          tnd: pointsToTnd(summary.budgets.general),
+          unallocatedPoints: summary.unallocatedPoints,
+        },
+        budgets: summary.budgets,
+        pointsPerTnd: 100,
+        pendingBankDeposits: pending.map((p) => ({
+          id: String(p._id),
+          amountTnd: p.amountTnd,
+          reference: p.reference,
+          requestedAt: p.createdAt,
+        })),
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── POST /api/merchant/guarantee/topup/bank ──────────────
+// Declares a bank transfer. Creates a request, not points.
+router.post('/guarantee/topup/bank', async (req, res) => {
+  try {
+    const GuaranteeDepositRequest = require('../models/GuaranteeDepositRequest');
+    const amount = Number(req.body.amountTnd);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Enter how much you transferred, in dinars.' });
+    }
+
+    const request = await GuaranteeDepositRequest.create({
+      merchantId: req.user.id,
+      amountTnd: amount,
+      reference: String(req.body.reference || '').slice(0, 120),
+      bankName: String(req.body.bankName || '').slice(0, 120),
+      note: String(req.body.note || '').slice(0, 300),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Sent. Your points are added once the transfer is confirmed as received.',
+      data: {
+        id: String(request._id),
+        amountTnd: request.amountTnd,
+        pointsWhenConfirmed: tndToPoints(request.amountTnd),
+        status: request.status,
+      },
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ─── GET /api/merchant/guarantee/refund ───────────────────
 // What can be taken out and, when it cannot, exactly why (§5.2).
 router.get('/guarantee/refund', async (req, res) => {
@@ -1916,18 +2190,52 @@ router.delete('/products/:id', async (req, res) => {
 // ─── GET  /api/merchant/coupons ───────────────────────────
 router.get('/coupons', async (req, res) => {
   try {
-    const coupons = await Coupon.find({ merchantId: req.user.id }).sort({ createdAt: -1 });
-    res.json({ success: true, data: coupons });
+    const coupons = await Coupon.find({ merchantId: req.user.id })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Whether each offer's terms can be changed yet, worked out here so the
+    // app can grey the control and say when instead of offering an edit that
+    // the server will refuse.
+    const withLock = coupons.map((c) => {
+      const locked = cooldownUntil(
+        c.termsChangedAt || c.createdAt,
+        EDIT_COOLDOWN.CATALOG_HOURS
+      );
+      return {
+        ...c,
+        editable: !locked,
+        editableAt: locked,
+        editCooldownHours: EDIT_COOLDOWN.CATALOG_HOURS,
+      };
+    });
+
+    res.json({ success: true, data: withLock });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ─── POST /api/merchant/coupons ───────────────────────────
 router.post('/coupons', async (req, res) => {
   try {
-    const { code, discount, discountPercentage, maxDiscountAmount, expiryDate, isActive, type, tags, maxUsage, minOrderAmount, description } = req.body;
+    const { code, discount, discountPercentage, maxDiscountAmount, expiryDate, isActive, type, tags, maxUsage, minOrderAmount, description, discountUnit } = req.body;
     const discountValue = parseFloat(discount ?? discountPercentage ?? 0);
     if (!code || isNaN(discountValue)) {
       return res.status(400).json({ success: false, message: 'code and discount are required' });
+    }
+
+    // A voucher carries a dinar value (§4.2); a coupon carries a percentage.
+    const unit = discountUnit === 'tnd' || type === 'voucher' ? 'tnd' : 'percent';
+    if (unit === 'percent' && (discountValue <= 0 || discountValue > 100)) {
+      return res.status(400).json({
+        success: false,
+        message: 'A percentage discount has to be between 1 and 100.',
+      });
+    }
+    if (unit === 'tnd' && discountValue <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'A voucher has to be worth more than nothing.',
+      });
     }
     const existing = await Coupon.findOne({ code: code.toUpperCase() });
     if (existing) {
@@ -1938,6 +2246,11 @@ router.post('/coupons', async (req, res) => {
       discount:          discountValue,
       maxDiscountAmount: maxDiscountAmount ? parseFloat(maxDiscountAmount) : null,
       type:              type || 'percentage',
+      discountUnit:      unit,
+      // What a customer spends to get it, at the documented 100 points to
+      // the dinar. Derived rather than typed so a voucher's price and its
+      // face value cannot drift apart.
+      pointsCost:        unit === 'tnd' ? tndToPoints(discountValue) : 0,
       expiryDate:        expiryDate ? new Date(expiryDate) : new Date(Date.now() + 30 * 86400000),
       isActive:          isActive !== false,
       merchantId:        req.user.id,
@@ -1963,6 +2276,12 @@ const COUPON_UPDATABLE = [
   'tags', 'maxUsage', 'minOrderAmount', 'description',
 ];
 
+// Changing any of these changes the deal a customer was shown, so they are
+// what the cooldown guards. Turning an offer off, or letting it expire, is
+// not a change of terms — a merchant must always be able to stop offering
+// something immediately.
+const COUPON_TERMS = ['discount', 'maxDiscountAmount', 'type', 'minOrderAmount', 'maxUsage'];
+
 router.put('/coupons/:id', async (req, res) => {
   try {
     const update = {};
@@ -1971,6 +2290,26 @@ router.put('/coupons/:id', async (req, res) => {
     }
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ success: false, message: 'No updatable fields supplied' });
+    }
+
+    const touchesTerms = COUPON_TERMS.some((k) => update[k] !== undefined);
+    if (touchesTerms) {
+      const existing = await Coupon.findOne({ _id: req.params.id, merchantId: req.user.id });
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'Coupon not found' });
+      }
+      const since = existing.termsChangedAt || existing.createdAt;
+      const locked = cooldownUntil(since, EDIT_COOLDOWN.CATALOG_HOURS);
+      if (locked) {
+        const hoursLeft = Math.ceil((locked - Date.now()) / 3600000);
+        return res.status(409).json({
+          success: false,
+          code: 'EDIT_COOLDOWN',
+          message: `This offer was published or changed recently. You can change its terms in ${hoursLeft} hour(s). You can switch it off now if you need to stop it.`,
+          data: { availableAt: locked, hoursRemaining: hoursLeft },
+        });
+      }
+      update.termsChangedAt = new Date();
     }
     if (update.discount !== undefined) {
       const d = parseFloat(update.discount);

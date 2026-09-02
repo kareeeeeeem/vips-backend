@@ -12,61 +12,59 @@ const Transaction = require('../models/Transaction');
 const router = express.Router();
 router.use(authMiddleware);
 
-// ─── Plan catalogue (static) ──────────────────────────────
-const PLANS = {
-  free: {
-    name:  'Free',
-    code:  'free',
-    price: 0,
-    features: {
-      maxProducts:     10,
-      maxCashiers:     1,
-      analytics:       false,
-      adsEnabled:      false,
-      prioritySupport: false,
-      apiAccess:       false,
-    },
-  },
+// ─── Plan catalogue (§8) ──────────────────────────────────
+// Three plans, priced in dinars, where the monthly fee buys a lower
+// commission. This used to be four tiers named Free/Basic/Pro/Enterprise
+// priced in dollars at 9.99/29.99/99.99 — a different product from the one
+// the platform document describes, and the reason the merchant's plan
+// screen came up empty: nothing it listed matched a plan the rest of the
+// system would accept.
+const { PLANS: ECONOMIC_PLANS } = require('../config/economics');
+
+const PLAN_FEATURES = {
   basic: {
-    name:  'Basic',
-    code:  'basic',
-    price: 9.99,
-    features: {
-      maxProducts:     50,
-      maxCashiers:     3,
-      analytics:       true,
-      adsEnabled:      false,
-      prioritySupport: false,
-      apiAccess:       false,
-    },
+    maxProducts:     50,
+    maxCashiers:     2,
+    customerDatabase: false,
+    smartSegments:   false,
+    campaigns:       false,
+    predictive:      false,
+    prioritySupport: false,
   },
-  pro: {
-    name:  'Professional',
-    code:  'pro',
-    price: 29.99,
-    features: {
-      maxProducts:     500,
-      maxCashiers:     10,
-      analytics:       true,
-      adsEnabled:      true,
-      prioritySupport: true,
-      apiAccess:       false,
-    },
+  professional: {
+    maxProducts:     500,
+    maxCashiers:     10,
+    customerDatabase: true,
+    smartSegments:   true,
+    campaigns:       true,
+    predictive:      false,
+    prioritySupport: false,
   },
-  enterprise: {
-    name:  'Enterprise',
-    code:  'enterprise',
-    price: 99.99,
-    features: {
-      maxProducts:     -1,
-      maxCashiers:     -1,
-      analytics:       true,
-      adsEnabled:      true,
-      prioritySupport: true,
-      apiAccess:       true,
-    },
+  advanced: {
+    maxProducts:     -1,
+    maxCashiers:     -1,
+    customerDatabase: true,
+    smartSegments:   true,
+    campaigns:       true,
+    predictive:      true,
+    prioritySupport: true,
   },
 };
+
+const PLANS = Object.fromEntries(
+  Object.entries(ECONOMIC_PLANS).map(([key, plan]) => [
+    key,
+    {
+      name:  plan.label,
+      code:  key,
+      // Dinars per month, and the commission the platform takes in return.
+      price: plan.monthlyFeeTnd,
+      currency: 'TND',
+      commissionPercent: plan.commissionPercent,
+      features: PLAN_FEATURES[key],
+    },
+  ])
+);
 
 // ─── GET /api/merchant/subscription/plans ─────────────────
 router.get('/plans', async (req, res) => {
@@ -80,10 +78,10 @@ router.get('/current', async (req, res) => {
     if (!sub) {
       sub = await MerchantSubscription.create({
         merchantId: req.user.id,
-        planName:   PLANS.free.name,
-        planCode:   PLANS.free.code,
-        price:      PLANS.free.price,
-        features:   PLANS.free.features,
+        planName:   PLANS.basic.name,
+        planCode:   PLANS.basic.code,
+        price:      PLANS.basic.price,
+        features:   PLANS.basic.features,
         startDate:  new Date(),
         endDate:    null,
         isActive:   true,
@@ -156,7 +154,24 @@ router.post('/subscribe', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    res.json({ success: true, message: `Subscribed to ${plan.name}`, data: sub });
+    // §8: the plan is what sets the commission, so the merchant's own record
+    // moves with it. Without this the subscription screen would take the
+    // money and change nothing the rest of the platform reads — the merchant
+    // would keep paying 3% on a plan they had upgraded off.
+    const merchantDoc = await User.findById(req.user.id);
+    if (merchantDoc) {
+      merchantDoc.merchantPlan = plan.code; // pre-save hook resets commissionRate
+      await merchantDoc.save();
+    }
+
+    res.json({
+      success: true,
+      message: `Subscribed to ${plan.name}`,
+      data: {
+        ...sub.toObject(),
+        commissionPercent: plan.commissionPercent,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -56,6 +56,12 @@ const userSchema = new mongoose.Schema(
     brandColor: { type: String, default: null }, // e.g., '0xFFDC2626'
     isTrending: { type: Boolean, default: false },
     discountPercentage: { type: Number, default: 0 },
+    /**
+     * When the storefront discount last changed. A shop-wide discount is a
+     * promise on the storefront, so it stands for a day before it can be
+     * rewritten — see EDIT_COOLDOWN.STORE_DISCOUNT_HOURS.
+     */
+    discountChangedAt:  { type: Date, default: null },
     // Platform cut on this merchant's sales, as a percentage. Derived from
     // `merchantPlan` (§8) rather than typed in — kept as a stored field so
     // historical reports still read the rate that applied at the time.

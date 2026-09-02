@@ -171,6 +171,11 @@ const merchantNotifRoutes      = require('./routes/merchant_notifications');
 // dues CRUD sub-router, so dues.js stays mounted for that one route.
 const duesRoutes               = require('./routes/dues');
 
+// §6.2: targeted offers to customer segments. Mounted *before* the generic
+// /api/merchant router: Express matches mounts in order, and routes/assets.js,
+// hrm.js and tax.js were once dead code for exactly this reason.
+app.use('/api/merchant/rewards',            require('./routes/merchant_rewards'));
+
 // Core merchant endpoints (profile, orders, finance, cashiers, stock,
 // assets, tax-rates, staff, dues CRUD, etc.)
 app.use('/api/merchant',                    merchantRoutes);

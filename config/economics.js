@@ -75,6 +75,31 @@ const REFUND = {
   REVIEW_WORKING_DAYS: 5,
 };
 
+// ─── Offer stability ───────────────────────────────────────
+// How long an offer has to stand before the merchant may change it again.
+//
+// A customer who sees "50 dinars off" and finds it is 20 by the time they
+// reach the till has been misled, even if nobody intended it. The wait is
+// what makes a published offer a commitment rather than a live-editable
+// number, and it is why the merchant confirms a change rather than simply
+// making one.
+const EDIT_COOLDOWN = {
+  /** Coupons and vouchers in the catalogue. */
+  CATALOG_HOURS: 12,
+  /** The shop-wide discount shown on the storefront. */
+  STORE_DISCOUNT_HOURS: 24,
+};
+
+/**
+ * When something last changed at `changedAt` may next be changed.
+ * Returns null when it can be changed now.
+ */
+const cooldownUntil = (changedAt, hours) => {
+  if (!changedAt) return null;
+  const until = new Date(new Date(changedAt).getTime() + hours * 60 * 60 * 1000);
+  return until > new Date() ? until : null;
+};
+
 // ─── §8 Subscription tiers ─────────────────────────────────
 // The monthly fee buys a lower commission, so a merchant's rate is a
 // property of their plan rather than a number typed in by hand.
@@ -95,5 +120,6 @@ module.exports = {
   POINTS_PER_TND, TND_PER_POINT, pointsToTnd, tndToPoints,
   DEFAULT_EARN_RATE, MAX_EARN_RATE, pointsForInvoice,
   GIFTBACK, BUDGETS, BUDGET_LABELS, REFUND,
+  EDIT_COOLDOWN, cooldownUntil,
   PLANS, PLAN_KEYS, commissionForInvoice,
 };

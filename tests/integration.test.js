@@ -2116,6 +2116,155 @@ async function testChat() {
 // The platform previously ran a redemption rate ten times the documented
 // one, two different earn rates at once, no guarantee at all, and a
 // Giftback that shared only its name with the one in §4.2.
+// ─── FLOW 25: What the screenshots asked for ─────────────────────────
+//
+// Each block here is a rule that came off a reviewed screen, kept so the
+// behaviour cannot quietly go back to what it was.
+async function testScreenshotFixes() {
+  console.log('\n🖼  FLOW 25: Reviewed-screen behaviour');
+  if (!adminToken) return assert('screenshot-fix prerequisites', false);
+
+  const stamp = Date.now();
+  const merchant = await seedUser({
+    fullName: 'Screens Store', email: `screens_m_${stamp}@vips.test`,
+    phone: _uniquePhone('5'), password: 'ScreensPass123', role: 'merchant',
+    storeName: 'Screens Store', earnRate: 6,
+  });
+  const customer = await seedUser({
+    fullName: 'Screens Customer', email: `screens_c_${stamp}@vips.test`,
+    phone: _uniquePhone('6'), password: 'ScreensPass123', role: 'customer',
+  });
+  const mTok = (await req('POST', '/auth/login',
+    { email: merchant.email, password: 'ScreensPass123' })).data?.token;
+  if (!mTok) return assert('screenshot-fix login', false);
+
+  // ── Vouchers carry dinars, not a percentage ──
+  const voucher = await req('POST', '/merchant/coupons', {
+    code: `SCV${stamp}`.slice(0, 14),
+    discount: 50, discountUnit: 'tnd', type: 'voucher',
+    expiryDate: new Date(Date.now() + 30 * 86400000).toISOString(),
+  }, mTok);
+  assert('a voucher is worth dinars, not a percentage',
+    voucher.data?.discountUnit === 'tnd' && voucher.data?.discount === 50,
+    JSON.stringify(voucher.data?.discountUnit));
+  assert('and its price in points follows the documented rate',
+    voucher.data?.pointsCost === 5000, String(voucher.data?.pointsCost));
+
+  const badPercent = await req('POST', '/merchant/coupons', {
+    code: `SCB${stamp}`.slice(0, 14), discount: 500, type: 'percentage',
+    expiryDate: new Date(Date.now() + 30 * 86400000).toISOString(),
+  }, mTok);
+  assert('a percentage above 100 is refused', badPercent.status === 400,
+    `${badPercent.status}`);
+
+  // ── A published offer stands for a while ──
+  const voucherId = voucher.data?._id;
+  const tooSoon = await req('PUT', `/merchant/coupons/${voucherId}`, { discount: 10 }, mTok);
+  assert('terms cannot be rewritten straight after publishing',
+    tooSoon.status === 409 && tooSoon.code === 'EDIT_COOLDOWN',
+    `${tooSoon.status} ${tooSoon.code}`);
+  const switchOff = await req('PUT', `/merchant/coupons/${voucherId}`, { isActive: false }, mTok);
+  assert('but it can always be switched off', switchOff.success === true, switchOff.message);
+
+  const listed = await req('GET', '/merchant/coupons', null, mTok);
+  const row = (listed.data || []).find((c) => String(c._id) === String(voucherId));
+  assert('the list says when each offer becomes editable',
+    row && row.editable === false && row.editableAt,
+    JSON.stringify(row && { editable: row.editable, at: row.editableAt }));
+
+  // ── The storefront discount holds for a day ──
+  const setDiscount = await req('PUT', '/merchant/storefront-discount',
+    { discountPercentage: 15 }, mTok);
+  assert('a merchant can set their storefront discount',
+    setDiscount.success === true, setDiscount.message);
+  const changeAgain = await req('PUT', '/merchant/storefront-discount',
+    { discountPercentage: 40 }, mTok);
+  assert('and cannot change it again the same day',
+    changeAgain.status === 409, `${changeAgain.status}`);
+  const overHundred = await req('PUT', '/merchant/storefront-discount',
+    { discountPercentage: 150 }, mTok);
+  assert('a discount above 100% is refused', overHundred.status === 400,
+    `${overHundred.status}`);
+
+  // ── VIPs Recovery is money taken back out, not points handed out ──
+  const dash = await req('GET', '/merchant/dashboard', null, mTok);
+  assert('the dashboard reports recovery rather than "issued"',
+    dash.data?.vipsRecoveryPoints !== undefined && dash.data?.totalVipsIssued === undefined,
+    JSON.stringify(Object.keys(dash.data || {}).filter((k) => k.startsWith('vips') || k.includes('Vips'))));
+
+  // ── Topping up: two sources, and money is confirmed before it counts ──
+  const topup = await req('GET', '/merchant/guarantee/topup', null, mTok);
+  assert('the top-up screen offers both sources',
+    topup.data?.recoverable !== undefined && Array.isArray(topup.data?.pendingBankDeposits),
+    JSON.stringify(topup.data));
+
+  const declared = await req('POST', '/merchant/guarantee/topup/bank',
+    { amountTnd: 500, reference: 'TRF-1' }, mTok);
+  assert('a declared transfer creates a request, not points',
+    declared.success === true && declared.data?.status === 'pending',
+    JSON.stringify(declared.data));
+  const beforeConfirm = await req('GET', '/merchant/guarantee', null, mTok);
+  assert('and no points exist until it is confirmed',
+    (beforeConfirm.data?.totalPoints || 0) === 0,
+    String(beforeConfirm.data?.totalPoints));
+
+  const requests = await req('GET', '/admin/guarantee-requests', null, adminToken);
+  const mine = (requests.data?.items || []).find((r) => r.id === declared.data.id);
+  assert('the console lists it for review', Boolean(mine), 'not listed');
+
+  const confirmed = await req('PUT', `/admin/guarantee-requests/${declared.data.id}`,
+    { action: 'confirm' }, adminToken);
+  assert('confirming it creates the points',
+    confirmed.data?.guarantee?.unallocatedPoints === 50000,
+    String(confirmed.data?.guarantee?.unallocatedPoints));
+  const twice = await req('PUT', `/admin/guarantee-requests/${declared.data.id}`,
+    { action: 'confirm' }, adminToken);
+  assert('and one transfer cannot be confirmed twice', twice.status === 409,
+    `${twice.status}`);
+
+  // ── Targeted offers ──
+  const segs = await req('GET', '/merchant/rewards/segments', null, mTok);
+  assert('every customer segment reports its live size',
+    (segs.data?.segments || []).length === 4 &&
+      segs.data.segments.every((x) => typeof x.customers === 'number'),
+    JSON.stringify((segs.data?.segments || []).map((x) => x.key)));
+
+  const action = await req('POST', '/merchant/rewards/actions',
+    { segment: 'be_back', discountType: 'percent', discountValue: 20, availabilityDays: 7 }, mTok);
+  assert('an offer starts as a draft with a message written for it',
+    action.data?.status === 'draft' && `${action.data?.message}`.length > 0,
+    JSON.stringify(action.data?.status));
+  const emptySend = await req('POST', `/merchant/rewards/actions/${action.data._id}/send`, {}, mTok);
+  assert('sending to an empty group is refused rather than sending nothing',
+    emptySend.status === 409, `${emptySend.status}`);
+
+  const badSegment = await req('POST', '/merchant/rewards/actions',
+    { segment: 'everyone', discountValue: 10 }, mTok);
+  assert('an unknown segment is refused', badSegment.status === 400, `${badSegment.status}`);
+
+  // ── The report is in dinars and keeps the two due directions apart ──
+  const report = await req('GET', '/merchant/report', null, mTok);
+  assert('the report is denominated in dinars', report.data?.currency === 'TND',
+    String(report.data?.currency));
+  assert('and reports what is owed each way separately',
+    report.data?.due?.fromCustomers !== undefined &&
+      report.data?.due?.toSuppliers !== undefined,
+    JSON.stringify(report.data?.due));
+
+  // ── Plans are the documented three ──
+  const plans = await req('GET', '/merchant/subscription/plans', null, mTok);
+  const codes = (plans.data || []).map((p) => p.code).sort();
+  assert('the plan list is the documented three',
+    JSON.stringify(codes) === JSON.stringify(['advanced', 'basic', 'professional']),
+    JSON.stringify(codes));
+  assert('and each is priced in dinars against a commission',
+    (plans.data || []).every((p) => p.currency === 'TND' && typeof p.commissionPercent === 'number'),
+    JSON.stringify((plans.data || []).map((p) => [p.code, p.price, p.commissionPercent])));
+
+  await User.deleteMany({ email: { $in: [merchant.email, customer.email] } });
+  await require('../models/Coupon').deleteMany({ merchantId: merchant._id });
+}
+
 async function testBusinessModel() {
   console.log('\n📜 FLOW 24: The documented business model');
   const economics = require('../config/economics');
@@ -2476,6 +2625,7 @@ async function runAll() {
     await testDeliveryEstimate();
     await testAdminOrderCancel();
     await testBusinessModel();
+    await testScreenshotFixes();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
   }
