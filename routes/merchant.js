@@ -18,6 +18,8 @@
 const express  = require('express');
 const mongoose = require('mongoose');
 const { authMiddleware } = require('../middleware/auth');
+const { requirePin } = require('../middleware/pin');
+const { ensureVipsId } = require('../utils/vipsId');
 
 /**
  * Push an order update to the customer who placed it, over the chat socket.
@@ -385,7 +387,7 @@ router.get('/wallet', async (req, res) => {
 // Funds are held (deducted from walletBalance) the moment the request is
 // made — see models/Payout.js for why this stays 'pending' rather than
 // actually disbursing (no bank rail is wired up).
-router.post('/wallet/payout', async (req, res) => {
+router.post('/wallet/payout', requirePin, async (req, res) => {
   try {
     const { amount, bankName, accountName, accountNumber } = req.body;
     const amt = Number(amount);
@@ -512,6 +514,7 @@ router.get('/profile', async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select('-password');
     if (!user) return res.status(404).json({ success: false, message: 'Merchant not found' });
+    await ensureVipsId(user);
     res.json({ success: true, data: user });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -1120,15 +1123,11 @@ router.put('/orders/:id/status', async (req, res) => {
     // none of this.
     let refundedPoints = 0;
     if (status === 'refunded' && order.paymentStatus !== 'refunded') {
-      if (order.pointsCredited) {
-        const earnedPoints = Math.floor(order.totalAmount || 0);
-        const user = await User.findById(order.userId);
-        if (user) {
-          user.walletPoints = Math.max(0, (user.walletPoints || 0) - earnedPoints);
-          await user.save();
-          refundedPoints = earnedPoints;
-        }
-      }
+      // Shared with the admin console's refund, so both take back the same
+      // amount. This used to recompute it as one point per dinar.
+      const { reversePointsForOrder } = require('../utils/points');
+      const reversal = await reversePointsForOrder(order);
+      refundedPoints = reversal.points;
       order.paymentStatus = 'refunded';
     }
     await order.save();
@@ -1191,6 +1190,15 @@ router.put('/orders/:id/status', async (req, res) => {
  */
 async function resolveCustomer({ userId, phone, qr }) {
   const scanned = String(qr || '').trim();
+
+  // The short id a customer reads out, and the QR that carries it.
+  const shortMatch = scanned.match(/^VIPS_ID_(\d{4,6})$/) || String(userId || '').match(/^(\d{4,6})$/);
+  if (shortMatch) {
+    const { findByVipsId } = require('../utils/vipsId');
+    const found = await findByVipsId(shortMatch[1], 'customer');
+    if (found) return found;
+  }
+
   const fromQr = scanned.startsWith('VIPS_USER_') ? scanned.slice('VIPS_USER_'.length) : null;
   const id = fromQr || userId;
 
@@ -2247,7 +2255,7 @@ router.get('/coupons', async (req, res) => {
 // ─── POST /api/merchant/coupons ───────────────────────────
 router.post('/coupons', async (req, res) => {
   try {
-    const { code, discount, discountPercentage, maxDiscountAmount, expiryDate, isActive, type, tags, maxUsage, minOrderAmount, description, discountUnit } = req.body;
+    const { code, discount, discountPercentage, voucherDiscountPercentage, maxDiscountAmount, expiryDate, isActive, type, tags, maxUsage, minOrderAmount, description, discountUnit } = req.body;
     const discountValue = parseFloat(discount ?? discountPercentage ?? 0);
     if (!code || isNaN(discountValue)) {
       return res.status(400).json({ success: false, message: 'code and discount are required' });
@@ -2267,6 +2275,16 @@ router.post('/coupons', async (req, res) => {
         message: 'A voucher has to be worth more than nothing.',
       });
     }
+    const voucherRate = voucherDiscountPercentage === undefined || voucherDiscountPercentage === null || voucherDiscountPercentage === ''
+      ? null
+      : parseFloat(voucherDiscountPercentage);
+    if (type === 'voucher' && voucherRate !== null &&
+        (!Number.isFinite(voucherRate) || voucherRate <= 0 || voucherRate > 100)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Voucher discount has to be between 1 and 100 percent.',
+      });
+    }
     const existing = await Coupon.findOne({ code: code.toUpperCase() });
     if (existing) {
       return res.status(409).json({ success: false, message: 'Coupon code already exists' });
@@ -2277,6 +2295,7 @@ router.post('/coupons', async (req, res) => {
       maxDiscountAmount: maxDiscountAmount ? parseFloat(maxDiscountAmount) : null,
       type:              type || 'percentage',
       discountUnit:      unit,
+      voucherDiscountPercentage: voucherRate,
       // What a customer spends to get it, at the documented 100 points to
       // the dinar. Derived rather than typed so a voucher's price and its
       // face value cannot drift apart.
@@ -2302,7 +2321,7 @@ router.post('/coupons', async (req, res) => {
 // reset `usageCount` to sidestep `maxUsage`. `code` is excluded too — it is
 // the unique key customers type at checkout.
 const COUPON_UPDATABLE = [
-  'discount', 'maxDiscountAmount', 'type', 'expiryDate', 'isActive',
+  'discount', 'maxDiscountAmount', 'voucherDiscountPercentage', 'type', 'expiryDate', 'isActive',
   'tags', 'maxUsage', 'minOrderAmount', 'description',
 ];
 
@@ -2310,7 +2329,14 @@ const COUPON_UPDATABLE = [
 // what the cooldown guards. Turning an offer off, or letting it expire, is
 // not a change of terms — a merchant must always be able to stop offering
 // something immediately.
-const COUPON_TERMS = ['discount', 'maxDiscountAmount', 'type', 'minOrderAmount', 'maxUsage'];
+const COUPON_TERMS = [
+  'discount',
+  'maxDiscountAmount',
+  'voucherDiscountPercentage',
+  'type',
+  'minOrderAmount',
+  'maxUsage',
+];
 
 router.put('/coupons/:id', async (req, res) => {
   try {
@@ -2350,6 +2376,19 @@ router.put('/coupons/:id', async (req, res) => {
       // Kept in sync by the model's pre-save hook, which findOneAndUpdate
       // does not run.
       update.discountPercentage = d;
+    }
+    if (update.voucherDiscountPercentage !== undefined) {
+      const rate = update.voucherDiscountPercentage === null || update.voucherDiscountPercentage === ''
+        ? null
+        : parseFloat(update.voucherDiscountPercentage);
+      if (rate !== null &&
+          (!Number.isFinite(rate) || rate <= 0 || rate > 100)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Voucher discount has to be between 1 and 100 percent.',
+        });
+      }
+      update.voucherDiscountPercentage = rate;
     }
     if (update.expiryDate !== undefined) update.expiryDate = new Date(update.expiryDate);
     const coupon = await Coupon.findOneAndUpdate(

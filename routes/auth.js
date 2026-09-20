@@ -5,6 +5,7 @@ const User = require('../models/User');
 const { authMiddleware } = require('../middleware/auth');
 const { verifyFirebaseIdToken } = require('../utils/firebaseAdmin');
 const { sendOtpEmail } = require('../utils/mailer');
+const { ensureVipsId } = require('../utils/vipsId');
 
 const router = express.Router();
 
@@ -13,7 +14,7 @@ const router = express.Router();
 // so the caller can email/log it. Shared by register + forgot-password so
 // both go through the same verified path.
 async function issueOtp(user) {
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otp = crypto.randomInt(100000, 1000000).toString();
   user.resetPasswordToken = crypto.createHash('sha256').update(otp).digest('hex');
   user.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000);
   await user.save({ validateBeforeSave: false });
@@ -58,7 +59,7 @@ router.post('/register', async (req, res) => {
     // retry/resend from the Verification screen.
     try {
       const otp = await issueOtp(user);
-      console.log(`🔑 Verification OTP for ${user.email}: ${otp}`);
+      if (process.env.NODE_ENV !== 'production') console.log(`🔑 Verification OTP for ${user.email}: ${otp}`);
       await sendOtpEmail(user.email, otp, 'verify your VIPs account');
     } catch (otpError) {
       console.error(`Could not issue verification OTP for ${user.email}: ${otpError.message}`);
@@ -81,12 +82,15 @@ router.post('/register', async (req, res) => {
 });
 
 // ─── POST /api/auth/login ─────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post(['/login', '/merchant-password-login'], async (req, res) => {
   try {
     const { email, phone, password } = req.body;
 
     // Support login by email OR phone
-    const identifier = email || phone;
+    const identifier = typeof (email || phone) === 'string' ? (email || phone).trim().toLowerCase() : '';
+    if (typeof password !== 'string' || !password) {
+      return res.status(400).json({ success: false, message: 'Password is required.' });
+    }
     if (!identifier) {
       return res.status(400).json({ success: false, message: 'Email or phone is required.' });
     }
@@ -99,6 +103,10 @@ router.post('/login', async (req, res) => {
         success: false,
         message: 'Invalid credentials.',
       });
+    }
+
+    if (req.path === '/merchant-password-login' && user.role !== 'merchant') {
+      return res.status(401).json({ success: false, message: 'Invalid merchant credentials.' });
     }
 
     // Check password
@@ -131,9 +139,9 @@ router.post('/login', async (req, res) => {
         });
       }
       const otp = await issueOtp(user);
-      console.log(`🔑 2FA OTP for ${user.email}: ${otp}`);
+      if (process.env.NODE_ENV !== 'production') console.log(`🔑 2FA OTP for ${user.email}: ${otp}`);
       const { sent, error: mailError } = await sendOtpEmail(user.email, otp, 'sign in to your VIPs account');
-      if (!sent) console.error(`2FA OTP email to ${user.email} was not sent: ${mailError}`);
+      if (!sent) return res.status(503).json({ success: false, message: 'Could not deliver the sign-in code. Please try again later.' });
 
       return res.json({
         success: true,
@@ -150,6 +158,9 @@ router.post('/login', async (req, res) => {
     );
 
     // Record last login
+    // Keep the session before this one, which is what "last connection"
+    // means to a person.
+    user.previousLogin = user.lastLogin || null;
     user.lastLogin = new Date();
     await user.save({ validateBeforeSave: false });
 
@@ -206,6 +217,9 @@ router.post('/2fa/verify', async (req, res) => {
     // directly issues a token, so it must not be replayable.
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
+    // Keep the session before this one, which is what "last connection"
+    // means to a person.
+    user.previousLogin = user.lastLogin || null;
     user.lastLogin = new Date();
     await user.save({ validateBeforeSave: false });
 
@@ -266,6 +280,8 @@ router.get('/me', authMiddleware, async (req, res) => {
         message: 'User not found.',
       });
     }
+
+    await ensureVipsId(user);
 
     res.json({
       success: true,
@@ -381,10 +397,10 @@ router.post('/forgot-password', async (req, res) => {
     const otp = await issueOtp(user);
     // Also logged to server console so this is verifiable even if
     // SENDGRID_API_KEY isn't configured yet — never returned in the response.
-    console.log(`🔑 Reset OTP for ${email}: ${otp}`);
+    if (process.env.NODE_ENV !== 'production') console.log(`🔑 Reset OTP for ${email}: ${otp}`);
     const { sent, error: mailError } = await sendOtpEmail(user.email, otp, 'reset your VIPs password');
     if (!sent) {
-      console.error(`Reset OTP email to ${email} was not sent: ${mailError}`);
+      return res.status(503).json({ success: false, message: 'Could not deliver the reset code. Please try again later.' });
     }
 
     res.json({
@@ -596,19 +612,25 @@ router.post('/merchant-login', async (req, res) => {
       });
     }
 
-    const otp = Math.floor(1000 + Math.random() * 9000).toString();
+    const otp = crypto.randomInt(1000, 10000).toString();
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
     user.resetPasswordToken = crypto.createHash('sha256').update(otp).digest('hex');
     user.resetPasswordExpires = otpExpiry;
     await user.save({ validateBeforeSave: false });
 
-    // OTP is logged to server console only — never returned in the HTTP response
-    console.log(`🔑 Merchant OTP for ${phone}: ${otp}`);
-
+    if (!user.email) {
+      return res.status(503).json({ success: false, message: 'No email is attached to this account. Please sign in with your password.' });
+    }
+    const { sent } = await sendOtpEmail(user.email, otp, 'sign in to your merchant account');
+    if (!sent) {
+      return res.status(503).json({ success: false, message: 'Could not deliver the code. Use email and password, or try again later.' });
+    }
+    const [local, domain] = user.email.split('@');
     res.json({
       success: true,
-      message: 'OTP sent successfully.',
+      message: 'A sign-in code was sent to your account email.',
+      data: { channel: 'email', destination: `${local.slice(0, 1)}***@${domain}` },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -726,6 +748,9 @@ router.post('/social', async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
+    // Keep the session before this one, which is what "last connection"
+    // means to a person.
+    user.previousLogin = user.lastLogin || null;
     user.lastLogin = new Date();
     await user.save({ validateBeforeSave: false });
 
@@ -785,6 +810,9 @@ router.post('/merchant-social', async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
+    // Keep the session before this one, which is what "last connection"
+    // means to a person.
+    user.previousLogin = user.lastLogin || null;
     user.lastLogin = new Date();
     await user.save({ validateBeforeSave: false });
 

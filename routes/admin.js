@@ -30,6 +30,7 @@ const PosInvoice           = require('../models/PosInvoice');
 const PosSession           = require('../models/PosSession');
 const Role                 = require('../models/Role');
 const AdminAuditLog        = require('../models/AdminAuditLog');
+const MerchantSubscription = require('../models/MerchantSubscription');
 const VisitEvent           = require('../models/VisitEvent');
 
 const { recordMovement, movementTypeForDelta } = require('../utils/stockLedger');
@@ -1046,6 +1047,23 @@ router.put('/merchants/:id/plan', requirePermission('merchants.update'), async (
     }
     await merchant.save();
 
+    // Keep the merchant app's subscription record in step with the plan the
+    // console applies. Previously the User record changed commission while
+    // /merchant/subscription/current still showed the old plan.
+    if (plan) {
+      const economicPlan = PLANS[plan];
+      await MerchantSubscription.findOneAndUpdate(
+        { merchantId: merchant._id },
+        {
+          planCode: plan,
+          planName: economicPlan.label,
+          price: economicPlan.monthlyFeeTnd,
+          isActive: true,
+        },
+        { upsert: true, new: true, runValidators: true },
+      );
+    }
+
     res.json({
       success: true,
       message: 'Merchant plan updated.',
@@ -1372,9 +1390,28 @@ router.put('/orders/:id/status', requirePermission('orders.update'), async (req,
     if (stamps[status]) order[stamps[status]] = new Date();
     if (req.body.note) order.orderNote = String(req.body.note);
 
+    // Refunding from the console has to take back the loyalty points the
+    // sale awarded, exactly as refunding from the Merchant app does. It did
+    // not: this route only relabelled the status, so an order refunded here
+    // returned the customer's money and left them holding every point it had
+    // earned them. Same helper as the merchant path, so the two cannot drift.
+    let refundedPoints = 0;
+    if (status === 'refunded' && order.paymentStatus !== 'refunded') {
+      const { reversePointsForOrder } = require('../utils/points');
+      const reversal = await reversePointsForOrder(order);
+      refundedPoints = reversal.points;
+      order.paymentStatus = 'refunded';
+    }
+
     await order.save();
 
-    res.json({ success: true, message: 'Order status updated.', data: { order: order.toJSON() } });
+    res.json({
+      success: true,
+      message: refundedPoints
+        ? `Order refunded, and ${refundedPoints} point(s) taken back.`
+        : 'Order status updated.',
+      data: { order: order.toJSON(), refundedPoints },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -2359,6 +2396,11 @@ router.get('/search', requirePermission('dashboard.read'), async (req, res) => {
 // this router so it inherits the admin gate above rather than re-declaring it.
 router.use('/pos', requirePermission('pos.read'), require('./admin_pos'));
 router.use('/products', require('./admin_products'));
+router.use('/offers', require('./admin_offers'));
+router.use('/subscriptions', require('./admin_subscriptions'));
+router.use('/wallets', require('./admin_wallets'));
+router.use('/ads', require('./admin_ads'));
+router.use('/broadcasts', require('./admin_broadcasts'));
 
 // ═══════════════════════════════════════════════════════════
 // PLATFORM SETTINGS
@@ -2478,6 +2520,38 @@ router.delete('/settings/admins/:id', requirePermission('staff.delete'), async (
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+/**
+ * GET /api/admin/config — the business model's own numbers.
+ *
+ * The console needs the plan list to offer a plan, the budget keys to label a
+ * guarantee, and the Giftback and refund rules to explain a decision. Reading
+ * them from config/economics.js means the screens restate the documents
+ * rather than keeping a second, drifting copy of them in the browser — the
+ * same reason those literals were pulled out of the routes in the first
+ * place. Nothing here is per-account, so any signed-in operator may read it.
+ */
+router.get('/config', (req, res) => {
+  const {
+    POINTS_PER_TND, DEFAULT_EARN_RATE, MAX_EARN_RATE,
+    DIAMONDS_PER_TND, GIFTBACK, BUDGETS, REFUND, EDIT_COOLDOWN, PLANS,
+  } = require('../config/economics');
+
+  res.json({
+    success: true,
+    message: 'Platform economics',
+    data: {
+      pointsPerTnd: POINTS_PER_TND,
+      diamondsPerTnd: DIAMONDS_PER_TND,
+      earnRate: { default: DEFAULT_EARN_RATE, max: MAX_EARN_RATE },
+      budgets: BUDGETS.map((key) => ({ key, label: BUDGET_LABELS[key] })),
+      giftback: GIFTBACK,
+      refund: REFUND,
+      editCooldown: EDIT_COOLDOWN,
+      plans: PLAN_KEYS.map((key) => PLANS[key]),
+    },
+  });
 });
 
 // ═══════════════════════════════════════════════════════════

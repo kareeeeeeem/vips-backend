@@ -8,6 +8,11 @@
 require('dotenv').config();
 
 const BASE_URL = process.env.TEST_URL || 'http://localhost:3000/api';
+if (process.env.TEST_ISOLATED !== '1' ||
+    !/^mongodb:\/\/(?:127\.0\.0\.1|localhost):\d+\/vips_qa_[a-z0-9_]+$/.test(process.env.MONGODB_URI || '') ||
+    !/^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api$/.test(BASE_URL)) {
+  throw new Error('Use npm test: this suite writes fixtures only to an isolated local database.');
+}
 
 // ─── Direct-DB test seeding ────────────────────────────────────
 // Wallet points can only be earned for real through spin-wheel/check-in/
@@ -18,6 +23,10 @@ const BASE_URL = process.env.TEST_URL || 'http://localhost:3000/api';
 // database the running backend under test is already using.
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const Product = require('../models/Product');
+const Coupon = require('../models/Coupon');
+const Order = require('../models/Order');
+const { creditPointsForOrder } = require('../utils/points');
 let dbConnected = false;
 
 async function seedWalletPoints(uid, amount) {
@@ -251,8 +260,9 @@ async function testOrderFlow() {
   const createOrder = await req('POST', '/order/create', orderPayload, userToken);
   assert('POST /order/create success', createOrder.success === true, `msg=${createOrder.message}`);
   assert('order is priced from the database, not the request',
-    Math.abs((createOrder.data?.totalAmount ?? 0) - (29.99 * 2 + 9.99)) < 0.01,
-    `total=${createOrder.data?.totalAmount} (expected ${29.99 * 2 + 9.99})`);
+    Math.abs((createOrder.data?.totalAmount ?? 0) - (29.99 * 2 + 9.99 + 6)) < 0.001,
+    `total=${createOrder.data?.totalAmount} (includes 6 TND delivery)`);
+  assert('delivery fee is stored for the merchant receipt', createOrder.data?.deliveryCharge === 6);
 
   const bogus = await req('POST', '/order/create', {
     merchantId,
@@ -792,9 +802,11 @@ async function testAdmin() {
   assert('a one-character search is an empty result, not an error',
     shortSearch.success === true && shortSearch.data?.total === 0);
 
-  const orderSearch = await req('GET', '/admin/search?q=1059', null, adminToken);
+  const existingOrder = await Order.findById(orderId);
+  const searchedNumber = existingOrder.orderNumber;
+  const orderSearch = await req('GET', `/admin/search?q=${searchedNumber}`, null, adminToken);
   assert('searching an order number finds that order',
-    orderSearch.data?.orders?.some((o) => o.orderNumber === 1059),
+    orderSearch.data?.orders?.some((o) => o.orderNumber === searchedNumber),
     JSON.stringify(orderSearch.data?.orders?.map((o) => o.orderNumber)));
 
   const searchNoToken = await req('GET', '/admin/search?q=QA');
@@ -1561,6 +1573,28 @@ async function testDashboards() {
     null, adminToken);
   assert('an unknown dashboard export is rejected', dashUnknown.status === 400);
 
+  const wallets = await req('GET', '/admin/wallets?role=customer', null, adminToken);
+  assert('the console lists customer wallets with both balances',
+    wallets.success && (wallets.data?.items || []).some((u) => String(u._id) === String(userId) &&
+      typeof u.walletBalance === 'number' && typeof u.walletPoints === 'number'));
+  const pointsBefore = (await User.findById(userId)).walletPoints;
+  const adjusted = await req('POST', `/admin/wallets/${userId}/adjust`, {
+    unit: 'points', delta: 25, reason: 'QA reconciliation',
+  }, adminToken);
+  assert('an authorised points adjustment reaches the customer balance',
+    adjusted.success && (await User.findById(userId)).walletPoints === pointsBefore + 25);
+  const ledger = await req('GET', `/admin/wallets/${userId}/transactions`, null, adminToken);
+  assert('the wallet adjustment has a completed ledger entry and reason',
+    (ledger.data?.items || []).some((t) => t.operationId?.startsWith('admin-adjustment:') &&
+      t.status === 'completed' && t.description.includes('QA reconciliation')));
+  const overdraft = await req('POST', `/admin/wallets/${userId}/adjust`, {
+    unit: 'points', delta: -(pointsBefore + 1000), reason: 'QA invalid overdraft',
+  }, adminToken);
+  assert('an admin adjustment cannot make points negative', overdraft.status === 409);
+  await req('POST', `/admin/wallets/${userId}/adjust`, {
+    unit: 'points', delta: -25, reason: 'QA reconciliation rollback',
+  }, adminToken);
+
   // The bootstrap script and the permissions module must agree on the role
   // list, or a role the console fully understands cannot be created at all.
   const { ROLES } = require('../middleware/permissions');
@@ -1571,6 +1605,84 @@ async function testDashboards() {
     createAdminSource.includes("require('../middleware/permissions')") &&
     ROLES.includes('cashier'),
     'the script keeps its own copy of the role list');
+}
+
+async function testAdminSubscriptionPayments() {
+  console.log('\n💳 FLOW: Admin Subscription Payment Review');
+  const bank = await req('POST', '/services/packages/subscribe', {
+    tier: 'silver', quantity: 2, paymentMethod: 'bank_transfer',
+    bankReference: `BANK-${ts}`,
+  }, userToken);
+  assert('a bank transfer creates an inactive pending request',
+    bank.status === 202 && bank.data?.paymentStatus === 'pending_payment' && bank.data?.isActive === false,
+    bank.message);
+
+  const pending = await req('GET',
+    `/admin/subscriptions?audience=customer&paymentStatus=pending_payment&search=${encodeURIComponent(TEST_USER.email)}`,
+    null, adminToken);
+  assert('admin can find pending customer subscription payments',
+    pending.success && pending.data?.items?.some(item => item._id === bank.data?._id));
+
+  const beforeApproval = Date.now();
+  const approved = await req('PUT', `/admin/subscriptions/customer/${bank.data?._id}/payment`,
+    { action: 'approve', reason: 'Bank receipt verified' }, adminToken);
+  assert('admin approval marks the payment paid and activates the subscription',
+    approved.success && approved.data?.subscription?.paymentStatus === 'paid' &&
+      approved.data.subscription.isActive === true, approved.message);
+  assert('approved payment starts its full term at review time',
+    new Date(approved.data?.subscription?.startDate).getTime() >= beforeApproval - 1000 &&
+      new Date(approved.data?.subscription?.endDate) - new Date(approved.data?.subscription?.startDate) === 14 * 86400000);
+  const paymentEntries = await require('../models/Transaction').find({
+    operationId: `subscription-payment:${bank.data?._id}`,
+  });
+  assert('external subscription payment has one completed ledger entry',
+    paymentEntries.length === 1 && paymentEntries[0].status === 'completed' && paymentEntries[0].account === 'Bank');
+  const repeated = await req('PUT', `/admin/subscriptions/customer/${bank.data?._id}/payment`,
+    { action: 'approve' }, adminToken);
+  assert('a payment request cannot be approved twice', repeated.status === 409);
+
+  const cash = await req('POST', '/services/packages/subscribe', {
+    tier: 'gold', quantity: 1, paymentMethod: 'partner_cash', partnerStore: 'QA Partner Store',
+  }, userToken);
+  const missingReason = await req('PUT', `/admin/subscriptions/customer/${cash.data?._id}/payment`,
+    { action: 'reject' }, adminToken);
+  assert('rejecting a payment requires a reason', missingReason.status === 400);
+  const rejected = await req('PUT', `/admin/subscriptions/customer/${cash.data?._id}/payment`,
+    { action: 'reject', reason: 'Cash receipt was not found' }, adminToken);
+  assert('rejection keeps the subscription inactive and stores the reason',
+    rejected.data?.subscription?.paymentStatus === 'rejected' &&
+      rejected.data.subscription.isActive === false &&
+      rejected.data.subscription.reviewReason === 'Cash receipt was not found');
+}
+
+async function testAdminBroadcasts() {
+  console.log('\n📣 FLOW: Admin Broadcasts');
+  const title = `Platform notice ${ts}`;
+  const sent = await req('POST', '/admin/broadcasts', {
+    title,
+    message: 'A message from the administration.',
+    audience: 'all',
+    type: 'system',
+    actionUrl: '/wallet',
+  }, adminToken);
+  assert('admin can send one broadcast to customers and merchants',
+    sent.status === 201 && sent.data?.broadcast?.customerCount > 0 &&
+      sent.data?.broadcast?.merchantCount > 0, sent.message);
+  const history = await req('GET', '/admin/broadcasts', null, adminToken);
+  assert('the console keeps a broadcast history with recipient counts',
+    history.data?.items?.some(item => item.title === title &&
+      item.customerCount > 0 && item.merchantCount > 0));
+  const customerInbox = await req('GET', '/user/notifications', null, userToken);
+  assert('an admin broadcast reaches the customer inbox',
+    customerInbox.data?.some(item => item.title === title));
+  const merchantInbox = await req('GET', '/merchant/notifications', null, merchantToken);
+  assert('the same broadcast reaches the merchant inbox',
+    merchantInbox.data?.notifications?.some(item => item.title === title));
+  const unsafeLink = await req('POST', '/admin/broadcasts', {
+    title: 'Unsafe link', message: 'Must not leave the app.', audience: 'customers',
+    actionUrl: 'https://example.com',
+  }, adminToken);
+  assert('broadcast actions cannot inject an external link', unsafeLink.status === 400);
 }
 
 // ─── FLOW 13: Client/server wiring ──────────────────────────
@@ -1600,16 +1712,59 @@ function testWiring() {
     }
   })(adminRouter.stack, '');
 
-  const dart = fs.readFileSync(
-    pathMod.join(__dirname, '../../admin/services/admin_api_service.dart'), 'utf8');
+  // The console is the web app in admin-web/, which reaches the API only
+  // through app/core/api.js — so every call it can possibly make is a
+  // `get/getFull/post/put/del/download` in one of these modules.
+  // There are two consoles against this API — the Flutter one in lib/admin
+  // and the web one in admin-web — and either may be absent from a checkout.
+  // Both are scanned, and the union is what the API is measured against: an
+  // endpoint reachable from either console is reachable.
+  const collectFiles = (dir, ext) => {
+    const out = [];
+    if (!fs.existsSync(dir)) return out;
+    (function walk(d) {
+      for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = pathMod.join(d, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith(ext)) out.push(fs.readFileSync(full, 'utf8'));
+      }
+    })(dir);
+    return out;
+  };
+
   const calls = [];
-  const re = /_api\.(get|post|put|delete)\(\s*'([^']+)'/g;
-  let m;
-  while ((m = re.exec(dart))) {
-    const raw = m[2].replace(/\$\{[^}]+\}/g, ':p').replace(/\$\w+/g, ':p').split('?')[0];
-    if (raw.startsWith('/admin')) calls.push({ method: m[1].toUpperCase(), raw });
+
+  // ── the Flutter console: `_api.get('/admin/users')` ──
+  const dartSources = collectFiles(pathMod.join(__dirname, '../../admin'), '.dart');
+  for (const source of dartSources) {
+    const re = /_api\.(get|post|put|delete)\(\s*'([^']+)'/g;
+    let m;
+    while ((m = re.exec(source))) {
+      const raw = m[2]
+        .replace(/\$\{[^}]+\}/g, ':p')
+        .replace(/\$\w+/g, ':p')
+        .split('?')[0];
+      if (raw.startsWith('/admin')) calls.push({ method: m[1].toUpperCase(), raw });
+    }
   }
-  assert('the console calls the admin API', calls.length > 50, `${calls.length} calls found`);
+
+  // ── the web console: `api.get('/users')`, relative to /api/admin ──
+  const jsSources = collectFiles(pathMod.join(__dirname, '../admin-web/app'), '.js');
+  const METHOD_FOR = {
+    get: 'GET', getFull: 'GET', download: 'GET', post: 'POST', put: 'PUT', del: 'DELETE',
+  };
+  for (const source of jsSources) {
+    const re = /\bapi\.(get|getFull|post|put|del|download)\(\s*(['`])([^'`]+)\2/g;
+    let m;
+    while ((m = re.exec(source))) {
+      const raw = m[3].replace(/\$\{[^}]+\}/g, ':p').split('?')[0];
+      if (raw.startsWith('/')) calls.push({ method: METHOD_FOR[m[1]], raw: '/admin' + raw });
+    }
+  }
+
+  assert('at least one console is wired to the admin API',
+    calls.length > 50,
+    `${calls.length} calls found (dart files: ${dartSources.length}, js files: ${jsSources.length})`);
 
   // Only the segment under /reports or /dashboards is an enum the client
   // interpolates; collapsing every "products" would hide /admin/products
@@ -2120,6 +2275,243 @@ async function testChat() {
 //
 // Each block here is a rule that came off a reviewed screen, kept so the
 // behaviour cannot quietly go back to what it was.
+
+// ─── FLOW 27: The three units ────────────────────────────────────────
+//
+// Dinars, points (100 = 1 TND) and club diamonds (10,000 = 1 TND) all look
+// like numbers on a screen, and every bug this flow covers was one of them
+// being handled as another, or a figure the client sent being trusted as
+// money.
+// ─── FLOW 28: What one app does, the others must see ────────────────
+//
+// The three apps share one backend, and the decisions taken in the console
+// are only real if the other two obey them. Each of these was broken: a
+// suspended customer kept their session, a deactivated shop stayed on the
+// home screen, and a deleted account answered 500 instead of signing out.
+async function testCrossAppIntegration() {
+  console.log('\n🔗 FLOW 28: Console decisions reaching the apps');
+
+  if (!adminToken) return assert('cross-app prerequisites', false, 'no admin token');
+
+  const stamp = Date.now();
+  const shopper = await seedUser({
+    fullName: 'Cross App Shopper', email: `xapp_c_${stamp}@vips.test`,
+    phone: _uniquePhone('7'), password: 'XPass123', role: 'customer',
+  });
+  // Signed here rather than fetched from /auth/login. This flow runs at the
+  // end of a long suite, and /api/auth is rate limited to ten calls a minute
+  // — a limiter working as designed should not read as a failing test. The
+  // payload is exactly what /auth/login issues.
+  const token = require('jsonwebtoken').sign(
+    { id: shopper._id, email: shopper.email, role: shopper.role },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+
+  // ── suspending a customer ends the session they already have ──
+  const before = await req('GET', '/user/wallet', null, token);
+  assert('a customer can reach their wallet before being suspended',
+    before.success === true, before.message);
+
+  await req('PUT', `/admin/users/${shopper._id}/ban`, { banned: true }, adminToken);
+  const during = await req('GET', '/user/wallet', null, token);
+  assert('suspending a customer stops the token they are already holding',
+    during.success === false, `still worked: ${JSON.stringify(during).slice(0, 80)}`);
+  assert('and says why, in a form the app can act on',
+    during.code === 'ACCOUNT_SUSPENDED', `code=${during.code} msg=${during.message}`);
+
+  await req('PUT', `/admin/users/${shopper._id}/ban`, { banned: false }, adminToken);
+  const after = await req('GET', '/user/wallet', null, token);
+  assert('reinstating lets the same token back in', after.success === true, after.message);
+
+  // ── a customer can close their own account ──
+  // Both app stores require this, and the Settings screen has always called
+  // this path. Account deletion is a destructive action, so it requires the
+  // same server-verified security PIN that the Flutter settings screen sends.
+  const pinSet = await req('POST', '/auth/pin', { pin: '2468' }, token);
+  assert('a customer can set a PIN before closing their account',
+    pinSet.success === true, pinSet.message);
+
+  const wrongPin = await req('DELETE', '/user/account', { pin: '1357' }, token);
+  assert('account deletion rejects an incorrect PIN',
+    wrongPin.success === false, JSON.stringify(wrongPin));
+
+  const closed = await req('DELETE', '/user/account', { pin: '2468' }, token);
+  assert('a customer can delete their own account', closed.success === true, closed.message);
+  assert('their orders are kept — they are financial records',
+    closed.data && typeof closed.data.ordersRetained === 'number',
+    JSON.stringify(closed.data));
+
+  const afterDelete = await req('GET', '/user/wallet', null, token);
+  assert('a deleted account signs out cleanly instead of erroring',
+    afterDelete.success === false && /no longer exists/i.test(afterDelete.message || ''),
+    `msg=${afterDelete.message}`);
+
+  // ── deactivating a shop takes it off the customer's home screen ──
+  const shop = await seedUser({
+    fullName: 'Cross App Shop', email: `xapp_m_${stamp}@vips.test`,
+    phone: _uniquePhone('8'), password: 'XPass123', role: 'merchant',
+    storeName: 'Cross App Shop', storeCategory: 'Grocery',
+    earnRate: 6, isTrending: true, isActive: true,
+  });
+  const onHome = async () => {
+    const r = await req('GET', '/content/trending-merchants');
+    return (r.data || []).some((m) => String(m._id) === String(shop._id));
+  };
+
+  assert('a live shop appears on the home screen', await onHome() === true);
+
+  await req('PUT', `/admin/merchants/${shop._id}/activate`, { active: false }, adminToken);
+  assert('deactivating it takes it off the home screen', await onHome() === false);
+
+  const search = await req('GET', `/content/search?q=${encodeURIComponent('Cross App Shop')}`);
+  const inSearch = (search?.data?.merchants || []).some((m) => String(m._id) === String(shop._id));
+  assert('and out of search results', inSearch === false);
+
+  await req('PUT', `/admin/merchants/${shop._id}/activate`, { active: true }, adminToken);
+  assert('reactivating puts it back', await onHome() === true);
+}
+
+async function testCurrencyIntegrity() {
+  console.log('\n🪙 FLOW 27: Points, dinars and diamonds');
+
+  const stamp = Date.now();
+  const shop = await seedUser({
+    fullName: 'Unit Shop', email: `cur_m_${stamp}@vips.test`,
+    phone: _uniquePhone('5'), password: 'CurPass123', role: 'merchant',
+    storeName: 'Unit Shop', storeCategory: 'Grocery', earnRate: 6,
+  });
+  const buyer = await seedUser({
+    fullName: 'Unit Buyer', email: `cur_c_${stamp}@vips.test`,
+    phone: _uniquePhone('6'), password: 'CurPass123', role: 'customer',
+    walletPoints: 5000, diamonds: 150,
+  });
+
+  const login = await req('POST', '/auth/login', {
+    email: buyer.email, password: 'CurPass123',
+  });
+  const token = login?.data?.token;
+  if (!token) return assert('currency prerequisites', false, `login: ${login?.message}`);
+
+  const product = await Product.create({
+    merchantId: shop._id, name: 'Unit Test Item', price: 60,
+    category: 'Grocery', stock: 500, isActive: true,
+  });
+  const basket = {
+    merchantId: String(shop._id),
+    items: [{ productId: String(product._id), quantity: 1 }],
+    paymentMethod: 'cash',
+    orderType: 'takeaway',
+    deliveryAddress: 'Tunis',
+  };
+
+  // ── the rate the apps are told ──
+  const rates = await req('GET', '/config/rates');
+  assert('100 points to the dinar is what /config/rates reports',
+    rates?.data?.pointsPerTnd === 100 && rates?.data?.vipsToTnd === 0.01,
+    `pointsPerTnd=${rates?.data?.pointsPerTnd} vipsToTnd=${rates?.data?.vipsToTnd}`);
+
+  // ── a discount the client invents is not money ──
+  // /order/create subtracted `couponDiscountAmount` straight from the total
+  // with no lookup, so a code that never existed bought the basket for 0.
+  const forged = await req('POST', '/order/create', {
+    ...basket, couponCode: `GHOST-${stamp}`, couponDiscountAmount: 999999,
+  }, token);
+  assert('a coupon code that does not exist is refused',
+    forged.success === false, `total=${forged?.data?.totalAmount} msg=${forged.message}`);
+
+  const honest = await req('POST', '/order/create', basket, token);
+  assert('an order with no coupon is charged the catalogue price',
+    honest?.data?.totalAmount === 60, `total=${honest?.data?.totalAmount}`);
+
+  // ── a real coupon is worth what the coupon says, once ──
+  await Coupon.create({
+    code: `UNIT${stamp}`, discount: 10, discountUnit: 'tnd', type: 'fixed',
+    expiryDate: new Date(Date.now() + 864e5), isActive: true, maxUsage: 1,
+  });
+  const withCoupon = await req('POST', '/order/create',
+    { ...basket, couponCode: `UNIT${stamp}` }, token);
+  assert('a 10 TND coupon takes 10 TND off',
+    withCoupon?.data?.totalAmount === 50, `total=${withCoupon?.data?.totalAmount}`);
+
+  const reused = await req('POST', '/order/create',
+    { ...basket, couponCode: `UNIT${stamp}` }, token);
+  assert('a single-use coupon cannot be spent twice',
+    reused.success === false, `msg=${reused.message}`);
+
+  // ── a percentage coupon is a percentage, not dinars ──
+  await Coupon.create({
+    code: `PCT${stamp}`, discount: 25, discountUnit: 'percent', type: 'percentage',
+    expiryDate: new Date(Date.now() + 864e5), isActive: true,
+  });
+  const pct = await req('POST', '/order/create',
+    { ...basket, couponCode: `PCT${stamp}` }, token);
+  assert('25% off 60 TND is 15 TND',
+    pct?.data?.totalAmount === 45, `total=${pct?.data?.totalAmount}`);
+
+  // ── points redeem at the documented rate and cannot overdraw ──
+  const redeemed = await req('POST', '/order/create',
+    { ...basket, walletPointsRedeemed: 1000 }, token);
+  assert('1,000 points is 10 TND off',
+    redeemed?.data?.walletDiscountAmount === 10,
+    `discount=${redeemed?.data?.walletDiscountAmount}`);
+
+  const afterRedeem = await User.findById(buyer._id).select('walletPoints').lean();
+  assert('redeeming debits exactly the points used',
+    afterRedeem.walletPoints === 4000, `balance=${afterRedeem.walletPoints}`);
+
+  const greedy = await req('POST', '/order/create',
+    { ...basket, walletPointsRedeemed: 999999 }, token);
+  const afterGreedy = await User.findById(buyer._id).select('walletPoints').lean();
+  assert('over-redeeming never drives the total below zero',
+    (greedy?.data?.totalAmount ?? -1) >= 0, `total=${greedy?.data?.totalAmount}`);
+  assert('over-redeeming never drives the balance below zero',
+    afterGreedy.walletPoints >= 0, `balance=${afterGreedy.walletPoints}`);
+
+  // ── diamonds are a hundredth of a point, and the remainder is kept ──
+  const before = await User.findById(buyer._id).select('walletPoints').lean();
+  const converted = await req('POST', '/user/vips-club/convert', { diamonds: 150 }, token);
+  const after = await User.findById(buyer._id).select('walletPoints diamonds').lean();
+  assert('150 diamonds convert to exactly 1 point',
+    converted.success === true && after.walletPoints - before.walletPoints === 1,
+    `gained=${after.walletPoints - before.walletPoints} msg=${converted.message}`);
+  assert('the 50 diamonds that did not make a point are kept',
+    after.diamonds === 50, `diamonds=${after.diamonds}`);
+
+  // ── a refund takes back what was actually awarded ──
+  // This recomputed the claw-back as one point per dinar while points are
+  // earned at the merchant's own rate, so a refund left the customer holding
+  // most of what the sale had given them.
+  const sale = await Order.create({
+    userId: buyer._id, merchantId: shop._id,
+    items: [{ productId: String(product._id), item_name: 'Unit Test Item', price: 60, quantity: 1 }],
+    totalAmount: 60, status: 'delivered', paymentStatus: 'paid',
+  });
+  const credit = await creditPointsForOrder(sale);
+  assert('points are earned at the merchant rate, not one per dinar',
+    credit.credited === true && credit.points === 360,
+    `points=${credit.points} rate=${credit.rate}`);
+
+  // Refunded from the admin console, which used to reverse nothing at all —
+  // it relabelled the status and left the customer holding all 360 points.
+  const beforeRefund = await User.findById(buyer._id).select('walletPoints').lean();
+  const refund = await req('PUT', `/admin/orders/${sale._id}/status`,
+    { status: 'refunded' }, adminToken);
+  const afterRefund = await User.findById(buyer._id).select('walletPoints').lean();
+  assert('refunding from the console takes back every point the sale awarded',
+    beforeRefund.walletPoints - afterRefund.walletPoints === 360,
+    `clawed=${beforeRefund.walletPoints - afterRefund.walletPoints} msg=${refund?.message}`);
+
+  // ── money is rounded to the millime, not the centime ──
+  const { roundTnd, pointsToTnd } = require('../config/economics');
+  assert('the dinar keeps its three decimal places',
+    roundTnd(10.8005) === 10.801 && roundTnd(12.3456) === 12.346,
+    `${roundTnd(10.8005)} / ${roundTnd(12.3456)}`);
+  assert('points convert to dinars at three decimals',
+    pointsToTnd(1) === 0.01 && pointsToTnd(12345) === 123.45,
+    `${pointsToTnd(1)} / ${pointsToTnd(12345)}`);
+}
+
 // ─── FLOW 26: Paying a bill with points ──────────────────────────────
 //
 // §4.3's other half: the customer spends points at the till. The QR used to
@@ -2317,6 +2709,31 @@ async function testScreenshotFixes() {
   assert('and one transfer cannot be confirmed twice', twice.status === 409,
     `${twice.status}`);
 
+  // ── Advertisement moderation ──
+  const adStart = new Date(Date.now() - 60000).toISOString();
+  const adEnd = new Date(Date.now() + 86400000).toISOString();
+  const submittedAd = await req('POST', '/merchant/ads', {
+    title: 'Moderated QA campaign', startDate: adStart, endDate: adEnd,
+  }, mTok);
+  assert('a merchant advertisement starts pending moderation',
+    submittedAd.data?.moderationStatus === 'pending');
+  const hiddenAds = await req('GET', '/content/ads');
+  assert('a pending advertisement is hidden from customers',
+    !(hiddenAds.data || []).some((a) => String(a._id) === String(submittedAd.data?._id)));
+  const adminAds = await req('GET', '/admin/ads?moderation=pending', null, adminToken);
+  assert('the console lists advertisements awaiting review',
+    (adminAds.data?.items || []).some((a) => String(a._id) === String(submittedAd.data?._id)));
+  const approvedAd = await req('PUT', `/admin/ads/${submittedAd.data?._id}/moderate`,
+    { decision: 'approved' }, adminToken);
+  assert('an admin can approve an advertisement', approvedAd.data?.ad?.moderationStatus === 'approved');
+  const visibleAds = await req('GET', '/content/ads');
+  assert('an approved active advertisement reaches customers',
+    (visibleAds.data || []).some((a) => String(a._id) === String(submittedAd.data?._id)));
+  const editedAd = await req('PUT', `/merchant/ads/${submittedAd.data?._id}`,
+    { title: 'Changed after approval', moderationStatus: 'approved' }, mTok);
+  assert('editing an advertisement sends it back for review and cannot self-approve',
+    editedAd.data?.moderationStatus === 'pending');
+
   // ── Targeted offers ──
   const segs = await req('GET', '/merchant/rewards/segments', null, mTok);
   assert('every customer segment reports its live size',
@@ -2486,6 +2903,37 @@ async function testBusinessModel() {
     assert(`the ${plan} plan carries ${commission}% commission`,
       r.data?.commissionRate === commission, String(r.data?.commissionRate));
   }
+  const syncedPlan = await req('GET', '/merchant/subscription/current', null, mTok);
+  assert('a plan changed in the console reaches the merchant subscription screen',
+    syncedPlan.data?.planCode === 'advanced', JSON.stringify(syncedPlan.data));
+  const merchantSubscriptions = await req('GET', '/admin/subscriptions?audience=merchant', null, adminToken);
+  const managedSubscription = (merchantSubscriptions.data?.items || [])
+    .find((item) => String(item.merchantId?._id || item.merchantId) === merchantId);
+  assert('the console lists merchant subscriptions', !!managedSubscription);
+  const suspendedSubscription = await req(
+    'PUT', `/admin/subscriptions/merchant/${managedSubscription?._id}`,
+    { isActive: false }, adminToken);
+  assert('the console can suspend a merchant subscription',
+    suspendedSubscription.data?.subscription?.isActive === false);
+  await req('PUT', `/admin/subscriptions/merchant/${managedSubscription?._id}`,
+    { isActive: true }, adminToken);
+
+  const moderatedOffer = await Coupon.create({
+    code: `ADMIN${Date.now()}`,
+    discount: 10,
+    discountUnit: 'percent',
+    type: 'percentage',
+    expiryDate: new Date(Date.now() + 86400000),
+    merchantId,
+  });
+  const offers = await req('GET', `/admin/offers?search=${moderatedOffer.code}`, null, adminToken);
+  assert('the console lists merchant offers',
+    offers.data?.items?.some((item) => item.code === moderatedOffer.code));
+  const suspendedOffer = await req('PUT', `/admin/offers/${moderatedOffer._id}/status`,
+    { isActive: false }, adminToken);
+  assert('the console can suspend an offer', suspendedOffer.data?.offer?.isActive === false);
+  const removedOffer = await req('DELETE', `/admin/offers/${moderatedOffer._id}`, null, adminToken);
+  assert('the console can remove an unused offer', removedOffer.success === true);
   const badPlan = await req('PUT', `/admin/merchants/${merchantId}/plan`, { plan: 'platinum' }, adminToken);
   assert('an unknown plan is refused', badPlan.status === 400, `${badPlan.status}`);
 
@@ -2549,7 +2997,6 @@ async function testAdminOrderCancel() {
     await mongoose.connect(process.env.MONGODB_URI);
     dbConnected = true;
   }
-  const Order = require('../models/Order');
   const seeded = new Order({
     userId,
     merchantId: merchantId || null,
@@ -2688,6 +3135,123 @@ async function testOrderTracking() {
     adminStatus === t.data.status, `admin=${adminStatus} customer=${t.data.status}`);
 }
 
+async function testCheckoutAndSubscriptionContracts() {
+  console.log('\n🔎 Checkout, session and subscription regressions');
+  const stamp = Date.now();
+  const merchant = await seedUser({ fullName: 'Contract merchant', role: 'merchant',
+    email: `contract-shop-${stamp}@vips.test`, phone: _uniquePhone('6'), password: 'Contract123!' });
+  const customer = await seedUser({ fullName: 'Contract customer', role: 'customer',
+    email: `contract-user-${stamp}@vips.test`, phone: _uniquePhone('5'), password: 'Contract123!',
+    walletPoints: 1000, walletBalance: 100 });
+  const jwt = require('jsonwebtoken');
+  const token = jwt.sign({ id: customer.id, role: 'customer' }, process.env.JWT_SECRET, { expiresIn: '1h' });
+  const product = await Product.create({ merchantId: merchant._id, name: 'Contract item', price: 10, category: 'Food', stock: 100 });
+  const basket = { items: [{ productId: product.id, quantity: 1 }], orderType: 'takeaway', paymentMethod: 'cash' };
+
+  for (const paymentMethod of ['bank_transfer', 'partner_cash']) {
+    const quoted = await req('POST', '/order/quote', { ...basket, paymentMethod }, token);
+    assert(`${paymentMethod} checkout can be quoted`, quoted.success && quoted.data?.totalAmount === 10);
+    const created = await req('POST', '/order/create', { ...basket, paymentMethod }, token);
+    const stored = created.data?._id ? await Order.findById(created.data._id) : null;
+    assert(`${paymentMethod} is preserved with payment pending`,
+      created.success && stored?.paymentMethod === paymentMethod && stored?.paymentStatus === 'pending');
+    const unchanged = await User.findById(customer._id);
+    assert(`${paymentMethod} does not debit wallet or points`,
+      unchanged.walletBalance === 100 && unchanged.walletPoints === 1000);
+  }
+
+  const adds = await Promise.all(Array.from({ length: 8 }, () => req('POST', '/cart/add', {
+    itemId: product.id, quantity: 1, price: 0.01, name: 'Forged name',
+  }, token)));
+  const savedCart = await req('GET', '/cart', null, token);
+  assert('concurrent cart additions preserve every unit without duplicate lines',
+    adds.every(response => response.success) && savedCart.data?.length === 1 && savedCart.data[0].quantity === 8);
+  assert('cart additions use catalogue values instead of client prices', savedCart.data?.[0]?.price === 10 && savedCart.data[0].name === 'Contract item');
+  await Product.updateOne({ _id: product._id }, { $set: { price: 12, vat: 7, taxMethod: 'Exclusive' } });
+  const refreshedCart = await req('GET', '/cart', null, token);
+  assert('saved carts reflect current catalogue prices and taxes', refreshedCart.data?.[0]?.price === 12 && refreshedCart.data[0].taxRate === 7);
+  const taxedQuote = await req('POST', '/order/quote', basket, token);
+  assert('checkout includes exclusive product tax', taxedQuote.data?.taxAmount === 0.84 && taxedQuote.data?.totalAmount === 12.84);
+  await Product.updateOne({ _id: product._id }, { $set: { taxMethod: 'Inclusive' } });
+  const inclusiveQuote = await req('POST', '/order/quote', basket, token);
+  assert('checkout does not charge inclusive tax twice', inclusiveQuote.data?.taxAmount === 0 && inclusiveQuote.data?.totalAmount === 12);
+  const fractionalCart = await req('PUT', '/cart/update', { itemId: product.id, quantity: 1.5 }, token);
+  assert('cart rejects fractional quantities without changing the saved line', fractionalCart.status === 400 && (await User.findById(customer._id)).cart[0].quantity === 8);
+  await Product.updateOne({ _id: product._id }, { $set: { price: 10, vat: 0, taxMethod: 'None' } });
+  await req('POST', '/cart/clear', {}, token);
+
+  const login = await req('POST', '/auth/merchant-password-login', { email: merchant.email.toUpperCase(), password: 'Contract123!' });
+  assert('merchant password sign-in returns a merchant session', login.success && login.data?.user?.role === 'merchant' && !!login.data?.token);
+  const wrongRole = await req('POST', '/auth/merchant-password-login', { email: customer.email, password: 'Contract123!' });
+  assert('consumer credentials cannot sign into the merchant password endpoint', wrongRole.status === 401);
+  const undelivered = await req('POST', '/auth/merchant-login', { phone: merchant.phone });
+  assert('an unsent merchant OTP is reported as unavailable', undelivered.status === 503 && !undelivered.success);
+
+  const quote = await req('POST', '/order/quote', { ...basket, orderType: 'delivery', tipAmount: 2.5, walletPointsRedeemed: 1000 }, token);
+  assert('quote includes catalogue price, delivery, tip and points exactly',
+    quote.data?.subtotal === 10 && quote.data?.deliveryCharge === 6 && quote.data?.tipAmount === 2.5 && quote.data?.totalAmount === 8.5);
+  assert('merchant ownership is derived from the catalogue', quote.data?.merchantId === merchant.id);
+  assert('a quote does not spend wallet points', (await User.findById(customer._id)).walletPoints === 1000);
+  const mismatch = await req('POST', '/order/create', { ...basket, merchantId: customer.id }, token);
+  assert('an order cannot be attributed to another store', mismatch.status === 400);
+  for (const quantity of [0, -1, 1.5, 'NaN', 1000]) {
+    const invalid = await req('POST', '/order/create', { ...basket, items: [{ productId: product.id, quantity }] }, token);
+    assert(`invalid quantity ${quantity} is rejected before checkout`, invalid.status === 400);
+  }
+  const stale = await req('POST', '/order/create', { ...basket, expectedTotal: 0 }, token);
+  assert('a changed total requires another review', stale.status === 409);
+  const inactiveProduct = await Product.create({ merchantId: merchant._id, name: 'Hidden item', price: 5, category: 'Food', isActive: false });
+  const inactive = await req('POST', '/order/create', { ...basket, items: [{ productId: inactiveProduct.id, quantity: 1 }] }, token);
+  assert('an unpublished product cannot be ordered', inactive.status === 400);
+
+  const simultaneous = await Promise.all(Array.from({ length: 8 }, () => req('POST', '/order/create', basket, token)));
+  assert('concurrent orders all receive a valid response', simultaneous.every(response => response.status === 201), JSON.stringify(simultaneous.map(response => response.message)));
+  assert('concurrent orders receive unique order numbers', new Set(simultaneous.map(response => response.data?.orderNumber)).size === 8);
+  const competing = await Promise.all(Array.from({ length: 2 }, () => req('POST', '/order/create', {
+    ...basket, walletPointsRedeemed: 1000, expectedTotal: 0,
+  }, token)));
+  assert('only one checkout can spend the same points balance', competing.filter(response => response.status === 201).length === 1);
+  assert('the other checkout receives a reviewable conflict', competing.some(response => response.status === 409));
+  assert('concurrent redemption never overdraws or loses a debit', (await User.findById(customer._id)).walletPoints === 0);
+  const redeemedOrder = competing.find(response => response.status === 201).data;
+  const canceled = await req('PUT', `/order/${redeemedOrder._id}/cancel`, {}, token);
+  assert('canceling returns the points actually redeemed', canceled.success && (await User.findById(customer._id)).walletPoints === 1000);
+  const repeatCancel = await req('PUT', `/order/${redeemedOrder._id}/cancel`, {}, token);
+  assert('a repeated cancellation cannot refund points twice', repeatCancel.status === 400 && (await User.findById(customer._id)).walletPoints === 1000);
+  const refunds = await require('../models/Transaction').find({ operationId: `checkout-refund:${redeemedOrder._id}:PTS` });
+  assert('the refund appears once in the points ledger', refunds.length === 1 && refunds[0].amount === 1000);
+
+  const walletOrder = await req('POST', '/order/create', { ...basket, paymentMethod: 'wallet' }, token);
+  assert('wallet checkout actually debits the cash wallet', walletOrder.data?.paymentStatus === 'paid' && (await User.findById(customer._id)).walletBalance === 90);
+  await req('PUT', `/order/${walletOrder.data._id}/cancel`, {}, token);
+  assert('canceling a wallet order returns exactly its cash payment', (await User.findById(customer._id)).walletBalance === 100);
+
+  const plans = await req('GET', '/services/packages', null, token);
+  const gold = plans.data.find(plan => plan.tier === 'gold');
+  const subscription = await req('POST', '/services/packages/subscribe', { tier: 'gold', quantity: 3, expectedTotal: gold.price * 3 }, token);
+  assert('subscription charges the displayed weekly price and quantity', subscription.success && subscription.data?.amountPaid === 1.5 && (await User.findById(customer._id)).walletBalance === 98.5);
+  assert('three weeks buys exactly twenty-one days', new Date(subscription.data.endDate) - new Date(subscription.data.startDate) === 21 * 86400000);
+  const renewal = await req('POST', '/services/packages/subscribe', { tier: 'gold', quantity: 2 }, token);
+  assert('renewing the same tier keeps the remaining subscription time', new Date(renewal.data.endDate) - new Date(subscription.data.endDate) === 14 * 86400000);
+  const invalidWeeks = await req('POST', '/services/packages/subscribe', { tier: 'gold', quantity: 11 }, token);
+  assert('an invalid subscription quantity is refused', invalidWeeks.status === 400);
+  const subscriptionTotal = await req('POST', '/services/packages/subscribe', { tier: 'gold', quantity: 1, expectedTotal: 0.01 }, token);
+  assert('a stale subscription price is refused', subscriptionTotal.status === 409);
+
+  const beforeServices = (await User.findById(customer._id)).walletBalance;
+  const services = await req('GET', '/services/status');
+  assert('API keys alone cannot enable a missing utility or telecom adapter', services.data?.mobileRecharge?.configured === false && services.data?.utilityBills?.configured === false);
+  for (const path of ['/services/pay-bill', '/services/mobile-recharge', '/services/donate']) {
+    const unavailable = await req('POST', path, { amount: 1, operator: 'Orange', phoneNumber: '12345678', organization: 'UNICEF', billServiceId: product.id, referenceNumber: 'test' }, token);
+    assert(`${path} cannot report an unperformed payment as successful`, unavailable.status === 503 && !unavailable.success);
+  }
+  assert('unavailable external services leave the wallet untouched', (await User.findById(customer._id)).walletBalance === beforeServices);
+  const missing = await req('GET', '/not-a-real-endpoint');
+  assert('unknown API endpoints return a JSON failure', missing.status === 404 && missing.success === false);
+  const preflight = await fetch(`${BASE_URL}/order/trips/test/mark`, { method: 'OPTIONS', headers: { Origin: 'http://localhost:8080', 'Access-Control-Request-Method': 'PATCH' } });
+  assert('browser PATCH requests are allowed by the API preflight', preflight.headers.get('access-control-allow-methods')?.includes('PATCH'));
+}
+
 async function runAll() {
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║   VIPs E2E Integration Test Suite            ║');
@@ -2708,6 +3272,8 @@ async function runAll() {
     await testReferral();
     await testGiftSend();
     await testAdmin();
+    await testAdminSubscriptionPayments();
+    await testAdminBroadcasts();
     // After testAdmin: the cross-check below needs an admin token, and the
     // whole point of it is that the customer's tracker and the console read
     // the same status field.
@@ -2722,8 +3288,12 @@ async function runAll() {
     await testBusinessModel();
     await testScreenshotFixes();
     await testPayWithPoints();
+    await testCurrencyIntegrity();
+    await testCrossAppIntegration();
+    await testCheckoutAndSubscriptionContracts();
   } catch (err) {
     console.error('\n💥 Test runner crashed:', err.message);
+    assert('Test suite completed without an exception', false, err.message);
   }
 
   if (dbConnected) await mongoose.disconnect();

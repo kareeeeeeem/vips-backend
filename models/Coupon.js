@@ -17,6 +17,7 @@ const couponSchema = new mongoose.Schema(
      * so a voucher meant to be worth 50 dinars was published as 50% off.
      */
     discountUnit:       { type: String, enum: ['percent', 'tnd'], default: 'percent' },
+    voucherDiscountPercentage: { type: Number, default: null, min: 0, max: 100 },
     expiryDate:         { type: Date, required: true },
     isActive:           { type: Boolean, default: true },
     merchantId:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },

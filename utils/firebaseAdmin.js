@@ -3,9 +3,22 @@
 // `.auth()`, `.credential`, etc. Those moved to modular subpath imports.
 // Verified locally: typeof require('firebase-admin').auth === 'undefined',
 // while require('firebase-admin/auth').getAuth is a function.
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getAuth } = require('firebase-admin/auth');
-
+//
+// Those imports happen inside ensureInitialized() rather than at the top of
+// this file, and that placement is load-bearing.
+//
+// firebase-admin pulls in jwks-rsa@4, which does `require('jose')`, and
+// jose@6 ships ESM only. Requiring ESM from CommonJS is supported from Node
+// 22.12 onwards and throws ERR_REQUIRE_ESM before it. At the top of the file
+// that throw happens while routes/auth.js is being loaded, which is during
+// index.js's own module graph — so on Node 20 the *entire platform* refused
+// to boot over a dependency only social login uses.
+//
+// Down here the same failure is caught below and cached like any other
+// initialization error: the server starts, every other endpoint works, and
+// /api/health reports social login as unavailable with the reason. A feature
+// that cannot work on this runtime should disable itself, not take the
+// backend down with it.
 let app = null;
 let initError = null;
 
@@ -19,6 +32,8 @@ function ensureInitialized() {
         'FIREBASE_SERVICE_ACCOUNT env var is not set — social login cannot verify tokens.'
       );
     }
+    // eslint-disable-next-line global-require
+    const { initializeApp, cert } = require('firebase-admin/app');
     const serviceAccount = JSON.parse(raw);
     app = initializeApp({ credential: cert(serviceAccount) });
   } catch (err) {
@@ -35,6 +50,8 @@ function ensureInitialized() {
 // forged — callers must not fall back to trusting client-supplied fields.
 async function verifyFirebaseIdToken(idToken) {
   ensureInitialized();
+  // eslint-disable-next-line global-require
+  const { getAuth } = require('firebase-admin/auth');
   return getAuth(app).verifyIdToken(idToken);
 }
 

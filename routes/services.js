@@ -6,6 +6,7 @@ const User = require('../models/User');
 const { authMiddleware, optionalAuthMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
+const WEEKLY_PACKAGE_PRICES = Object.freeze({ silver: 0.3, gold: 0.5, platinum: 1 });
 
 // ─── Real-provider integration gates ──────────────────────
 // Mobile recharge and utility bill payment/inquiry have no actual telecom
@@ -16,8 +17,12 @@ const router = express.Router();
 // (or aggregator) API key is set, these stay honestly disabled instead of
 // faking success, mirroring how /payment/methods already gates Paymee/
 // PayPal on whether real credentials are configured.
-const TELECOM_RECHARGE_CONFIGURED = !!process.env.TELECOM_RECHARGE_API_KEY;
-const UTILITY_BILLS_CONFIGURED = !!process.env.UTILITY_BILLS_API_KEY;
+// No provider adapter exists in this repository. An API key alone cannot
+// deliver airtime, query a bill or transfer a donation. Keep these gates shut
+// until an actual provider implementation and its receipt verification exist.
+const TELECOM_RECHARGE_CONFIGURED = false;
+const UTILITY_BILLS_CONFIGURED = false;
+const DONATIONS_CONFIGURED = false;
 const NOT_CONFIGURED_MESSAGE =
   'This service isn\'t available yet — real provider integration is still pending.';
 
@@ -56,6 +61,7 @@ router.get('/status', (req, res) => {
     data: {
       mobileRecharge: { configured: TELECOM_RECHARGE_CONFIGURED },
       utilityBills: { configured: UTILITY_BILLS_CONFIGURED },
+      donations: { configured: DONATIONS_CONFIGURED },
     },
   });
 });
@@ -120,12 +126,22 @@ router.post('/pay-bill', authMiddleware, async (req, res) => {
 // ─── GET /api/services/packages ───────────────────────────
 router.get('/packages', authMiddleware, async (req, res) => {
   try {
+    // Priced by the week, not the year. A year is a larger commitment than
+    // the app's single-step quantity picker suggests, and "1 year / 2 years"
+    // asks for a decision the control makes look small.
+    //
+    // The weekly figures are round numbers rather than a yearly price
+    // divided by 52, which produced 0.288 and 0.962 — prices no one would
+    // put in front of a customer. They land close to the old annual value:
+    // 0.3 a week is 15.6 a year against 15 before.
     const packages = [
       {
         id: 'basic',
         tier: 'basic',
         name: 'Basic',
-        price: 0,
+        price: 0.0,
+        billingPeriod: 'week',
+        yearlyPrice: 0,
         monthlyPrice: 0,
         redeemPoints: 1000,
         giftPoints: 800,
@@ -136,7 +152,9 @@ router.get('/packages', authMiddleware, async (req, res) => {
         id: 'silver',
         tier: 'silver',
         name: 'Silver',
-        price: 15,
+        price: WEEKLY_PACKAGE_PRICES.silver,
+        billingPeriod: 'week',
+        yearlyPrice: 15.6,
         monthlyPrice: 1.25,
         redeemPoints: 1500,
         giftPoints: 1200,
@@ -147,7 +165,9 @@ router.get('/packages', authMiddleware, async (req, res) => {
         id: 'gold',
         tier: 'gold',
         name: 'Gold',
-        price: 25,
+        price: WEEKLY_PACKAGE_PRICES.gold,
+        billingPeriod: 'week',
+        yearlyPrice: 26,
         monthlyPrice: 2.08,
         redeemPoints: 2500,
         giftPoints: 2200,
@@ -159,7 +179,9 @@ router.get('/packages', authMiddleware, async (req, res) => {
         id: 'platinum',
         tier: 'platinum',
         name: 'Platinum',
-        price: 50,
+        price: WEEKLY_PACKAGE_PRICES.platinum,
+        billingPeriod: 'week',
+        yearlyPrice: 52,
         monthlyPrice: 4.17,
         redeemPoints: 5000,
         giftPoints: 4500,
@@ -191,50 +213,96 @@ router.get('/packages/current', authMiddleware, async (req, res) => {
 
 // ─── POST /api/services/packages/subscribe ────────────────
 router.post('/packages/subscribe', authMiddleware, async (req, res) => {
+  let charged = 0;
+  let subscription;
+  let prior;
+  const lockUntil = new Date(Date.now() + 5 * 60 * 1000);
   try {
     const { tier } = req.body;
-    const validTiers = ['silver', 'gold', 'platinum'];
-    if (!validTiers.includes(tier)) {
+    const paymentMethod = req.body.paymentMethod || 'wallet';
+    if (!Object.hasOwn(WEEKLY_PACKAGE_PRICES, tier)) {
       return res.status(400).json({ success: false, message: 'Invalid package tier' });
     }
-
-    const prices = { silver: 15, gold: 25, platinum: 50 };
-    const user = await User.findById(req.user.id);
-
-    if (user.walletBalance < prices[tier]) {
-      return res.status(400).json({ success: false, message: 'Insufficient wallet balance' });
+    const quantity = Number(req.body.quantity ?? 1);
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 10) {
+      return res.status(400).json({ success: false, message: 'Choose between 1 and 10 weeks' });
+    }
+    const amount = require('../config/economics').roundTnd(WEEKLY_PACKAGE_PRICES[tier] * quantity);
+    if (req.body.expectedTotal != null &&
+        (!Number.isFinite(Number(req.body.expectedTotal)) || Math.abs(Number(req.body.expectedTotal) - amount) > 0.0005)) {
+      return res.status(409).json({ success: false, message: 'The package price changed. Please refresh and review it.' });
     }
 
-    user.walletBalance -= prices[tier];
-    await user.save();
+    if (paymentMethod === 'bank_transfer' || paymentMethod === 'partner_cash') {
+      const bankReference = String(req.body.bankReference || '').trim();
+      const partnerStore = String(req.body.partnerStore || '').trim();
+      if (paymentMethod === 'bank_transfer' && bankReference.length < 3) {
+        return res.status(400).json({ success: false, message: 'Enter the bank transfer reference.' });
+      }
+      if (paymentMethod === 'partner_cash' && !partnerStore) {
+        return res.status(400).json({ success: false, message: 'Choose a partner store for cash payment.' });
+      }
 
-    const endDate = new Date();
-    endDate.setFullYear(endDate.getFullYear() + 1);
+      const now = new Date();
+      const endDate = new Date(now.getTime() + quantity * 7 * 86400000);
+      const request = await Subscription.create({
+        userId: req.user.id,
+        tier,
+        startDate: now,
+        endDate,
+        isActive: false,
+        durationWeeks: quantity,
+        amountPaid: amount,
+        paymentMethod,
+        paymentStatus: 'pending_payment',
+        bankReference,
+        partnerStore,
+      });
+      return res.status(202).json({
+        success: true,
+        message: paymentMethod === 'bank_transfer'
+          ? 'Payment request received. We will verify your bank transfer.'
+          : 'Cash payment request received. Pay at the selected partner store.',
+        data: request,
+      });
+    }
 
-    await Subscription.findOneAndUpdate(
-      { userId: req.user.id, isActive: true },
-      { isActive: false }
+    if (paymentMethod !== 'wallet') {
+      return res.status(400).json({ success: false, message: 'Unsupported payment method.' });
+    }
+    const reserved = await User.findOneAndUpdate(
+      { _id: req.user.id, walletBalance: { $gte: amount },
+        $or: [{ subscriptionPurchaseUntil: null }, { subscriptionPurchaseUntil: { $lte: new Date() } }] },
+      { $inc: { walletBalance: -amount }, $set: { subscriptionPurchaseUntil: lockUntil } },
     );
-
-    const subscription = await Subscription.create({
-      userId: req.user.id,
-      tier,
-      endDate,
-      isActive: true,
+    if (!reserved) {
+      return res.status(409).json({ success: false, message: 'Insufficient balance or a subscription purchase is already in progress.' });
+    }
+    charged = amount;
+    prior = await Subscription.findOne({ userId: req.user.id, isActive: true, endDate: { $gt: new Date() } }).sort({ endDate: -1 });
+    const startDate = prior?.tier === tier ? prior.endDate : new Date();
+    const endDate = new Date(startDate.getTime() + quantity * 7 * 86400000);
+    subscription = await Subscription.create({
+      userId: req.user.id, tier, startDate, endDate, isActive: true,
+      durationWeeks: quantity, amountPaid: amount,
     });
-
     await Transaction.create({
-      userId: req.user.id,
-      type: 'expense',
-      amount: prices[tier],
-      description: `Subscription to ${tier} package`,
-      status: 'completed',
-      reference: `SUB-${Date.now()}`,
+      userId: req.user.id, type: 'expense', amount, currency: 'TND',
+      description: `${tier} subscription — ${quantity} week(s)`,
+      status: 'completed', reference: `SUB-${subscription._id}`,
     });
-
-    res.json({ success: true, message: `Subscribed to ${tier} package!`, data: subscription });
+    await Subscription.updateMany({ userId: req.user.id, isActive: true, _id: { $ne: subscription._id } }, { isActive: false });
+    res.json({ success: true, message: `Subscribed to ${tier} for ${quantity} week(s)!`, data: subscription });
   } catch (error) {
+    if (charged) await User.updateOne({ _id: req.user.id }, { $inc: { walletBalance: charged } });
+    if (subscription) {
+      await Subscription.deleteOne({ _id: subscription._id });
+      await Transaction.deleteMany({ reference: `SUB-${subscription._id}` });
+    }
+    if (prior) await Subscription.updateOne({ _id: prior._id }, { isActive: true });
     res.status(500).json({ success: false, message: error.message });
+  } finally {
+    await User.updateOne({ _id: req.user.id, subscriptionPurchaseUntil: lockUntil }, { $unset: { subscriptionPurchaseUntil: 1 } });
   }
 });
 
@@ -282,6 +350,9 @@ router.post('/mobile-recharge', authMiddleware, async (req, res) => {
 
 // ─── POST /api/services/donate ────────────────────────────
 router.post('/donate', authMiddleware, async (req, res) => {
+  if (!DONATIONS_CONFIGURED) {
+    return res.status(503).json({ success: false, code: 'SERVICE_NOT_CONFIGURED', message: 'Donations are currently unavailable. Your wallet has not been charged.' });
+  }
   try {
     const { organization, amount } = req.body;
 

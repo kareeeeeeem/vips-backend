@@ -26,7 +26,7 @@ const app = express();
 // ─── Middleware ────────────────────────────────────────────
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'vendorType', 'localization_key', 'module_id'],
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -248,11 +248,45 @@ app.put('/api/admin/employees/:id', authMiddleware, requireRole('admin'), async 
 const adminRoutes = require('./routes/admin');
 app.use('/api/admin', adminRoutes);
 
+// ═══════════════════════════════════════════════════════════
+// ADMIN DASHBOARD (the web console itself)
+// ═══════════════════════════════════════════════════════════
+// Served from the same process as the API it drives: one deploy, one origin,
+// so the browser needs no CORS grant and the console can never be pointed at
+// a backend of a different version than the one it was built against.
+//
+// Mounted *after* /api/admin so an API path can never be shadowed by a file.
+{
+  const path = require('path');
+  const adminWeb = path.join(__dirname, 'admin-web');
+
+  app.use('/admin', express.static(adminWeb, {
+    // `no-cache` means "revalidate", not "do not store": the browser keeps
+    // the file and asks with its ETag, so an unchanged asset costs a 304 and
+    // no body. That is the right default here because nothing in this folder
+    // is content-hashed — a long max-age on assets/css/app.css would leave
+    // operators on yesterday's stylesheet with today's markup, with no way to
+    // fix it but a hard reload none of them will think to do.
+    etag: true,
+    setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+  }));
+
+  // The console routes on the hash, so every real path lands on index.html.
+  // A missing asset must still 404 rather than quietly returning HTML, or a
+  // typo'd script src turns into a syntax error with no clue where from.
+  app.get('/admin/*', (req, res, next) => {
+    if (path.extname(req.path)) return next();
+    return res.sendFile(path.join(adminWeb, 'index.html'));
+  });
+
+  app.get('/admin', (req, res) => res.redirect('/admin/'));
+}
+
 // ─── Health Check ─────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   const dbStates = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
   const dbReadyState = mongoose.connection.readyState;
-  res.json({
+  res.status(dbReadyState === 1 ? 200 : 503).json({
     status:    'ok',
     message:   'VIPs Backend is running',
     timestamp: new Date().toISOString(),
@@ -267,6 +301,7 @@ app.get('/api/health', (req, res) => {
       version: require('./package.json').version,
       startedAt: STARTED_AT,
       env: process.env.NODE_ENV || 'development',
+      ...(process.env.NODE_ENV === 'test' ? { testInstanceId: process.env.TEST_INSTANCE_ID } : {}),
     },
     db: {
       readyState: dbReadyState,
@@ -283,6 +318,10 @@ app.get('/api/health', (req, res) => {
 });
 
 // ─── Global Error Handler ─────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ success: false, message: 'Endpoint not found' });
+});
+
 app.use((err, req, res, next) => {
   const status = err.status || 500;
   // Always log the real thing.

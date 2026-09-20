@@ -1,18 +1,20 @@
 const express = require('express');
 const { authMiddleware } = require('../middleware/auth');
+const { requirePin } = require('../middleware/pin');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Order = require('../models/Order');
 const Employee = require('../models/Employee');
 const Contact = require('../models/Contact');
 const UserNotification = require('../models/UserNotification');
-const { seedDemoTransactionsForUser } = require('../utils/autoSeeder');
 
 const router = express.Router();
 
 // All user routes require authentication
 const giftback = require('../utils/giftback');
-const { pointsToTnd } = require('../config/economics');
+const {
+  pointsToTnd, DIAMONDS_PER_TND, DIAMONDS_PER_POINT, diamondsToTnd, diamondsToPoints,
+} = require('../config/economics');
 
 router.use(authMiddleware);
 
@@ -144,15 +146,6 @@ router.get('/transactions', async (req, res) => {
       .skip((page - 1) * limit)
       .limit(parseInt(limit))
       .populate('merchantId', 'storeName fullName');
-
-    if (transactions.length === 0 && !type) {
-      await seedDemoTransactionsForUser(req.user.id);
-      transactions = await Transaction.find(filter)
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(parseInt(limit))
-        .populate('merchantId', 'storeName fullName');
-    }
 
     const total = await Transaction.countDocuments(filter);
 
@@ -346,7 +339,14 @@ router.get('/vips-club', async (req, res) => {
       data: {
         walletPoints: user.walletPoints,
         points: user.walletPoints,
-        convertibleDiamonds: user.walletPoints,
+        // Diamonds, not points. This reported walletPoints, so a balance of
+        // 1,000 points was shown as 1,000 diamonds — a hundred times its
+        // real value in the club.
+        diamonds: user.diamonds || 0,
+        convertibleDiamonds: user.diamonds || 0,
+        diamondsPerTnd: DIAMONDS_PER_TND,
+        diamondsValueTnd: diamondsToTnd(user.diamonds || 0),
+        diamondsPerPoint: DIAMONDS_PER_POINT,
         pendingDiamonds: user.pendingDiamonds || 0,
         suspendedDiamonds: user.suspendedDiamonds || 0,
         superBonus: user.superBonus || 0,
@@ -376,11 +376,16 @@ router.post('/vips-club/checkin', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Already checked in today' });
     }
 
+    // Diamonds, not points. These same numbers were being credited as
+    // loyalty points, so a daily check-in minted a whole dinar of spendable
+    // value — and the seventh day ten — against no merchant guarantee at
+    // all. As diamonds they are worth a hundredth of that, which is what a
+    // daily streak reward should be.
     const dayRewards = [100, 100, 100, 100, 250, 250, 1000];
     const streak = (user.checkInStreak || 0) % 7;
-    const rewardPoints = dayRewards[streak];
+    const rewardDiamonds = dayRewards[streak];
 
-    user.walletPoints = (user.walletPoints || 0) + rewardPoints;
+    user.diamonds = (user.diamonds || 0) + rewardDiamonds;
     user.checkInStreak = streak + 1 >= 7 ? 0 : streak + 1;
     user.lastCheckIn = new Date();
     await user.save();
@@ -388,8 +393,8 @@ router.post('/vips-club/checkin', async (req, res) => {
     await Transaction.create({
       userId: user._id,
       type: 'reward',
-      amount: rewardPoints,
-      currency: 'PTS',
+      amount: rewardDiamonds,
+      currency: 'DMD',
       description: `Daily check-in reward (Day ${streak + 1})`,
       status: 'completed',
       reference: `CHECKIN-${Date.now()}`,
@@ -397,8 +402,15 @@ router.post('/vips-club/checkin', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Check-in successful! You earned ${rewardPoints} points`,
-      data: { pointsEarned: rewardPoints, newBalance: user.walletPoints, newPoints: user.walletPoints, streak: user.checkInStreak },
+      message: `Checked in! ${rewardDiamonds} diamonds added.`,
+      data: {
+        diamondsEarned: rewardDiamonds,
+        pointsEarned: 0,
+        newDiamonds: user.diamonds,
+        newBalance: user.walletPoints,
+        newPoints: user.walletPoints,
+        streak: user.checkInStreak,
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -406,76 +418,65 @@ router.post('/vips-club/checkin', async (req, res) => {
 });
 
 // ─── POST /api/user/vips-club/convert ─────────────────────
+/**
+ * Turns club diamonds into loyalty points.
+ *
+ * Diamonds are worth a hundredth of a point, so the conversion floors: a
+ * customer converting 150 diamonds gets 1 point and keeps the remaining 50
+ * rather than losing them to rounding.
+ */
 router.post('/vips-club/convert', async (req, res) => {
   try {
-    const { points } = req.body;
-    if (!points || points < 100) {
-      return res.status(400).json({ success: false, message: 'Minimum 100 points required' });
+    const requested = Math.floor(Number(req.body.diamonds ?? req.body.points));
+    if (!Number.isFinite(requested) || requested < DIAMONDS_PER_POINT) {
+      return res.status(400).json({
+        success: false,
+        message: `You need at least ${DIAMONDS_PER_POINT} diamonds to convert — that is one point.`,
+      });
     }
 
     const user = await User.findById(req.user.id);
-    if (user.walletPoints < points) {
-      return res.status(400).json({ success: false, message: 'Insufficient points' });
+    if ((user.diamonds || 0) < requested) {
+      return res.status(400).json({
+        success: false,
+        message: `You have ${user.diamonds || 0} diamonds.`,
+      });
     }
 
-    const walletAmount = points * 0.01;
-    user.walletPoints -= points;
-    user.walletBalance = (user.walletBalance || 0) + walletAmount;
+    const points = diamondsToPoints(requested);
+    // Only take what actually became points; the remainder stays theirs.
+    const spent = points * DIAMONDS_PER_POINT;
+
+    user.diamonds = (user.diamonds || 0) - spent;
+    user.walletPoints = (user.walletPoints || 0) + points;
     await user.save();
 
     await Transaction.create({
       userId: user._id,
       type: 'credit',
-      amount: walletAmount,
-      description: `Converted ${points} diamonds to wallet`,
+      amount: points,
+      currency: 'PTS',
+      description: `Converted ${spent} diamonds to ${points} points`,
       status: 'completed',
       reference: `CONVERT-${Date.now()}`,
     });
 
     res.json({
       success: true,
-      message: `Converted ${points} points to ${walletAmount} wallet balance`,
-      data: { walletAmount, newBalance: user.walletBalance, newPoints: user.walletPoints },
+      message: `${spent} diamonds became ${points} points.`,
+      data: {
+        diamondsSpent: spent,
+        pointsGained: points,
+        diamondsLeft: user.diamonds,
+        newPoints: user.walletPoints,
+        valueTnd: pointsToTnd(points),
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// ─── DELETE /api/user/account ─────────────────────────────
-router.delete('/account', async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    await Promise.all([
-      User.findByIdAndDelete(userId),
-      Transaction.deleteMany({ userId }),
-      Order.deleteMany({ userId }),
-      UserNotification.deleteMany({ userId }),
-      Contact.deleteMany({ userId }),
-      Employee.deleteMany({ merchantId: userId }),
-    ]);
-
-    res.json({
-      success: true,
-      message: 'Account deleted successfully',
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// ─── GET /api/user/teams ──────────────────────────────────
-router.get('/teams', async (req, res) => {
-  try {
-    const employees = await Employee.find({ merchantId: req.user.id }).sort({ createdAt: -1 });
-    res.json({ success: true, data: employees });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// ─── POST /api/user/teams ─────────────────────────────────
 router.post('/teams', async (req, res) => {
   try {
     const { name, role, email, status } = req.body;
@@ -786,6 +787,106 @@ router.get('/payment-methods', async (req, res) => {
 router.get('/giftback', async (req, res) => {
   try {
     res.json({ success: true, data: await giftback.summaryFor(req.user.id) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/user/vips-id ────────────────────────────────
+/**
+ * The card a customer shows at the till: their short id and the QR that
+ * carries it. The id is assigned the first time this is asked for.
+ */
+router.get('/vips-id', async (req, res) => {
+  try {
+    const { ensureVipsId } = require('../utils/vipsId');
+    const user = await User.findById(req.user.id).select('fullName role vipsId profileImage');
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+    const vipsId = await ensureVipsId(user);
+    res.json({
+      success: true,
+      data: {
+        vipsId,
+        // Both forms resolve, so a scan works even against an older build
+        // that still reads the long one.
+        qr: `VIPS_ID_${vipsId}`,
+        fullName: user.fullName,
+        role: user.role,
+        digits: vipsId.length,
+      },
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * DELETE /api/user/account — the customer closes their own account.
+ *
+ * The Settings screen has offered this since it was written and called this
+ * exact path; nothing served it, so the button showed a spinner and then an
+ * error. It is also not optional: both stores require an app that creates
+ * accounts to let a person delete one from inside it.
+ *
+ * Only ever acts on the caller's own account — the id comes from the token,
+ * never from the request — so this cannot be pointed at anybody else.
+ */
+router.delete('/account', requirePin, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+    // An operator deleting themselves here would leave the console with one
+    // fewer administrator and no record of who did it. Staff are removed from
+    // the console, where that is checked.
+    if (user.role === 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Administrator accounts are closed from the admin console.',
+      });
+    }
+
+    // A merchant still owes their customers whatever they have sold. Live
+    // orders would be stranded, and a guarantee balance is the merchant's own
+    // money held by the platform (§5.1) — deleting the account would strand
+    // it with no one to refund it to.
+    if (user.role === 'merchant') {
+      const liveStatuses = ['pending', 'confirmed', 'processing', 'ready', 'handover'];
+      const live = await Order.countDocuments({ merchantId: user._id, status: { $in: liveStatuses } });
+      if (live > 0) {
+        return res.status(409).json({
+          success: false,
+          message: `You have ${live} order(s) still in progress. Complete or cancel them first.`,
+        });
+      }
+
+      const g = user.guarantee || {};
+      const b = g.budgets || {};
+      const held = (g.unallocatedPoints || 0) + (b.discount || 0) + (b.packages || 0) + (b.general || 0);
+      if (held > 0) {
+        return res.status(409).json({
+          success: false,
+          message: 'Your guarantee still holds a balance. Request a refund before closing the account.',
+        });
+      }
+    }
+
+    // Kept, deliberately: orders and transactions are financial records, and
+    // deleting them would rewrite past revenue and break the merchant's own
+    // books. The same rule the admin-side deletion follows.
+    const [orders, transactions] = await Promise.all([
+      Order.countDocuments({ userId: user._id }),
+      Transaction.countDocuments({ userId: user._id }),
+    ]);
+
+    await user.deleteOne();
+
+    res.json({
+      success: true,
+      message: 'Your account has been deleted.',
+      data: { ordersRetained: orders, transactionsRetained: transactions },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

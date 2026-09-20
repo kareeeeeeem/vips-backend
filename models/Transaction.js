@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const transactionSchema = new mongoose.Schema(
   {
+    operationId: { type: String },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -58,6 +59,7 @@ const transactionSchema = new mongoose.Schema(
 );
 
 transactionSchema.index({ userId: 1, createdAt: -1 });
+transactionSchema.index({ operationId: 1 }, { unique: true, sparse: true });
 transactionSchema.index({ merchantId: 1, createdAt: -1 });
 transactionSchema.index({ merchantId: 1, status: 1 });
 transactionSchema.index({ userId: 1, type: 1 });

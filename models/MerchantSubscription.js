@@ -10,13 +10,24 @@ const merchantSubscriptionSchema = new mongoose.Schema(
     },
     planName: {
       type: String,
-      enum: ['Free', 'Basic', 'Professional', 'Enterprise'],
-      default: 'Free',
+      // Arabic labels are the canonical labels in config/economics.js.
+      // English values remain readable for records created by older builds.
+      enum: [
+        'أساسية',
+        'احترافية',
+        'متقدمة',
+        'Free',
+        'Basic',
+        'Professional',
+        'Advanced',
+        'Enterprise',
+      ],
+      default: 'أساسية',
     },
     planCode: {
       type: String,
-      enum: ['free', 'basic', 'pro', 'enterprise'],
-      default: 'free',
+      enum: ['basic', 'professional', 'advanced', 'free', 'pro', 'enterprise'],
+      default: 'basic',
     },
     price:        { type: Number, default: 0 },
     billingCycle: { type: String, enum: ['monthly', 'yearly'], default: 'monthly' },

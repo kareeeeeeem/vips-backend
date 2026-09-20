@@ -15,8 +15,8 @@ function ensureConfigured() {
   if (configured) return true;
   if (configError) return false;
   const apiKey = process.env.SENDGRID_API_KEY;
-  if (!apiKey) {
-    configError = 'SENDGRID_API_KEY env var is not set — emails will be logged, not sent.';
+  if (!apiKey || !process.env.SENDGRID_FROM_EMAIL) {
+    configError = 'Email delivery requires SENDGRID_API_KEY and SENDGRID_FROM_EMAIL.';
     return false;
   }
   sgMail.setApiKey(apiKey);
@@ -26,16 +26,14 @@ function ensureConfigured() {
 
 // For /api/health — mirrors firebaseAdmin.getInitStatus().
 function getInitStatus() {
-  if (configured) return { configured: true };
-  ensureConfigured();
-  return { configured: false, error: configError };
+  return ensureConfigured() ? { configured: true } : { configured: false, error: configError };
 }
 
 // Returns { sent: boolean, error?: string }. Never throws — callers should
 // treat a failed send as non-fatal to whatever real action triggered it.
 async function sendEmail({ to, subject, text, html }) {
   if (!ensureConfigured()) {
-    console.log(`📧 [mailer] SendGrid not configured — would have sent to ${to}: "${subject}"\n${text}`);
+    if (process.env.NODE_ENV !== 'production') console.log(`📧 [mailer] SendGrid not configured — would have sent to ${to}: "${subject}"\n${text}`);
     return { sent: false, error: configError };
   }
   const fromEmail = process.env.SENDGRID_FROM_EMAIL;

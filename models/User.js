@@ -3,6 +3,8 @@ const bcrypt = require('bcryptjs');
 
 const userSchema = new mongoose.Schema(
   {
+    checkoutRefundIds: { type: [mongoose.Schema.Types.ObjectId], default: [], select: false },
+    subscriptionPurchaseUntil: { type: Date, default: null, select: false },
     fullName: {
       type: String,
       required: true,
@@ -200,6 +202,41 @@ const userSchema = new mongoose.Schema(
     checkInStreak: { type: Number, default: 0 },
 
     // VIPs Club extended
+    /**
+     * VIPs Club diamonds. Their own balance, not a second name for
+     * walletPoints: the club reported `convertibleDiamonds: walletPoints`,
+     * so a customer holding 1,000 points was shown 1,000 diamonds — worth a
+     * hundredth as much — and the two could never be told apart.
+     */
+    diamonds:          { type: Number, default: 0, min: 0 },
+
+    /**
+     * The number a person reads out or types: six digits for a customer,
+     * four for a merchant. The VIPs ID card showed the Mongo _id, which is
+     * 24 hex characters — not something anyone can repeat over a counter,
+     * and it puts the shape of the database on a screen in a restaurant.
+     *
+     * Sparse and unique: assigned when first needed rather than at signup,
+     * so existing accounts are not all rewritten at once.
+     *
+     * No `default`, and that is the whole point. A sparse index skips only
+     * documents where the field is *absent* — an explicit `vipsId: null`
+     * still occupies the index. With `default: null` every signup wrote one,
+     * so the second account ever created collided with the first and
+     * registration failed with E11000 for everyone after it. Leaving the
+     * field off until utils/vipsId.js assigns a real one is what makes
+     * sparse do the job it was chosen for.
+     */
+    vipsId:            { type: String, unique: true, sparse: true, index: true },
+
+    /**
+     * The session before this one. "Last connection" was reading `lastLogin`,
+     * which is stamped during the very login that then displays it — so the
+     * line always showed the moment the customer opened the app, which tells
+     * them nothing they do not already know. This is the one that answers
+     * "when was I last here".
+     */
+    previousLogin:     { type: Date, default: null },
     pendingDiamonds:   { type: Number, default: 0 },
     suspendedDiamonds: { type: Number, default: 0 },
     superBonus:        { type: Number, default: 0 },
@@ -277,6 +314,8 @@ userSchema.methods.toJSON = function () {
   // safe) to expose in an API response.
   delete obj.resetPasswordToken;
   delete obj.resetPasswordExpires;
+  delete obj.checkoutRefundIds;
+  delete obj.subscriptionPurchaseUntil;
   return obj;
 };
 

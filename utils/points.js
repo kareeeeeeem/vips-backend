@@ -62,4 +62,56 @@ async function creditPointsForOrder(order) {
   return { credited: true, points, rate };
 }
 
-module.exports = { creditPointsForOrder, earnRateFor, DEFAULT_EARN_RATE };
+/**
+ * Take back the points an order awarded, when it is refunded.
+ *
+ * Reads the amount from the ledger entry that granted it rather than
+ * recomputing. Two reasons: the merchant may have changed their earn rate
+ * since the sale, and recomputing is what went wrong before — the merchant
+ * route clawed back `Math.floor(totalAmount)`, one point per dinar, against
+ * a credit made at the merchant's own rate of six, so a refunded 100 TND
+ * order took back 100 of the 600 points it had given.
+ *
+ * Lives here, beside the crediting, because there were two refund paths —
+ * the merchant app and the admin console — and only one of them reversed
+ * anything at all. A rule each caller has to remember is a rule with holes
+ * in exactly the caller that forgot.
+ */
+async function reversePointsForOrder(order) {
+  if (!order || !order.pointsCredited) return { reversed: false, points: 0 };
+
+  const earned = await Transaction.findOne({
+    reference: `ORDER-EARN-${order._id}`,
+    type: 'reward',
+  }).select('amount').lean();
+
+  const points = Math.max(0, Math.floor(earned?.amount || 0));
+  if (points <= 0) return { reversed: false, points: 0 };
+
+  const user = await User.findById(order.userId);
+  if (!user) return { reversed: false, points: 0 };
+
+  // Never below zero: the customer may have spent them already. What cannot
+  // be recovered is written off rather than turned into a negative balance
+  // that would silently eat their next legitimate earnings.
+  const taken = Math.min(points, user.walletPoints || 0);
+  user.walletPoints = (user.walletPoints || 0) - taken;
+  await user.save();
+
+  await Transaction.create({
+    userId: user._id,
+    merchantId: order.merchantId || null,
+    type: 'debit',
+    amount: taken,
+    currency: 'PTS',
+    description: `${taken} VIPS points reversed — order #${order.orderNumber} refunded`,
+    status: 'completed',
+    reference: `ORDER-REVERSE-${order._id}`,
+  });
+
+  return { reversed: true, points: taken, awarded: points };
+}
+
+module.exports = {
+  creditPointsForOrder, reversePointsForOrder, earnRateFor, DEFAULT_EARN_RATE,
+};

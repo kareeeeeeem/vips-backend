@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VIPs — Admin</title>
+  <link rel="shortcut icon" href="assets/img/favicon.svg" type="image/svg+xml">
+
+  <link href="https://fonts.googleapis.com/css2?family=Karla:wght@200;300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+
+  <!-- Vendor theme (QRPayPro admin), unmodified -->
+  <link rel="stylesheet" href="assets/css/fontawesome-all.css">
+  <link rel="stylesheet" href="assets/css/bootstrap.css">
+  <link rel="stylesheet" href="assets/css/line-awesome.css">
+  <link rel="stylesheet" href="assets/css/animate.css">
+  <link rel="stylesheet" href="assets/css/style.css">
+  <!-- VIPs brand layer — must come last -->
+  <link rel="stylesheet" href="assets/css/vips-theme.css">
+  <link rel="stylesheet" href="assets/css/app.css">
+</head>
+
+<!--
+  `dark-sidebar` is the vendor theme's own dark navigation mode. Fifty-seven
+  rules already restate the sidebar's text, icons and headings in light
+  colours under it, so switching it on is what makes a navy sidebar legible —
+  far better than hand-writing those overrides and missing some.
+-->
+<body class="dark-sidebar">
+
+  <!-- ── Sign-in ─────────────────────────────────────────── -->
+  <div class="login-screen" id="login-screen" hidden>
+    <form class="login-card" id="login-form" autocomplete="on">
+      <div class="login-brand">
+        <span class="login-mark">VIPs</span>
+        <h4>Admin Console</h4>
+        <p>لوحة تحكم منصة فيبس</p>
+      </div>
+
+      <div class="login-alert" id="login-error" hidden></div>
+
+      <label class="login-field">
+        <span>Email</span>
+        <input type="email" name="email" autocomplete="username" required autofocus>
+      </label>
+
+      <label class="login-field">
+        <span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+
+      <button type="submit" class="btn btn--base w-100" id="login-submit">Sign in</button>
+
+      <p class="login-foot">
+        Admin accounts only. Customer and merchant sign-ins are refused here.
+      </p>
+    </form>
+  </div>
+
+  <!-- ── Console ─────────────────────────────────────────── -->
+  <div class="page-wrapper" id="app-shell" hidden>
+    <div id="body-overlay" class="body-overlay"></div>
+
+    <div class="sidebar">
+      <div class="sidebar-inner">
+        <div class="sidebar-logo">
+          <a href="#/" class="sidebar-main-logo"><span class="brand-mark">VIPs</span></a>
+          <button class="sidebar-menu-bar" type="button" aria-label="Toggle navigation">
+            <i class="fas fa-exchange-alt"></i>
+          </button>
+        </div>
+
+        <div class="sidebar-user-area">
+          <div class="sidebar-user-thumb"><span class="avatar" id="nav-avatar">—</span></div>
+          <div class="sidebar-user-content">
+            <h6 class="title" id="nav-username">…</h6>
+            <span class="sub-title" id="nav-userrole">…</span>
+          </div>
+        </div>
+
+        <div class="sidebar-menu-wrapper">
+          <ul class="sidebar-menu" id="sidebar-menu"></ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="main-wrapper">
+      <div class="main-body-wrapper">
+        <nav class="navbar-wrapper">
+          <div class="dashboard-title-part">
+            <div class="left">
+              <div class="icon">
+                <button class="sidebar-menu-bar" type="button" aria-label="Toggle navigation">
+                  <i class="fas fa-exchange-alt"></i>
+                </button>
+              </div>
+              <div class="content">
+                <h3 class="title" id="page-title">…</h3>
+                <p id="page-subtitle">Welcome to the VIPs admin console</p>
+              </div>
+            </div>
+            <div class="right">
+              <div class="topbar-actions">
+                <button class="topbar-btn" id="global-search-btn" type="button" title="Search (/)">
+                  <i class="las la-search"></i>
+                </button>
+                <button class="topbar-btn" id="alerts-btn" type="button" title="Attention needed">
+                  <i class="las la-bell"></i>
+                  <span class="topbar-dot" id="alerts-dot" hidden></span>
+                </button>
+                <button class="topbar-btn" id="signout-btn" type="button" title="Sign out">
+                  <i class="las la-sign-out-alt"></i>
+                </button>
+              </div>
+              <div class="dashboard-path" id="breadcrumb"></div>
+            </div>
+          </div>
+        </nav>
+
+        <div class="body-wrapper">
+          <div id="view"></div>
+        </div>
+      </div>
+
+      <footer class="footer-wrapper">
+        <div class="footer-content">
+          <span id="footer-note">VIPs Admin</span>
+          <span class="footer-build" id="footer-build"></span>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <div class="toast-stack" id="toast-stack"></div>
+  <div class="modal-host" id="modal-host" hidden></div>
+
+  <script src="assets/js/bootstrap.bundle.js"></script>
+  <script src="assets/js/apexcharts.js"></script>
+  <script type="module" src="app/main.js"></script>
+</body>
+
+</html>

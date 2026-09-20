@@ -19,8 +19,19 @@
 const POINTS_PER_TND = 100;
 const TND_PER_POINT = 1 / POINTS_PER_TND; // 0.01
 
+/**
+ * Round an amount to the dinar's own precision.
+ *
+ * The Tunisian dinar has three decimal places — the millime — and the
+ * documents price in them (§4.2's worked example is an invoice of 10.800
+ * with 0.800 change). Rounding money to two decimals here silently moves
+ * up to five millimes per operation, in whichever direction the arithmetic
+ * happens to fall. Every money figure goes through this.
+ */
+const roundTnd = (tnd) => Math.round((Number(tnd) || 0) * 1000) / 1000;
+
 /** Points → dinars, rounded to millimes (3 decimals, Tunisian dinar). */
-const pointsToTnd = (points) => Math.round((Number(points) || 0) * TND_PER_POINT * 1000) / 1000;
+const pointsToTnd = (points) => roundTnd((Number(points) || 0) * TND_PER_POINT);
 
 /** Dinars → points. Floors: never credit a fraction of a point. */
 const tndToPoints = (tnd) => Math.floor((Number(tnd) || 0) * POINTS_PER_TND);
@@ -39,6 +50,19 @@ const pointsForInvoice = (amountTnd, earnRate) => {
   if (!Number.isFinite(rate) || rate <= 0) return 0;
   return Math.floor((Number(amountTnd) || 0) * Math.min(rate, MAX_EARN_RATE));
 };
+
+// ─── VIPs Club diamonds ────────────────────────────────────
+// A second, much smaller unit, collected inside the club rather than earned
+// on a purchase: 10,000 diamonds to the dinar, so one loyalty point is worth
+// a hundred of them. Kept apart from points because they are earned
+// differently and are worth a hundredth as much — reporting one as the other
+// overstates a customer's balance by two orders of magnitude.
+const DIAMONDS_PER_TND = 10000;
+const DIAMONDS_PER_POINT = DIAMONDS_PER_TND / POINTS_PER_TND; // 100
+
+const diamondsToTnd = (d) =>
+  Math.round(((Number(d) || 0) / DIAMONDS_PER_TND) * 1000) / 1000;
+const diamondsToPoints = (d) => Math.floor((Number(d) || 0) / DIAMONDS_PER_POINT);
 
 // ─── §4.2 Giftback ─────────────────────────────────────────
 // The customer forgoes the change on their invoice and receives it as
@@ -117,8 +141,9 @@ const commissionForInvoice = (amountTnd, planKey) => {
 };
 
 module.exports = {
-  POINTS_PER_TND, TND_PER_POINT, pointsToTnd, tndToPoints,
+  POINTS_PER_TND, TND_PER_POINT, roundTnd, pointsToTnd, tndToPoints,
   DEFAULT_EARN_RATE, MAX_EARN_RATE, pointsForInvoice,
+  DIAMONDS_PER_TND, DIAMONDS_PER_POINT, diamondsToTnd, diamondsToPoints,
   GIFTBACK, BUDGETS, BUDGET_LABELS, REFUND,
   EDIT_COOLDOWN, cooldownUntil,
   PLANS, PLAN_KEYS, commissionForInvoice,

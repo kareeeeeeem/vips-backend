@@ -6,10 +6,71 @@ const User = require('../models/User');
 const Product = require('../models/Product');
 const Promotion = require('../models/Promotion');
 const Order = require('../models/Order');
+const Transaction = require('../models/Transaction');
+const Coupon = require('../models/Coupon');
+const BusinessRegistration = require('../models/BusinessRegistration');
 const { authMiddleware, optionalAuthMiddleware } = require('../middleware/auth');
 const { runAutoSeeder } = require('../utils/autoSeeder');
 
 const router = express.Router();
+
+const BUSINESS_TIME_ZONE = 'Africa/Tunis';
+const WEEKDAYS = [
+  'Sunday',
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+];
+
+function minutesFromTime(value) {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value || ''));
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+function scheduleStatus(schedule, now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: BUSINESS_TIME_ZONE,
+    weekday: 'long',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const day = values.weekday;
+  const currentMinutes = Number(values.hour) * 60 + Number(values.minute);
+  const data = schedule && typeof schedule === 'object' ? schedule[day] : null;
+  const shifts = Array.isArray(data?.shifts) && data.shifts.length
+    ? data.shifts
+    : data?.open && data?.close
+      ? [{ open: data.open, close: data.close }]
+      : [];
+  const enabled = data?.enabled !== false;
+  const validShifts = shifts
+    .map((shift) => ({
+      open: String(shift.open || ''),
+      close: String(shift.close || ''),
+      openMinutes: minutesFromTime(shift.open),
+      closeMinutes: minutesFromTime(shift.close),
+    }))
+    .filter((shift) => shift.openMinutes !== null && shift.closeMinutes !== null);
+  const open = enabled && validShifts.some((shift) => {
+    if (shift.closeMinutes >= shift.openMinutes) {
+      return currentMinutes >= shift.openMinutes && currentMinutes < shift.closeMinutes;
+    }
+    return currentMinutes >= shift.openMinutes || currentMinutes < shift.closeMinutes;
+  });
+
+  return {
+    day,
+    isOpen: open,
+    todayShifts: enabled ? validShifts.map(({ open, close }) => ({ open, close })) : [],
+    timezone: BUSINESS_TIME_ZONE,
+    weekdays: WEEKDAYS,
+  };
+}
 
 // Real per-product stats derived from actual Orders, so product cards and
 // the detail page stop showing a hardcoded 5.0 rating / 0 sell count for
@@ -247,15 +308,144 @@ router.get('/outings', optionalAuthMiddleware, async (req, res) => {
   }
 });
 
+// ─── GET /api/content/merchants/:id ───────────────────────
+// Public storefront data. The merchant app writes the schedule during
+// registration; customers read the same schedule and a server-calculated
+// current status here.
+router.get('/merchants/:id', optionalAuthMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid merchant id' });
+    }
+    const merchant = await User.findOne({
+      _id: req.params.id,
+      role: 'merchant',
+      isActive: { $ne: false },
+    }).select('storeName storeCategory logo coverImage brandColor discountPercentage storeAddress storeDescription phone');
+    if (!merchant) {
+      return res.status(404).json({ success: false, message: 'Merchant not found' });
+    }
+
+    const registration = await BusinessRegistration.findOne({
+      merchantId: merchant._id,
+      status: { $ne: 'rejected' },
+    }).select('schedule address website socialMedia');
+    const schedule = registration?.schedule || {};
+    res.json({
+      success: true,
+      data: {
+        ...merchant.toObject(),
+        schedule,
+        openingStatus: scheduleStatus(schedule),
+        address: merchant.storeAddress || registration?.address || '',
+        website: registration?.website || '',
+        socialMedia: registration?.socialMedia || {},
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ─── GET /api/content/following-merchants ─────────────────
+// The Fidelity Cards tab is driven by the stores the customer follows. Each
+// card also carries that customer's points with the merchant and the latest
+// active offers, so the page does not invent a global reward balance.
+router.get('/following-merchants', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('following');
+    const followingIds = user?.following || [];
+    if (!followingIds.length) {
+      return res.json({ success: true, data: { merchants: [] } });
+    }
+
+    const [merchants, pointRows, offers] = await Promise.all([
+      User.find({
+        _id: { $in: followingIds },
+        role: 'merchant',
+        isActive: { $ne: false },
+      }).select('storeName storeCategory logo brandColor discountPercentage'),
+      Transaction.aggregate([
+        {
+          $match: {
+            userId: new mongoose.Types.ObjectId(req.user.id),
+            merchantId: { $in: followingIds },
+            currency: 'PTS',
+            status: { $in: ['pending', 'completed'] },
+          },
+        },
+        { $group: { _id: { merchantId: '$merchantId', status: '$status' }, total: { $sum: '$amount' } } },
+      ]),
+      Coupon.find({
+        merchantId: { $in: followingIds },
+        isActive: true,
+        expiryDate: { $gt: new Date() },
+      }).sort({ createdAt: -1 }).limit(40).lean(),
+    ]);
+
+    const pointsByMerchant = new Map();
+    for (const row of pointRows) {
+      const merchantId = String(row._id.merchantId);
+      const current = pointsByMerchant.get(merchantId) || { completed: 0, pending: 0 };
+      current[row._id.status] = row.total || 0;
+      pointsByMerchant.set(merchantId, current);
+    }
+
+    const offersByMerchant = new Map();
+    for (const offer of offers) {
+      const merchantId = String(offer.merchantId);
+      const list = offersByMerchant.get(merchantId) || [];
+      if (list.length < 3) {
+        list.push({
+          id: String(offer._id),
+          code: offer.code,
+          discount: offer.discount,
+          discountUnit: offer.discountUnit,
+          type: offer.type,
+          voucherDiscountPercentage: offer.voucherDiscountPercentage,
+          description: offer.description,
+          expiryDate: offer.expiryDate,
+        });
+      }
+      offersByMerchant.set(merchantId, list);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        merchants: merchants.map((merchant) => {
+          const id = String(merchant._id);
+          const points = pointsByMerchant.get(id) || { completed: 0, pending: 0 };
+          return {
+            ...merchant.toObject(),
+            points: points.completed,
+            pendingPoints: points.pending,
+            offers: offersByMerchant.get(id) || [],
+          };
+        }),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // ─── GET /api/content/trending-merchants ──────────────────
 router.get('/trending-merchants', optionalAuthMiddleware, async (req, res) => {
   try {
-    let merchants = await User.find({ role: 'merchant', isTrending: true })
+    // `isActive: { $ne: false }` rather than `isActive: true`: older merchant
+    // records predate the field, and treating "not set" as hidden would empty
+    // the home screen. What matters is that a merchant the console has
+    // deactivated is excluded — deactivating already hides their products, so
+    // without this the card stayed on the home screen and led to an empty shop.
+    const visible = { role: 'merchant', isActive: { $ne: false }, isTrending: true };
+
+    let merchants = await User.find(visible)
       .select('storeName storeCategory logo brandColor discountPercentage')
       .sort({ createdAt: -1 });
     if (merchants.length === 0) {
       await runAutoSeeder();
-      merchants = await User.find({ role: 'merchant', isTrending: true })
+      merchants = await User.find(visible)
         .select('storeName storeCategory logo brandColor discountPercentage')
         .sort({ createdAt: -1 });
     }
@@ -342,7 +532,12 @@ router.get('/search', optionalAuthMiddleware, async (req, res) => {
 
     const dealFilter = { $or: [{ title: regex }, { description: regex }] };
     const outingFilter = { $or: [{ title: regex }, { subtitle: regex }, { category: regex }] };
-    const merchantFilter = { role: 'merchant', $or: [{ storeName: regex }, { storeCategory: regex }] };
+    // Same rule as the home screen: a deactivated shop is not a search result.
+    const merchantFilter = {
+      role: 'merchant',
+      isActive: { $ne: false },
+      $or: [{ storeName: regex }, { storeCategory: regex }],
+    };
     const productFilter = { $or: [{ name: regex }, { description: regex }, { category: regex }] };
 
     if (catRegex && !onlyOutings) {
@@ -653,6 +848,11 @@ router.get('/ads', async (req, res) => {
 
     const ads = await MerchantAd.find({
       status: 'active',
+      $or: [
+        { moderationStatus: 'approved' },
+        // Ads created before moderation existed remain live until reviewed.
+        { moderationStatus: { $exists: false } },
+      ],
       startDate: { $lte: now },
       endDate: { $gte: now },
       $expr: {

@@ -5,6 +5,7 @@ const dealSchema = new mongoose.Schema(
     title: { type: String, required: true },
     description: { type: String, required: true },
     image: { type: String, required: true },
+    images: { type: [String], default: [] },
     currentPrice: { type: Number, required: true },
     originalPrice: { type: Number, required: true },
     discount: { type: Number, required: true },

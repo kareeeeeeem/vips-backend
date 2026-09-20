@@ -16,7 +16,7 @@ function backendUrl() {
 
 // Same rate as VIPS_TO_TND in routes/order.js — kept in sync manually
 // (matches that file's existing precedent for this constant).
-const { TND_PER_POINT: VIPS_TO_TND } = require('../config/economics');
+const { TND_PER_POINT: VIPS_TO_TND, roundTnd } = require('../config/economics');
 const MIN_TOPUP_VIPS = 100;
 const MAX_TOPUP_VIPS = 50000;
 
@@ -25,8 +25,12 @@ async function creditWalletTopup(topup) {
   topup.status = 'paid';
   const user = await User.findById(topup.userId);
   if (!user) return;
+  // Credit the points that were bought, and only those. This also added
+  // `tndAmount` to the spendable cash wallet, so a customer paying 10 TND
+  // received 1,000 points (worth 10 TND) *and* 10 TND of balance — twice
+  // what they paid for, every top-up. `tndAmount` is what the gateway
+  // charged, recorded on the WalletTopup; it is not a second credit.
   user.walletPoints = (user.walletPoints || 0) + topup.vipsAmount;
-  user.walletBalance = (user.walletBalance || 0) + topup.tndAmount;
   await Promise.all([
     user.save(),
     topup.save(),
@@ -154,7 +158,7 @@ router.post('/paymee/topup-initiate', authMiddleware, async (req, res) => {
     if (!vipsAmount || vipsAmount < MIN_TOPUP_VIPS || vipsAmount > MAX_TOPUP_VIPS) {
       return res.status(400).json({ success: false, message: `Amount must be between ${MIN_TOPUP_VIPS} and ${MAX_TOPUP_VIPS} points` });
     }
-    const tndAmount = Math.round(vipsAmount * VIPS_TO_TND * 100) / 100;
+    const tndAmount = roundTnd(vipsAmount * VIPS_TO_TND);
 
     const user = await User.findById(req.user.id);
     const [firstName, ...rest] = (user?.fullName || 'VIPs Customer').split(' ');
@@ -324,7 +328,7 @@ router.post('/paypal/topup-create', authMiddleware, async (req, res) => {
     if (!vipsAmount || vipsAmount < MIN_TOPUP_VIPS || vipsAmount > MAX_TOPUP_VIPS) {
       return res.status(400).json({ success: false, message: `Amount must be between ${MIN_TOPUP_VIPS} and ${MAX_TOPUP_VIPS} points` });
     }
-    const tndAmount = Math.round(vipsAmount * VIPS_TO_TND * 100) / 100;
+    const tndAmount = roundTnd(vipsAmount * VIPS_TO_TND);
 
     const result = await paypal.createOrder({
       amount: tndAmount,

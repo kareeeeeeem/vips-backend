@@ -1,0 +1,130 @@
+/**
+ * VIPs brand layer.
+ *
+ * style.css is the QRPayPro admin theme, kept byte-for-byte as shipped so it
+ * stays updatable. Everything below re-states only its brand-coloured
+ * declarations in the VIPs palette, and is generated rather than hand-listed
+ * so a colour buried in some rule nobody thought to look at is not missed.
+ *
+ *   #5a5278  (theme base)     ->  #00205C  Appblou, the VIPs navy
+ *   #7367f0  (theme primary)  ->  #FA6B25  AppPrimaryColor, the VIPs orange
+ *
+ * Load order matters: style.css first, then this.
+ */
+
+:root {
+  --vips-navy: #00205C;
+  --vips-orange: #FA6B25;
+  --vips-yellow: #FFC403;
+  --vips-success: #28c76f;
+  --vips-danger: #ea5455;
+  --vips-warning: #ff9f43;
+  --vips-info: #1e9ff2;
+  --vips-muted: #6e768e;
+  --vips-line: #eeeeee;
+}
+
+/* ── generated from style.css ─────────────────────────────── */
+
+.bg-primary { background-color: #00205C !important; }
+.bg--primary { background-color: #FA6B25 !important; }
+.bg--secondary { background-color: #00205C; }
+.bg--base { background-color: #00205C !important; }
+.text--primary { color: #FA6B25; }
+.text--secondary { color: #00205C; }
+.text--base { color: #00205C !important; }
+.border--primary { border: #FA6B25; }
+.border--secondary { border: 1px solid #00205C; }
+.border--base { border: 1px solid #00205C; }
+.swiper-pagination .swiper-pagination-bullet-active { background-color: #00205C; }
+.slider-next:hover, .slider-prev:hover { background-color: #00205C; }
+.pagination .page-item.active .page-link, .pagination .page-item:hover .page-link { background-color: #00205C; }
+.nav-tabs .nav-link::before { background-color: #00205C; }
+.nav-tabs .nav-link:hover { color: #00205C; }
+.nav-tabs .nav-link.active { color: #00205C; border-bottom: 2px solid #00205C; }
+.custom-card .card-body .card-form .toggle-container .switch-toggles.active::after { background: #00205C; }
+.toggle-container .switch-toggles.active::after { background: #00205C; }
+.section-header .section-sub-title { color: #00205C; }
+.section-header .section-title span { color: #00205C; }
+.btn--primary { background-color: #FA6B25; }
+.badge--primary { border-color: #FA6B25 !important; color: #FA6B25 !important; }
+.badge--base { border-color: #00205C; color: #00205C; }
+.border--primary { border: 1px solid #FA6B25; }
+.btn--base { background: #00205C; }
+.btn--base.active { color: #00205C; }
+.btn--base.active:focus, .btn--base.active:hover { background: #00205C; }
+.info-btn { background-color: #00205C; }
+.input-group-text { background: #00205C; }
+.custom-check-group input:checked + label::before { background-color: #00205C; border: 1px solid #00205C; }
+.custom-check-group label::before { border: 1px solid #00205C; }
+.radio-wrapper input[type=radio]:not(:checked) + label::after { background: #00205C; }
+.radio-wrapper input[type=radio]:checked + label::after { background: #00205C; }
+.fileholder.active { border: 2px dashed #00205C !important; }
+.fileholder-drag-drop-icon svg path:nth-child(2) { fill: #00205C; }
+.fileholder-basic-loading-circle.one { border: 2px solid #00205C; }
+.fileholder-basic-loading-circle.two { border: 2px solid #00205C; }
+.fileholder-basic-loading-circle.three { border: 2px solid #00205C; }
+.filepond--panel-root { border: 2px dashed #00205C; }
+.nice-select .option:hover { background-color: #00205C; }
+::-moz-selection { background-color: #00205C; }
+::selection { background-color: #00205C; }
+.header-top .header-notification-area .header-notification-bar .bling-area .bling { background: #00205C; }
+.header-top .header-notification-area .header-notification-bar .bling-area .bling::before { background: #00205C; }
+.header-top .header-notification-area .header-notification-bar .bling-area .bling::after { background: #00205C; }
+.header-top .header-notification-area .notification-footer a { color: #00205C; }
+.header-top .header-support-area .header-support-bar .bling-area .bling { background: #00205C; }
+.header-top .header-support-area .header-support-bar .bling-area .bling::before { background: #00205C; }
+.header-top .header-support-area .header-support-bar .bling-area .bling::after { background: #00205C; }
+.sidebar-user-area .sidebar-user-content .title { color: #00205C; }
+.sidebar-user-area .sidebar-user-content .sidebar-social li a:hover { color: #00205C; }
+.sidebar-logo .sidebar-menu-bar { color: #00205C; }
+.sidebar-menu .sidebar-menu-item::after { background-color: #00205C; }
+.sidebar-menu .sidebar-menu-item a .menu-icon { color: #00205C; }
+.sidebar-menu .sidebar-menu-item:hover { color: #00205C; }
+.sidebar-menu .sidebar-menu-item.active { color: #00205C; }
+.sidebar-menu .sidebar-menu-item.active .sidebar-submenu .sidebar-menu-item a.active { color: #00205C; }
+.settings-sidebar-area .settings-sidebar-header .title { border-bottom: 1px solid #00205C; }
+.settings-sidebar-area .layout-area .layout-tab-switcher::before { background: #00205C; }
+body.dark-min-sidebar .header { background-color: #00205C; }
+.navbar-wrapper { background: #00205C; }
+.copyright-area p a, .copyright-area p span { color: #00205C; }
+.dashboard-content .left .title { color: #00205C; }
+.dashbord-item .chart span { color: #00205C; }
+.dashbord-item #chart10 span { color: #FA6B25; }
+.dashbord-item #chart12 span { color: #00205C; }
+.chat-container .media.media-chat-reverse .media-body p { background-color: #00205C; }
+.chat-container .media.media-chat-reverse .media-body p::before { background-color: #00205C; }
+.chat-form .publisher .chatbox-send-part .chat-submit-btn { background-color: #00205C; }
+.account-header .sub-title span { color: #00205C; }
+.account-form input:-webkit-autofill { border-color: #00205C !important; }
+.dark-version input:-webkit-autofill { border-color: #00205C !important; }
+.dashboard-icon { color: #00205C; }
+.form-check-input:checked { background-color: #00205C !important; border-color: #00205C !important; }
+.gateway-item .gateway-item-wrapper .content span i { color: #00205C; }
+.dragable-card-wrapper .dragable-item .dragable-icon { color: #00205C; }
+.dragable-card-wrapper .ui-sortable-helper { color: #00205C; }
+.dragable-card-wrapper .ui-sortable-helper .dragable-remove-icon { background-color: #00205C !important; }
+.btn--base.outline { border: 1px solid #00205C; color: #00205C !important; }
+
+/* ── hand-written polish ──────────────────────────────────── */
+
+/* The page runs in the theme's own `dark-sidebar` mode (see index.html), which
+   already restates every sidebar colour for a dark panel. Only the panel's own
+   shade is changed here, from the theme's slate to the VIPs navy. */
+body.dark-sidebar .sidebar { background-color: var(--vips-navy); }
+body.dark-sidebar .sidebar .sidebar-menu .sidebar-menu-item.active > a,
+body.dark-sidebar .sidebar .sidebar-menu .sidebar-menu-item > a:hover { color: var(--vips-orange); }
+body.dark-sidebar .sidebar .sidebar-submenu .nav-link.active { color: var(--vips-orange); }
+
+/* Primary actions read orange, destructive stays red. */
+.btn--base, .btn--primary { background-color: var(--vips-orange); border-color: var(--vips-orange); }
+.btn--base:hover, .btn--primary:hover { background-color: #e05a17; border-color: #e05a17; }
+
+/* Points are not money: give them their own colour so a points figure is
+   never misread as dinars at a glance. */
+.figure--points { color: var(--vips-orange); }
+.figure--money  { color: var(--vips-navy); }
+
+/* Arabic content is right-to-left; the theme is not. Scoped to elements that
+   opt in, so the chrome stays LTR and only copy flips. */
+[dir="rtl"] { text-align: right; }

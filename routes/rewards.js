@@ -6,6 +6,7 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { authMiddleware } = require('../middleware/auth');
 const { runAutoSeeder } = require('../utils/autoSeeder');
+const { pointsToTnd } = require('../config/economics');
 
 // ─── Seed gift voucher brands ─────────────────────────────
 async function seedGiftVoucherBrands() {
@@ -153,6 +154,34 @@ router.post('/apply-coupon', authMiddleware, async (req, res) => {
 // ─── GET /api/rewards/gift-vouchers ─────────────────────────
 router.get('/gift-vouchers', authMiddleware, async (req, res) => {
   try {
+    const merchantVouchers = await Coupon.find({
+      type: 'voucher',
+      merchantId: { $ne: null },
+      isActive: true,
+      expiryDate: { $gt: new Date() },
+    })
+      .populate('merchantId', 'storeName logo')
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    if (merchantVouchers.length) {
+      return res.json({
+        success: true,
+        data: merchantVouchers.map((voucher) => ({
+          _id: String(voucher._id),
+          name: voucher.merchantId?.storeName || 'Partner store',
+          logoUrl: voucher.merchantId?.logo || '',
+          minAmount: voucher.pointsCost || Math.round((voucher.discount || 0) * 100),
+          maxAmount: voucher.pointsCost || Math.round((voucher.discount || 0) * 100),
+          currency: 'PTS',
+          voucherValueTnd: voucher.discount || 0,
+          voucherDiscountPercentage: voucher.voucherDiscountPercentage || null,
+          description: voucher.description || '',
+        })),
+      });
+    }
+
     let brands = await GiftVoucherBrand.find({ isActive: true }).sort({ name: 1 });
     if (brands.length === 0) {
       await runAutoSeeder();
@@ -172,16 +201,78 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid voucher or amount' });
     }
 
+    const merchantVoucher = await Coupon.findOne({
+      _id: voucherId,
+      type: 'voucher',
+      merchantId: { $ne: null },
+      isActive: true,
+      expiryDate: { $gt: new Date() },
+    }).lean().catch(() => null);
+
+    if (merchantVoucher) {
+      const requiredPoints = merchantVoucher.pointsCost || Math.round((merchantVoucher.discount || 0) * 100);
+      if (Number(amount) !== requiredPoints) {
+        return res.status(400).json({
+          success: false,
+          message: `This gift card costs exactly ${requiredPoints} points.`,
+        });
+      }
+
+      const user = await User.findById(req.user.id);
+      if (!user || user.walletPoints < requiredPoints) {
+        return res.status(400).json({ success: false, message: 'Not enough VIPs points.' });
+      }
+
+      user.walletPoints -= requiredPoints;
+      const code = `VIPS-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+      const personalVoucher = await Coupon.create({
+        code,
+        discount: merchantVoucher.discount,
+        discountUnit: 'tnd',
+        type: 'voucher',
+        voucherDiscountPercentage: merchantVoucher.voucherDiscountPercentage || null,
+        expiryDate: merchantVoucher.expiryDate,
+        userId: user._id,
+        merchantId: merchantVoucher.merchantId,
+        pointsCost: requiredPoints,
+        maxUsage: 1,
+        description: merchantVoucher.description || 'Partner store gift card',
+      });
+      await user.save();
+      await Transaction.create({
+        userId: user._id,
+        merchantId: merchantVoucher.merchantId,
+        type: 'expense',
+        amount: requiredPoints,
+        currency: 'PTS',
+        description: `Gift card purchased for ${merchantVoucher.discount} TND`,
+        status: 'completed',
+        reference: `ORDER-PTS-${personalVoucher._id}`,
+      });
+      return res.json({
+        success: true,
+        message: 'Gift card purchased successfully.',
+        data: { voucher: personalVoucher, pointsSpent: requiredPoints },
+      });
+    }
+
     // The brand was never loaded here before, so a purchase accepted any
     // voucherId at all and ignored the brand's own min/max range.
     const brand = await GiftVoucherBrand.findById(voucherId).catch(() => null);
     if (!brand || !brand.isActive) {
       return res.status(404).json({ success: false, message: 'Gift voucher brand not found' });
     }
+    // `amount` is a number of POINTS, and always was — it is checked against
+    // the brand's range and then subtracted from walletPoints. The brand's
+    // `currency` field says 'TND', so the range was reported to the customer
+    // as dinars: "between 200 and 5000 TND" for what is really 2 to 50 TND
+    // worth of points. Stated in the unit actually being spent, with the
+    // dinar value beside it.
     if (amount < brand.minAmount || amount > brand.maxAmount) {
       return res.status(400).json({
         success: false,
-        message: `Amount must be between ${brand.minAmount} and ${brand.maxAmount} ${brand.currency}`,
+        message: `This voucher costs between ${brand.minAmount} and ${brand.maxAmount} points `
+          + `(${pointsToTnd(brand.minAmount)}–${pointsToTnd(brand.maxAmount)} TND).`,
       });
     }
 
@@ -189,10 +280,16 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
     if (user.walletPoints < amount) {
-      return res.status(400).json({ success: false, message: 'Insufficient wallet points' });
+      return res.status(400).json({
+        success: false,
+        message: `You have ${user.walletPoints || 0} points; this voucher costs ${amount}.`,
+      });
     }
 
     user.walletPoints -= amount;
+    // What the voucher is worth to spend, in dinars — the points paid for it,
+    // converted at the one documented rate.
+    const voucherValueTnd = pointsToTnd(amount);
 
     // Actually issue the voucher the customer just paid for. Without this
     // the points were deducted, a Transaction was written, and the user got
@@ -207,13 +304,18 @@ router.post('/purchase-voucher', authMiddleware, async (req, res) => {
     const [voucher] = await Promise.all([
       Coupon.create({
         code,
-        discount: amount,
+        // The voucher is worth dinars, not a percentage. `discount` was set
+        // to the points paid with no `discountUnit`, which defaults to
+        // 'percent' — so 200 points spent produced a coupon that read as
+        // 200% off. Stated in dinars, and marked as such.
+        discount: voucherValueTnd,
+        discountUnit: 'tnd',
         type: 'voucher',
         expiryDate,
         userId: user._id,
         pointsCost: amount,
         maxUsage: 1,
-        description: `${brand.name} gift voucher — ${amount} ${brand.currency}`,
+        description: `${brand.name} gift voucher — ${voucherValueTnd} TND (${amount} points)`,
       }),
       user.save(),
       Transaction.create({
@@ -264,7 +366,6 @@ router.post('/send-gift', authMiddleware, async (req, res) => {
 router.post('/gift-offer', authMiddleware, async (req, res) => {
   try {
     const { recipientPhone, points, message } = req.body;
-    const { pointsToTnd } = require('../config/economics');
 
     const cost = Math.floor(Number(points));
     if (!recipientPhone || !Number.isFinite(cost) || cost <= 0) {
@@ -417,25 +518,32 @@ router.post('/spin-wheel', authMiddleware, async (req, res) => {
 
     if (randomReward.type === 'points') {
       const user = await User.findById(req.user.id);
-      user.walletPoints = (user.walletPoints || 0) + randomReward.amount;
+      // Diamonds, for the same reason as the daily check-in: a spin that
+      // hands out loyalty points is minting money nothing backs.
+      user.diamonds = (user.diamonds || 0) + randomReward.amount;
       await user.save();
 
       await Transaction.create({
         userId: user._id,
         type: 'reward',
         amount: randomReward.amount,
-        currency: 'PTS',
+        currency: 'DMD',
         description: `Spin wheel reward: ${randomReward.amount} diamonds`,
         status: 'completed',
         reference: `SPIN-${Date.now()}`,
       });
     }
 
-    const updatedUser = await User.findById(req.user.id).select('walletPoints');
+    const updatedUser = await User.findById(req.user.id).select('walletPoints diamonds');
     res.json({
       success: true,
       message: 'Wheel spun',
-      data: { ...randomReward, newBalance: updatedUser?.walletPoints || 0, remainingSpins: Math.max(0, MAX_DAILY_SPINS - spinsToday - 1) },
+      data: {
+        ...randomReward,
+        newDiamonds: updatedUser?.diamonds || 0,
+        newBalance: updatedUser?.walletPoints || 0,
+        remainingSpins: Math.max(0, MAX_DAILY_SPINS - spinsToday - 1),
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

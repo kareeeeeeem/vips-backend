@@ -107,10 +107,23 @@ router.post('/', async (req, res) => {
 // ─── PUT /api/merchant/ads/:id ────────────────────────────
 router.put('/:id', async (req, res) => {
   try {
+    const allowed = [
+      'title', 'description', 'imageUrl', 'targetAudience', 'budget',
+      'startDate', 'endDate', 'adType', 'targetUrl',
+    ];
+    const update = Object.fromEntries(
+      Object.entries(req.body).filter(([key]) => allowed.includes(key)),
+    );
+    // Any content edit needs another review; merchants can never approve
+    // their own advertisement by sending moderation fields in the body.
+    update.moderationStatus = 'pending';
+    update.moderationReason = '';
+    update.moderatedBy = null;
+    update.moderatedAt = null;
     const ad = await MerchantAd.findOneAndUpdate(
       { _id: req.params.id, merchantId: req.user.id },
-      req.body,
-      { new: true }
+      update,
+      { new: true, runValidators: true }
     );
     if (!ad) return res.status(404).json({ success: false, message: 'Ad not found' });
     res.json({ success: true, message: 'Ad updated', data: ad });

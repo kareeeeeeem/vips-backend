@@ -7,6 +7,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { authMiddleware } = require('../middleware/auth');
 const MerchantBill = require('../models/MerchantBill');
+const User = require('../models/User');
+const { findByVipsId } = require('../utils/vipsId');
 const Transaction  = require('../models/Transaction');
 
 const router = express.Router();
@@ -116,7 +118,7 @@ function makePayCode() {
 router.post('/', async (req, res) => {
   try {
     const {
-      customerId, customerName, customerPhone,
+      customerId, customerName, customerPhone, customerLookup,
       items, subtotal, taxAmount, taxRate,
       discountAmount, serviceCharge, grandTotal,
       paymentMethod, paymentStatus, paidAmount, notes, cashierId,
@@ -130,6 +132,20 @@ router.post('/', async (req, res) => {
     const parsedTotal  = parseFloat(grandTotal);
     if (!Number.isFinite(parsedTotal) || parsedTotal <= 0) {
       return res.status(400).json({ success: false, message: 'grandTotal must be a number greater than 0' });
+    }
+
+    // The POS accepts either the customer's short six-digit VIPs ID or a
+    // phone number. Resolve the short ID server-side before storing the bill.
+    let resolvedCustomerId = customerId || null;
+    let resolvedCustomerPhone = customerPhone || '';
+    if (!resolvedCustomerId && customerLookup) {
+      const lookup = String(customerLookup).trim();
+      const customer = /^\d{6}$/.test(lookup)
+        ? await findByVipsId(lookup, 'customer')
+        : await User.findOne({ phone: lookup, role: 'customer' });
+      if (!customer) return res.status(404).json({ success: false, message: 'Customer ID or phone was not found.' });
+      resolvedCustomerId = customer._id;
+      resolvedCustomerPhone = customer.phone || '';
     }
 
     // `paidAmount ?? parsedTotal`, not `||`: the app sends 0 when it is
@@ -154,9 +170,9 @@ router.post('/', async (req, res) => {
 
     const bill = await MerchantBill.create({
       merchantId:     req.user.id,
-      customerId:     customerId || null,
+      customerId:     resolvedCustomerId,
       customerName:   customerName || 'Walk-in Customer',
-      customerPhone:  customerPhone || '',
+      customerPhone:  resolvedCustomerPhone,
       billNumber,
       items,
       subtotal:       parseFloat(subtotal),
@@ -186,7 +202,7 @@ router.post('/', async (req, res) => {
     // merchant's revenue counted bills nobody had paid.
     if (parsedPaid > 0) {
       await Transaction.create({
-        userId:      customerId || req.user.id,
+      userId:      resolvedCustomerId || req.user.id,
         merchantId:  req.user.id,
         type:        'income',
         amount:      parsedPaid,

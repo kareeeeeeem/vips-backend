@@ -1,8 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
-const Product = require('../models/Product');
-const Deal = require('../models/Deal');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { authMiddleware } = require('../middleware/auth');
@@ -12,150 +10,106 @@ const router = express.Router();
 // §5.1: 100 points = 1 TND, from the one module that defines it. This was
 // 0.1 — ten times the documented rate — duplicated here, in payment.js and
 // in index.js, which is how the three drifted apart.
-const { TND_PER_POINT: VIPS_TO_TND } = require('../config/economics');
+const coupons = require('../utils/coupons');
 
-// ─── POST /api/order/create ───────────────────────────────
-router.post('/create', authMiddleware, async (req, res) => {
+const { quoteCheckout, publicQuote } = require('../utils/checkout');
+
+router.post('/quote', authMiddleware, async (req, res) => {
   try {
-    const { merchantId, items, paymentMethod, deliveryAddress, orderType, orderNote, couponCode, couponDiscountAmount, walletPointsRedeemed } = req.body;
+    res.json({ success: true, data: publicQuote(await quoteCheckout(req.body, req.user.id)) });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, message: error.message });
+  }
+});
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ success: false, message: 'Order must contain at least one item' });
+// Prices and the shop come from the catalogue. The same calculation powers
+// the preview and the committed order, including delivery, tips and points.
+router.post('/create', authMiddleware, async (req, res) => {
+  let quote;
+  let fundsReserved = false;
+  let couponConsumed = false;
+  let order;
+  try {
+    quote = await quoteCheckout(req.body, req.user.id);
+    const { normalizedItems, merchantId, orderType, paymentMethod, totalAmount,
+      discount, appliedCoupon, pointsUsed, walletDiscountAmount, deliveryCharge, tipAmount, taxAmount } = quote;
+    if (req.body.expectedTotal != null &&
+        (!Number.isFinite(Number(req.body.expectedTotal)) ||
+         Math.abs(Number(req.body.expectedTotal) - totalAmount) > 0.0005)) {
+      return res.status(409).json({ success: false, message: 'Your order total changed. Please review it again.', data: publicQuote(quote) });
     }
-
-    // Prices come from the database, never from the request. This used to
-    // take `item.price` straight off the body and total the order from it, so
-    // a modified client could order a D 12.500 product for D 0.001 — the
-    // server simply believed whatever price it was handed.
-    const normalizedItems = [];
-    for (const item of items) {
-      const id = item.productId || item.id;
-      const quantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
-
-      let priced = null;
-      let name = item.name || item.item_name || '';
-
-      if (id && mongoose.Types.ObjectId.isValid(id)) {
-        const product = await Product.findById(id).select('name price discountPrice');
-        if (product) {
-          priced = (product.discountPrice != null && product.discountPrice > 0)
-            ? product.discountPrice
-            : product.price;
-          name = product.name || name;
-        } else {
-          const deal = await Deal.findById(id).select('title currentPrice');
-          if (deal) {
-            priced = deal.currentPrice;
-            name = deal.title || name;
-          }
-        }
-      }
-
-      if (priced === null) {
-        return res.status(400).json({
-          success: false,
-          message: `Item "${name || id}" is no longer available`,
-        });
-      }
-
-      normalizedItems.push({
-        productId:        id,
-        item_name:        name,
-        price:            Number(priced) || 0,
-        quantity,
-        tax_amount:       Number(item.tax_amount) || 0,
-        discount_on_item: Number(item.discount_on_item) || 0,
+    const walletDebit = paymentMethod === 'wallet' ? totalAmount : 0;
+    if (pointsUsed > 0 || walletDebit > 0) {
+      const reserved = await User.findOneAndUpdate(
+        { _id: req.user.id, walletPoints: { $gte: pointsUsed }, walletBalance: { $gte: walletDebit } },
+        { $inc: { walletPoints: -pointsUsed, walletBalance: -walletDebit } },
+      );
+      if (!reserved) return res.status(409).json({ success: false, message: 'Your wallet balance changed. Please review your order.' });
+      fundsReserved = true;
+    }
+    if (appliedCoupon) {
+      await coupons.consume(appliedCoupon);
+      couponConsumed = true;
+    }
+    const deliveryAddress = typeof req.body.deliveryAddress === 'string'
+      ? { address: req.body.deliveryAddress } : (req.body.deliveryAddress || {});
+    order = await Order.create({
+      userId: req.user.id, merchantId, items: normalizedItems, totalAmount,
+      couponDiscountAmount: discount,
+      couponDiscountTitle: appliedCoupon ? (appliedCoupon.description || appliedCoupon.code) : '',
+      walletPointsRedeemed: pointsUsed, walletDiscountAmount,
+      deliveryCharge, additionalCharge: tipAmount, totalTaxAmount: taxAmount,
+      paymentMethod, paymentStatus: walletDebit > 0 || totalAmount === 0 ? 'paid' : 'pending',
+      deliveryAddress, orderType, orderNote: req.body.orderNote || '',
+      scheduleAt: req.body.scheduleAt || null,
+      status: 'pending', pendingAt: new Date(),
+    });
+    if (pointsUsed > 0) {
+      await Transaction.create({
+        userId: req.user.id, merchantId, type: 'debit', amount: pointsUsed, currency: 'PTS',
+        description: `${pointsUsed} VIPS points redeemed on order #${order.orderNumber}`,
+        status: 'completed', reference: `ORDER-PTS-${order._id}`,
       });
     }
-
-    let totalAmount = normalizedItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
-    const discount = Number(couponDiscountAmount) || 0;
-    totalAmount = Math.max(0, totalAmount - discount);
-
-    // Redeem wallet points against the remaining total, if requested.
-    // Capped by both what the user actually has and what's left to pay —
-    // never lets a redemption push the order below zero or overdraw the
-    // wallet.
-    let pointsUsed = 0;
-    let walletDiscountAmount = 0;
-    const requestedPoints = Number(walletPointsRedeemed) || 0;
-    let user = null;
-    if (requestedPoints > 0) {
-      user = await User.findById(req.user.id);
-      if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
-      const maxRedeemableByBalance = Math.max(0, Math.floor(user.walletPoints));
-      const maxRedeemableByTotal = Math.floor(totalAmount / VIPS_TO_TND);
-      pointsUsed = Math.max(0, Math.min(requestedPoints, maxRedeemableByBalance, maxRedeemableByTotal));
-      walletDiscountAmount = Math.round(pointsUsed * VIPS_TO_TND * 100) / 100;
-      totalAmount = Math.max(0, Math.round((totalAmount - walletDiscountAmount) * 100) / 100);
+    if (walletDebit > 0) {
+      await Transaction.create({
+        userId: req.user.id, merchantId, type: 'expense', amount: walletDebit, currency: 'TND',
+        description: `Wallet payment for order #${order.orderNumber}`,
+        status: 'completed', reference: `ORDER-WALLET-${order._id}`,
+      });
     }
-
-    // Normalize deliveryAddress: accept both plain string and structured object
-    const addressObj = typeof deliveryAddress === 'string'
-      ? { address: deliveryAddress }
-      : (deliveryAddress || {});
-
-    // A bare '' or falsy value isn't a valid ObjectId — omit the field
-    // entirely rather than passing something that fails Mongoose's cast.
-    const validMerchantId = merchantId && String(merchantId).trim() ? merchantId : null;
-
-    const order = await Order.create({
-      userId:              req.user.id,
-      merchantId:          validMerchantId,
-      items:               normalizedItems,
-      totalAmount,
-      couponDiscountAmount: discount,
-      walletPointsRedeemed: pointsUsed,
-      walletDiscountAmount,
-      paymentMethod:       paymentMethod || 'cash',
-      deliveryAddress:     addressObj,
-      orderType:           orderType || 'delivery',
-      orderNote:           orderNote || '',
-      status:              'pending',
-      pendingAt:           new Date(),
+    // The cart is fulfilled server-side; a failed follow-up request from the
+    // phone must not make already-ordered items reappear on the next launch.
+    await User.updateOne({ _id: req.user.id }, {
+      $pull: { cart: { itemId: { $in: normalizedItems.map(item => String(item.productId)) } } },
     });
-
-    if (pointsUsed > 0 && user) {
-      user.walletPoints -= pointsUsed;
-      await Promise.all([
-        user.save(),
-        Transaction.create({
-          userId:     user._id,
-          merchantId: merchantId || user._id,
-          type:       'debit',
-          amount:     pointsUsed,
-          currency:   'PTS',
-          description: `${pointsUsed} VIPS points redeemed on order #${order.orderNumber}`,
-          status:     'completed',
-          reference:  `ORDER-PTS-${order._id}`,
-        }),
-      ]);
-    }
-
-    // Tell the merchant a customer just ordered. Merchant notifications only
-    // ever fired when the merchant changed a status themselves — i.e. they
-    // were told about their own action and never about the one event that
-    // actually needs their attention, so the Notifications screen sat empty
-    // while real orders came in.
-    if (validMerchantId) {
+    if (merchantId) {
       try {
         const { push } = require('./merchant_notifications');
-        await push(
-          validMerchantId,
-          'New Order',
-          `Order #${order.orderNumber} — D ${Number(order.totalAmount || 0).toFixed(2)}`,
-          'order',
-          // orderNumber travels alongside the id: the merchant order screen
-          // is addressed by the numeric order number, not the Mongo id.
-          { orderId: order._id, orderNumber: order.orderNumber },
-        );
-      } catch (_) {}
+        await push(merchantId, 'New Order',
+          `Order #${order.orderNumber} — D ${totalAmount.toFixed(3)}`, 'order',
+          { orderId: order._id, orderNumber: order.orderNumber });
+      } catch (_) { /* Notification failure does not undo a placed order. */ }
     }
-
     res.status(201).json({ success: true, message: 'Order created', data: order });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    // Compensate rejected checkouts. Conditional increments above prevent two
+    // concurrent orders overdrawing a balance even on standalone MongoDB.
+    if (order) {
+      await Order.deleteOne({ _id: order._id });
+      await Transaction.deleteMany({ reference: { $in: [`ORDER-PTS-${order._id}`, `ORDER-WALLET-${order._id}`] } });
+    }
+    if (fundsReserved) {
+      await User.updateOne({ _id: req.user.id }, { $inc: {
+        walletPoints: quote.pointsUsed,
+        walletBalance: quote.paymentMethod === 'wallet' ? quote.totalAmount : 0,
+      } });
+    }
+    if (couponConsumed) {
+      await require('../models/Coupon').updateOne({ _id: quote.appliedCoupon._id },
+        { $inc: { usageCount: -1, usedCount: -1 } });
+    }
+    res.status(error.status || 500).json({ success: false, message: error.message });
   }
 });
 
@@ -355,12 +309,13 @@ router.put('/:id/cancel', authMiddleware, async (req, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
-    if (['delivered', 'cancelled'].includes(order.status)) {
+    if (!['pending', 'confirmed'].includes(order.status)) {
       return res.status(400).json({ success: false, message: 'Cannot cancel this order' });
     }
     order.$locals.statusBy = { id: req.user.id, role: 'customer', note: req.body.reason || '' };
     order.status = 'cancelled';
     order.canceledAt = new Date();
+    order.cancellationReason = String(req.body.reason || '').slice(0, 500);
     await order.save();
     res.json({ success: true, message: 'Order cancelled', data: order });
   } catch (error) {

@@ -67,7 +67,7 @@ const orderSchema = new mongoose.Schema(
     },
     orderType:     { type: String, enum: ['delivery', 'takeaway', 'dine_in'], default: 'delivery' },
     orderNote:     { type: String, default: '' },
-    paymentMethod: { type: String, enum: ['wallet', 'cash', 'card', 'online', 'paymee', 'paypal'], default: 'cash' },
+    paymentMethod: { type: String, enum: ['wallet', 'cash', 'card', 'online', 'paymee', 'paypal', 'bank_transfer', 'partner_cash'], default: 'cash' },
     paymentStatus: { type: String, enum: ['pending', 'paid', 'failed', 'refunded'], default: 'pending' },
     // Gateway-side identifier: Paymee payment token or PayPal order id.
     // Set on initiate/create, used to match the webhook/capture callback
@@ -152,8 +152,19 @@ orderSchema.index({ paymentReference: 1 }, { sparse: true });
 // Auto-assign a sequential orderNumber on first save
 orderSchema.pre('save', async function (next) {
   if (this.isNew && !this.orderNumber) {
+    const Counter = require('./Counter');
     const last = await mongoose.model('Order').findOne().sort({ orderNumber: -1 }).select('orderNumber');
-    this.orderNumber = last?.orderNumber ? last.orderNumber + 1 : 1001;
+    // $max adopts existing installations without moving a counter backwards.
+    // An atomic increment then gives simultaneous checkouts distinct numbers.
+    try {
+      await Counter.updateOne({ _id: 'orders' },
+        { $max: { value: last?.orderNumber || 1000 } }, { upsert: true });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+    }
+    const counter = await Counter.findOneAndUpdate(
+      { _id: 'orders' }, { $inc: { value: 1 } }, { new: true });
+    this.orderNumber = counter.value;
 
     // Record pending timestamp
     if (!this.pendingAt) this.pendingAt = new Date();
@@ -276,6 +287,10 @@ orderSchema.pre('save', function recordStatusChange(next) {
   delete this.$locals.statusBy;
 
   next();
+});
+
+orderSchema.post('save', async function (order) {
+  await require('../utils/checkoutRefund').refundCheckoutFunds(order);
 });
 
 module.exports = mongoose.model('Order', orderSchema);
