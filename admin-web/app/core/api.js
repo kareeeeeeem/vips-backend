@@ -7,6 +7,8 @@
  * than as `undefined` three frames later.
  */
 
+import { confirm } from './ui.js';
+
 const BASE = '/api/admin';
 const TOKEN_KEY = 'vips.admin.token';
 
@@ -17,6 +19,7 @@ export class ApiError extends Error {
     this.name = 'ApiError';
     this.status = status;
     this.body = body;
+    this.cancelled = status === 499;
   }
 }
 
@@ -52,6 +55,17 @@ export function qs(params = {}) {
 }
 
 async function request(method, path, { body, signal, raw = false } = {}) {
+  const changesData = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+  const isBackgroundUpdate = path.includes('/notifications/read') || path.includes('/content/ads/');
+  if (changesData && !isBackgroundUpdate) {
+    const approved = await confirm({
+      title: method === 'DELETE' ? 'Confirm deletion' : 'Confirm action',
+      message: 'Do you want to continue with this operation?',
+      submitLabel: 'Confirm',
+      tone: method === 'DELETE' ? 'danger' : 'base',
+    });
+    if (!approved) throw new ApiError('Action cancelled.', 499, null);
+  }
   const headers = {};
   const auth = token.get();
   if (auth) headers.Authorization = `Bearer ${auth}`;

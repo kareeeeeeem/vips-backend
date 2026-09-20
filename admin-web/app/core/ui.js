@@ -376,7 +376,10 @@ export function toast(message, tone = 'success', { timeout = 4500 } = {}) {
 }
 
 /** Report a caught failure without swallowing it. */
-export const toastError = (error) => toast(error?.message || 'Something went wrong.', 'danger');
+export const toastError = (error) => {
+  if (error?.cancelled || error?.status === 499) return;
+  toast(error?.message || 'Something went wrong.', 'danger');
+};
 
 // ── modals ───────────────────────────────────────────────────
 
